@@ -1,0 +1,10 @@
+# /etc/router/ifaces.conf — przykład (router-on-a-stick, jeden port 100G)
+# Po edycji na routerze:  router-ifaces diff   →   router-ifaces apply
+# MTU: zawsze standardowe 1500 — nie wpisuj mtu=.
+#
+# interfejs  vlan  ipv4               ipv6                     opis
+hu0          -     -                  -                        Port 100G: trunk VLAN do switcha
+hu0          100   192.0.2.2/30       2001:db8:100::2/64       Transit: EPIX AS62081
+hu0          200   198.51.100.2/30    2001:db8:200::2/64       Transit: Upstream-2 10G
+hu0          300   10.255.0.1/30      -                        Core: ASR1001-X BNG
+loop0        -     203.0.113.1/32     2001:db8::1/128          Loopback: router-id, BGP, SNMP

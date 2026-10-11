@@ -1,0 +1,39 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Router: kontrola (lint)",
+      "type": "shell",
+      "command": "bash tools/lint.sh",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Router: testy router-ifaces",
+      "type": "shell",
+      "command": "bash tests/run-tests.sh",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Router: wyciągnij programy do build/",
+      "type": "shell",
+      "command": "bash tools/extract.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "Router: wyślij install-router.sh na router",
+      "type": "shell",
+      "command": "bash tools/lint.sh && scp install-router.sh root@${input:routerHost}:/root/install-router.sh && echo 'Na routerze: bash /root/install-router.sh'",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "routerHost",
+      "type": "promptString",
+      "description": "Adres routera (zarządzanie eth2)",
+      "default": "192.168.80.111"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "recommendations": [
+    "timonwong.shellcheck",
+    "ms-python.python",
+    "ms-python.flake8",
+    "ms-vscode-remote.remote-ssh",
+    "editorconfig.editorconfig",
+    "yzhang.markdown-all-in-one"
+  ]
+}

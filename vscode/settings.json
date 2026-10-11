@@ -1,0 +1,20 @@
+{
+  "files.eol": "\n",
+  "files.encoding": "utf8",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "files.associations": {
+    "ifaces.conf*": "properties",
+    "*.vpp": "properties",
+    "router-ifaces": "python",
+    "router-monitor": "python",
+    "router-notify": "python"
+  },
+  "files.exclude": { "build": false },
+  "search.exclude": { "build/**": true },
+  "shellcheck.customArgs": ["-S", "warning"],
+  "flake8.args": ["--max-line-length=125"],
+  "[shellscript]": { "editor.tabSize": 2, "editor.insertSpaces": true },
+  "[python]": { "editor.tabSize": 4, "editor.insertSpaces": true },
+  "editor.rulers": [125]
+}

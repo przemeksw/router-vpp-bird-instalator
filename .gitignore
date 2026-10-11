@@ -1,0 +1,9 @@
+# wyciągnięte programy (źródło prawdy: install-router.sh)
+build/
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+# nigdy nie commituj haseł SMTP / iDRAC
+notify.conf
+*.env
