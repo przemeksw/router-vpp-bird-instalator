@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # install-router.sh  —  Dell R630 + Mellanox ConnectX-4 jako router BGP
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 #
 # Instaluje i uruchamia na Debianie 13 (trixie):
 #   * VPP 26.06 zbudowany ze źródeł (DPDK + sterownik mlx5), linux-cp, sFlow
@@ -40,6 +41,8 @@
 #   ./install-router.sh upgrade_script             # tylko aktualizacja programów routera (bez restartu VPP/BIRD)
 #   ./install-router.sh upgrade_script --dry-run   # pokaż, co by się zmieniło, bez zapisywania
 #   ./install-router.sh --version                  # wersja skryptu i wersja zainstalowana na routerze
+#   ./install-router.sh set_workers [N] [--dry-run] # zmiana liczby workerów VPP bez ponownej instalacji (po zmianie restart serwera)
+#   ./install-router.sh [set_workers N] --choose-nic  # wybór portu Mellanox numerem (1,2,3…); bez tej flagi pyta tylko przy pierwszej instalacji z wieloma portami
 #
 # Po instalacji: dokumentacja /opt/router/README.md, kontrola stanu: router-check
 #
@@ -55,14 +58,23 @@ SCRIPT_VERSION="1.4.0"         # wersja skryptu; podbij przy każdej zmianie pro
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
 VPP_WORKERS=auto               # auto = dobór do rdzeni i modelu karty; albo liczba, np. 12
+VPP_RX_DESC=4096               # deskryptory RX na kolejkę (DPDK mlx5)
+VPP_TX_DESC=1024               # deskryptory TX na kolejkę (1024 = bezpieczne; rzeczywista przyczyna -95 przy 4096 to był firmware 12.20, nie liczba deskryptorów)
+VPP_NIC_DEVARGS=""             # dodatkowe devargs DPDK; przy firmware >= 12.28 niepotrzebne (potwierdzone na R630: bez devargs porty wstają)
 PORT_MTU=1500                  # MTU portów VPP i VLAN-ów: standard Ethernet (ustawiane przy starcie VPP, przed podniesieniem portu)
-ROUTER_ID=""                   # puste = IPv4 interfejsu z trasą domyślną (eth2)
+ROUTER_ID=""                   # puste = adres loop0 (LOOP0_ADDR), a bez niego IPv4 interfejsu z trasą domyślną (eth2)
+LOOP0_ADDR="10.10.10.10/32"    # loopback loop0 w VPP: stały adres zarządzania (SSH, SNMP) i router-id; puste = bez loop0
+DATAPLANE_SSH=yes              # yes = drugi sshd w netns dataplane na adresie loop0 (sshd portu zarządzającego zostaje)
+MGMT_SNMP=yes                  # yes = snmpd także na porcie zarządzającym (host, RAID); liczniki portów VPP są na loop0
+SSH_PASSWORD_AUTH=yes          # logowanie hasłem na sshd w dataplane (loop0): yes = hasło lub klucz, no = tylko klucz
+SSH_ROOT_LOGIN=no              # PermitRootLogin na obu sshd (port zarządzający i loop0): no | prohibit-password | yes; "no" wymaga zwykłego użytkownika z sudo
 SNMP_COMMUNITY=""              # puste = wygeneruj losowe
 SNMP_ALLOW="192.168.80.0/24"   # skąd wolno odpytywać SNMP (IP/prefiks LibreNMS)
 SFLOW_COLLECTOR=""             # IP kolektora sFlow (FastNetMon); puste = brak
 SFLOW_SAMPLING=10000           # próbkowanie 1:N
 VPP_HANG_RESTART=1             # 1 = router-monitor restartuje VPP, gdy ten się zawiesi (30 s bez heartbeat)
-HUGEPAGES_2M=auto              # auto = 25% RAM (max 16 GB); albo liczba stron 2 MB, np. 8192
+VPP_BUFFERS=auto               # auto = 8× zapotrzebowanie (porty × workery × deskryptory), pamięć hugepages dobierana do tego; max = tyle, ile mieści się w hugepages z 35% RAM; albo liczba
+HUGEPAGES_2M=auto              # auto = od zapotrzebowania buforów (VPP_BUFFERS=auto) albo 35% RAM (VPP_BUFFERS=max); albo liczba stron 2 MB, np. 12288
 AUTO_NOSMT=1                   # 1 = przy włączonym HT dodaj "nosmt" do kernela
 AUTO_CSTATE=1                  # 1 = przy głębokich C-states ogranicz je do C1 w kernelu
 PANIC_REBOOT_SEC=10            # restart serwera N s po kernel panic
@@ -116,11 +128,13 @@ MAIN_LOG=$LOG_DIR/install.log
 MANIFEST=$DATA_DIR/MANIFEST.txt
 MAN_DB=$STATE_DIR/manifest.tsv
 ENV_FILE=$DATA_DIR/router-install.env
-TOTAL_STAGES=25
+TOTAL_STAGES=26
 
 MODE=install
 ASSUME_YES=0
 DRY_RUN=0
+WORKERS_REQ=""
+CHOOSE_NIC=0
 VERSION_FILE=/etc/router/version
 FROM_STAGE=0
 RESET=0
@@ -147,6 +161,9 @@ while (($#)); do
     --yes|-y) ASSUME_YES=1 ;;
     upgrade_script|--upgrade-script|--upgrade-scripts) MODE=upgrade ;;
     --dry-run) DRY_RUN=1 ;;
+    --choose-nic|--nic) CHOOSE_NIC=1 ;;
+    set_workers|--set-workers) MODE=workers ;;
+    [0-9]|[0-9][0-9]) if [[ $MODE == workers ]]; then WORKERS_REQ=$1; else echo "Nieznany argument: $1 (zobacz --help)"; exit 1; fi ;;
     --version|-V) MODE=version ;;
     --from)   shift; [[ ${1:-} =~ ^[0-9]+$ ]] || { echo "--from wymaga numeru etapu"; exit 1; }; FROM_STAGE=$((10#$1)) ;;
     -h|--help) usage ;;
@@ -158,11 +175,16 @@ done
 
 if [[ $MODE == version ]]; then
   echo "install-router.sh: wersja $SCRIPT_VERSION"
+  echo "  Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
   if [[ -f $VERSION_FILE ]]; then sed 's/^/  na routerze: /' "$VERSION_FILE"
   else echo "  na routerze: brak $VERSION_FILE (instalacja sprzed wersjonowania albo router jeszcze nie zainstalowany)"; fi
   exit 0
 fi
-((DRY_RUN)) && [[ $MODE != upgrade ]] && { echo "--dry-run działa tylko z upgrade_script"; exit 1; }
+((DRY_RUN)) && [[ $MODE != upgrade && $MODE != workers ]] && { echo "--dry-run działa tylko z upgrade_script i set_workers"; exit 1; }
+if [[ $MODE == workers ]]; then
+  ASSUME_YES=1                                     # bez pytań: zmiana dotyczy tylko rdzeni (GRUB, startup.conf)
+  [[ -z $WORKERS_REQ ]] || VPP_WORKERS=$WORKERS_REQ
+fi
 [[ $EUID -eq 0 ]] || { echo "Uruchom jako root."; exit 1; }
 mkdir -p "$SRC_DIR" "$DEB_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR"
 chmod 700 "$DATA_DIR"
@@ -180,7 +202,105 @@ expand_cpulist() {   # "1,3,5-9" -> "1 3 5 6 7 8 9"
 }
 join_by() { local IFS="$1"; shift; echo "$*"; }
 normalize_pci() { local p="${1,,}"; [[ $p =~ ^[0-9a-f]{4}: ]] || p="0000:$p"; echo "$p"; }
-netdev_of() { ls "/sys/bus/pci/devices/$1/net" 2>/dev/null | head -n1 || true; }
+netdev_of() { ls "${PCI_SYSFS:-/sys/bus/pci/devices}/$1/net" 2>/dev/null | head -n1 || true; }
+# bufory VPP od zapotrzebowania: każda kolejka RX/TX trzyma swoje bufory (deskryptory) + cache wątków; bierzemy 8× tyle
+# (zapas na zrywy, punt do Linuksa, składanie fragmentów), nie mniej niż 524288, zaokrąglone do 16384. Pamięć dobiera się potem do tego.
+calc_buffers() {   # calc_buffers PORTY WORKERY RX_DESC TX_DESC
+  local ports=$1 workers=$2 rx=$3 tx=$4 need b
+  need=$(( ports * workers * (rx + tx) + (workers + 1) * 2048 ))
+  b=$(( need * 8 ))
+  ((b < 524288)) && b=524288
+  echo $(( (b + 16383) / 16384 * 16384 ))
+}
+# hugepages_for BUFORY STERTA_MB WĘZŁY RAM_MB: pula 2 MB od zapotrzebowania węzła karty (sterta + 1280 MB zapasu + bufory 2496 B) + 15%,
+# po równo na węzły NUMA; od 2048 stron do 50% RAM
+hugepages_for() {
+  local node_mb pages cap
+  node_mb=$(( $2 + 1280 + ($1 * 2496 + 1048575) / 1048576 ))
+  node_mb=$(( node_mb * 115 / 100 ))
+  pages=$(( node_mb * $3 / 2 ))
+  cap=$(( $4 * 50 / 100 / 2 ))
+  ((pages > cap)) && pages=$cap
+  ((pages < 2048)) && pages=2048
+  echo "$pages"
+}
+# calc_hugepages RAM_MB: pula hugepages 2 MB dla VPP = 35% RAM, od 2048 do 12288 stron (4–24 GB); dzieli się po równo na węzły NUMA
+calc_hugepages() {
+  local n=$(( $1 * 35 / 100 / 2 ))
+  ((n > 12288)) && n=12288
+  ((n < 2048)) && n=2048
+  echo "$n"
+}
+# max_buffers HUGEPAGES_WĘZŁA_MB STERTA_MB: statyczne maksimum buforów, jakie mieści się w hugepages węzła karty
+# (po odjęciu sterty VPP i 1280 MB na statseg, DPDK i resztę — zmierzone na R630: ~1 GB — bierzemy 80% reszty;
+# bufor = 2496 B według "vppctl show buffers"). Duża pula = bufor na zrywy ruchu/DDoS i brak zrzutów.
+max_buffers() {
+  local hp_mb=$1 heap_mb=$2 cap
+  cap=$(( (hp_mb - heap_mb - 1280) * 1048576 / 100 * 80 / 2496 / 16384 * 16384 ))
+  ((cap < 32768)) && cap=32768
+  echo "$cap"
+}
+# porty Mellanox (mlx5_core, bez funkcji wirtualnych): "pci|netdev|numa|prędkość Mb/s|carrier|opis"
+list_mlx5_ports() {
+  local d p nd numa sp car desc pci=${PCI_SYSFS:-/sys/bus/pci/devices} net=${NET_SYSFS:-/sys/class/net}
+  for d in "$pci"/*; do
+    [[ $(cat "$d/vendor" 2>/dev/null) == 0x15b3 ]] || continue
+    [[ -e $d/physfn ]] && continue
+    [[ $(basename "$(readlink -f "$d/driver" 2>/dev/null)") == mlx5_core ]] || continue
+    p=$(basename "$d"); nd=$(netdev_of "$p")
+    numa=$(cat "$d/numa_node" 2>/dev/null || echo 0); ((numa < 0)) && numa=0
+    sp=""; car=""
+    if [[ -n $nd ]]; then
+      car=$(cat "$net/$nd/carrier" 2>/dev/null || true)
+      sp=$(cat "$net/$nd/speed" 2>/dev/null || true)
+    fi
+    desc=$(lspci -s "$p" 2>/dev/null | sed 's/^[^ ]* [^:]*: //' || true)
+    echo "$p|${nd:--}|$numa|${sp:--}|${car:--}|${desc:-Mellanox $(cat "$d/device" 2>/dev/null)}"
+  done
+}
+# Wybór portów dla VPP numerem 1,2,3… (kilka po przecinku). Pyta tylko na terminalu, gdy portów jest więcej niż jeden
+# (albo z --choose-nic); bez terminala/--yes zostaje zapisany wybór, a gdy go brak — porty z linkiem, na końcu pierwszy.
+choose_nic() {
+  local rows=() r i n p nd numa sp car desc pcis=() def=() defn=() ans tok sel ok1 linktxt sptxt
+  while IFS= read -r r; do [[ -n $r ]] && rows+=("$r"); done < <(list_mlx5_ports)
+  ((${#rows[@]})) || return 0                      # brak kart Mellanox: etap 01 zgłosi błąd z podpowiedzią
+  ((${#PCI_ARGS[@]})) && return 0                  # adres podany jawnie w poleceniu ma pierwszeństwo
+  for r in "${rows[@]}"; do pcis+=("${r%%|*}"); done
+  for p in "${NIC_PCI[@]}"; do
+    for i in "${!pcis[@]}"; do [[ ${pcis[$i]} == "$p" ]] && def+=("$p"); done
+  done
+  if ((${#def[@]} == 0)); then
+    for r in "${rows[@]}"; do IFS='|' read -r p nd numa sp car desc <<<"$r"; [[ $car == 1 ]] && def+=("$p"); done
+    ((${#def[@]})) || def=("${pcis[0]}")
+  fi
+  if ((CHOOSE_NIC || (!ASSUME_YES && ${#rows[@]} > 1))) && { [[ -t 0 ]] || [[ -n ${ROUTER_TEST_TTY:-} ]]; }; then
+    for i in "${!pcis[@]}"; do for p in "${def[@]}"; do [[ ${pcis[$i]} == "$p" ]] && defn+=($((i + 1))); done; done
+    printf '\n  Wykryte porty Mellanox:\n'
+    n=0
+    for r in "${rows[@]}"; do
+      n=$((n + 1)); IFS='|' read -r p nd numa sp car desc <<<"$r"
+      case $car in 1) linktxt="link: jest" ;; 0) linktxt="brak linku" ;; *) linktxt="link: ?" ;; esac
+      if [[ $sp =~ ^[0-9]+$ ]] && ((sp > 0)); then sptxt="$((sp / 1000)) Gb/s"; else sptxt="? Gb/s"; fi
+      printf '    %d  %s  %-16s NUMA %s  %-9s %-11s %s\n' "$n" "$p" "$nd" "$numa" "$sptxt" "$linktxt" "$desc"
+    done
+    while :; do
+      read -rp "  Który port obsługuje VPP? Numer (kilka po przecinku) [$(IFS=,; echo "${defn[*]}")]: " ans || ans=""
+      ans=${ans:-$(IFS=,; echo "${defn[*]}")}
+      sel=(); ok1=1
+      for tok in ${ans//,/ }; do
+        if [[ $tok =~ ^[0-9]+$ ]] && ((tok >= 1 && tok <= ${#pcis[@]})); then sel+=("${pcis[$((tok - 1))]}"); else ok1=0; fi
+      done
+      ((ok1 && ${#sel[@]})) && break
+      echo "  Wpisz numer z listy (1-${#pcis[@]})."
+    done
+    def=("${sel[@]}")
+  fi
+  if [[ ${NIC_PCI[*]} != "${def[*]}" ]]; then
+    [[ -f /etc/router/router.env ]] && warn "zmiana portów VPP: ${NIC_PCI[*]} → ${def[*]} (wpisy hu* w ifaces.conf muszą pasować do nowego zestawu)"
+    NIC_PCI=("${def[@]}")
+  fi
+  ok "porty VPP: ${NIC_PCI[*]}"
+}
 bird_unit() {
   local u
   for u in bird.service bird3.service; do
@@ -285,11 +405,12 @@ EOF
 }
 
 if ((${#PCI_ARGS[@]})); then NIC_PCI=("${PCI_ARGS[@]}")
-elif [[ $MODE == check || $MODE == upgrade ]] && [[ -f /etc/router/router.env ]]; then
+elif [[ $MODE == check || $MODE == upgrade || $MODE == workers || $MODE == "" ]] && [[ -f /etc/router/router.env ]]; then
   read -ra NIC_PCI <<<"$(sed -n 's/^INST_NIC_PCI="\(.*\)"$/\1/p' /etc/router/router.env)"
   ((${#NIC_PCI[@]})) || read -ra NIC_PCI <<<"$NIC_PCI_DEFAULT"
 else read -ra NIC_PCI <<<"$NIC_PCI_DEFAULT"; fi
 for i in "${!NIC_PCI[@]}"; do NIC_PCI[$i]=$(normalize_pci "${NIC_PCI[$i]}"); done
+[[ $MODE == "" || $MODE == workers || $MODE == audit ]] && choose_nic
 
 # =============================================================================
 # PROGRAMY routera (/opt/router/bin) — jedno źródło treści dla instalacji i dla upgrade_script
@@ -298,6 +419,7 @@ prog_router_fw_update() {
   local bdf=${NIC_PCI[0]#0000:} fdir=$DATA_DIR/firmware
   cat <<EOF
 #!/bin/bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # router-fw-update — aktualizacja firmware karty Mellanox/NVIDIA. Uruchamiaj RĘCZNIE, w oknie serwisowym.
 #   router-fw-update            pokaż obecną i dostępną wersję, potem zapytaj o aktualizację
 #   router-fw-update --online   użyj najnowszego firmware z serwera NVIDIA (zamiast obrazu w mlxup)
@@ -317,6 +439,7 @@ if [[ ! -x \$MLXUP ]]; then
 fi
 [[ -x \$MLXUP ]] || { echo "Brak mlxup i nie udało się go pobrać."; exit 1; }
 psid=\$(mstflint -d "\$BDF" q 2>/dev/null | sed -n 's/^PSID: *//p')
+echo "router-fw-update — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
 echo "Karta \$BDF, PSID \${psid:-?}"
 if [[ \$psid == DEL* ]]; then echo "To karta z firmware Della — zaktualizuj ją pakietem z dell.com/support."; exit 1; fi
 "\$MLXUP" -d "\$BDF" \$ONLINE --query | tee "\$FWDIR/query-\$(date +%F-%H%M).txt"
@@ -347,6 +470,7 @@ EOF
 prog_router_alert() {
   cat <<'EOF'
 #!/bin/sh
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # router-alert <usługa> <SERVICE_RESULT> <EXIT_CODE> <EXIT_STATUS>
 # Wywoływany przez systemd (ExecStopPost / OnFailure). Normalne zatrzymanie = cisza.
 unit="$1"; result="${2:-unknown}"; code="${3:-}"; status="${4:-}"
@@ -366,6 +490,7 @@ EOF
 prog_router_ifaces() {
   cat <<'RIFEOF'
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """router-ifaces — interfejsy VPP (porty, VLAN-y, loopbacki) z pliku /etc/router/ifaces.conf
 
   router-ifaces              pokaż interfejsy: stan w VPP, adresy, opisy (jak "show interfaces description")
@@ -418,6 +543,12 @@ def color(s, c):
     return "\033[%sm%s\033[0m" % (c, s) if TTY else s
 
 
+def signature():
+    """Stopka z autorem na końcu wyniku polecenia: tylko na terminalu (skrypty i potoki dostają czysty wynik)."""
+    if sys.stdout.isatty():
+        print(color("— Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>", "2"))
+
+
 # --------------------------------------------------------------------------- logi
 def now():
     return time.strftime("%F %T")
@@ -432,16 +563,30 @@ def log(msg):
         pass
 
 
+def mon_max_sev():
+    """Najwyższy poziom zapisywany w alarmy.log (LOG_MAX_SEV w router-monitor.conf; 4 = ostrzeżenia i groźniejsze)."""
+    try:
+        with open(ROOT + "/etc/router/router-monitor.conf") as f:
+            m = re.search(r"^LOG_MAX_SEV=(\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else 4
+    except OSError:
+        return 4
+
+
+CLOSING_RE = re.compile(r"(_NORMAL|_END|RECOVERED)$")
+
+
 def event(sev, mnem, text, mail=True):
     """Zdarzenie w stylu Cisco: log router-monitor + syslog + (opcjonalnie) e-mail."""
     line = "%%IFACE-%d-%s: %s" % (sev, mnem, text)
     log(line)
-    try:
-        os.makedirs(LOGDIR, exist_ok=True)
-        with open(MONLOG, "a") as f:
-            f.write("%s %s\n" % (now(), line))
-    except OSError:
-        pass
+    if sev <= mon_max_sev() or CLOSING_RE.search(mnem):          # alarmy.log: ostrzeżenia i groźniejsze (+ zakończenia)
+        try:
+            os.makedirs(LOGDIR, exist_ok=True)
+            with open(MONLOG, "a") as f:
+                f.write("%s %s\n" % (now(), line))
+        except OSError:
+            pass
     prio = {1: "alert", 2: "crit", 3: "err", 4: "warning", 5: "notice"}.get(sev, "info")
     subprocess.run(["logger", "-t", "router-ifaces", "-p", "local0." + prio, line],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -1309,6 +1454,8 @@ def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(prog="router-ifaces", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
+    ap.add_argument("--version", action="version", version="router-ifaces — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
     ap.add_argument("cmd", nargs="?", default="show", choices=["show", "diff", "apply", "check", "render", "boot", "snmp"])
     ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
     ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
@@ -1318,7 +1465,9 @@ def main():
         sys.exit("Uruchom jako root.")
     fn = {"show": do_show, "diff": do_diff, "check": do_check, "render": do_render, "snmp": do_snmp,
           "apply": lambda a: do_apply(a), "boot": lambda a: do_apply(a, boot=True)}[args.cmd]
-    sys.exit(fn(args))
+    rc = fn(args)
+    signature()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
@@ -1329,6 +1478,7 @@ RIFEOF
 prog_mdadm_alert() {
   cat <<'EOF'
 #!/bin/sh
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # Wywoływany przez mdadm --monitor:  mdadm-alert <zdarzenie> <macierz> [dysk]
 ev="$1"; md="$2"; dev="${3:-}"
 case "$ev" in
@@ -1342,7 +1492,7 @@ state=$(grep -A1 "^$name " /proc/mdstat 2>/dev/null | grep -o '\[[U_]*\]' | tail
 msg="%MD-$sev-$(echo "$ev" | tr '[:lower:]' '[:upper:]'): $md ${dev:+dysk $dev }${state:+stan $state}"
 logger -t mdadm-alert -p "$prio" "$msg"
 mkdir -p /var/log/router
-printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log
+[ "$sev" -le 4 ] && printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log   # alarmy.log: ostrzeżenia i groźniejsze
 [ "$sev" -le 5 ] && /opt/router/bin/router-notify queue "$msg" >/dev/null 2>&1
 exit 0
 EOF
@@ -1351,13 +1501,14 @@ EOF
 prog_smartd_alert() {
   cat <<'EOF'
 #!/bin/sh
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # Wywoływany przez smartd (-M exec). smartd ustawia SMARTD_DEVICE, SMARTD_FAILTYPE, SMARTD_MESSAGE.
 t=$(echo "${SMARTD_FAILTYPE:-ALERT}" | tr '[:lower:]' '[:upper:]')
 sev=2; [ "$t" = "EMAILTEST" ] && sev=6
 msg="%SMART-$sev-$t: ${SMARTD_DEVICE:-?} ${SMARTD_MESSAGE:-}"
 logger -t smartd-alert -p local0.crit "$msg"
 mkdir -p /var/log/router
-printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log
+[ "$sev" -le 4 ] && printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log   # alarmy.log: ostrzeżenia i groźniejsze
 [ "$sev" -le 5 ] && /opt/router/bin/router-notify queue "$msg" >/dev/null 2>&1
 exit 0
 EOF
@@ -1366,6 +1517,7 @@ EOF
 prog_router_monitor() {
   cat <<'ROUTER_MONITOR_PY'
 #!/usr/bin/python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # router-monitor — monitor obciążenia routera VPP w czasie rzeczywistym.
 #
 # Co sekundę czyta segment statystyk VPP i zapisuje do logu zdarzenia
@@ -1377,7 +1529,7 @@ prog_router_monitor() {
 #   %VPP-1-HANG          VPP przestał odpowiadać (opcjonalny automatyczny restart)
 #   %SYS-4-CPU_HIGH      przeciążony rdzeń systemowy (BIRD, SNMP itd.)
 #   %MD-1-DEGRADED       zdegradowana macierz mdadm
-#   %VPP-6-STATS         co minutę szczyty z ostatniej minuty (historia)
+#   %VPP-6-STATS         szczyty z ostatniej minuty (historia; domyślnie wyłączone: SUMMARY_EVERY=60 to włącza)
 # Po ustąpieniu zdarzenia: *_NORMAL z czasem trwania i wartością szczytową.
 #
 # Logi: syslog/journal (tag router-monitor, facility local0)
@@ -1408,7 +1560,8 @@ CFG = {
     "HK_CPU_PCT": 90.0,     # % zajętości rdzenia systemowego
     "HK_CPU_SECONDS": 5,    # przez ile sekund z rzędu
     "REPEAT_EVERY": 10,     # s, przypomnienie o trwającym zdarzeniu
-    "SUMMARY_EVERY": 60,    # s, linia %VPP-6-STATS (0 = wyłączone)
+    "SUMMARY_EVERY": 0,     # s, linia %VPP-6-STATS (0 = wyłączone; w logu mają być tylko ostrzeżenia i zdarzenia)
+    "LOG_MAX_SEV": 4,       # najwyższy poziom zapisywany w alarmy.log (4 = ostrzeżenia i groźniejsze; 6 = także informacje)
     "XSTATS_EVERY": 10,     # s, odczyt liczników sprzętowych karty (vppctl)
     "MD_EVERY": 10,         # s, kontrola /proc/mdstat
     "HANG_SECONDS": 30,     # s bez heartbeat VPP => %VPP-1-HANG
@@ -1435,6 +1588,19 @@ def load_conf():
         pass
 
 
+CLOSING_RE = re.compile(r"(_NORMAL|_END|RECOVERED)$|^UP$")
+
+
+def alarm_log_allowed(sev, mnem):
+    """Do alarmy.log idą ostrzeżenia i groźniejsze (LOG_MAX_SEV) oraz zakończenia alarmów, żeby było widać czas trwania."""
+    return sev <= CFG["LOG_MAX_SEV"] or bool(CLOSING_RE.search(mnem))
+
+
+class AlarmFilter(logging.Filter):
+    def filter(self, record):
+        return alarm_log_allowed(getattr(record, "sev", 1), getattr(record, "mnem", ""))
+
+
 def setup_log():
     log = logging.getLogger("router-monitor")
     log.setLevel(logging.INFO)
@@ -1448,6 +1614,7 @@ def setup_log():
     os.makedirs(os.path.dirname(CFG["LOGFILE"]), exist_ok=True)
     fh = logging.handlers.WatchedFileHandler(CFG["LOGFILE"])
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    fh.addFilter(AlarmFilter())                          # plik: tylko ostrzeżenia i groźniejsze; syslog/journal dostaje wszystko
     log.addHandler(fh)
     if sys.stdout.isatty():
         log.addHandler(logging.StreamHandler(sys.stdout))
@@ -1478,7 +1645,7 @@ def queue_mail(line, sev):
 
 def emit(fac, sev, mnem, msg, mail=True):
     line = "%%%s-%d-%s: %s" % (fac, sev, mnem, msg)
-    LOG.log(SEV_LEVEL.get(sev, logging.INFO), "%s", line)
+    LOG.log(SEV_LEVEL.get(sev, logging.INFO), "%s", line, extra={"sev": sev, "mnem": mnem})
     if mail and mnem not in NOMAIL:
         queue_mail(line, sev)
 
@@ -1637,6 +1804,9 @@ def phys_if(name):
 # ------------------------------------------------------------------ główna pętla
 def main():
     global LOG
+    if len(sys.argv) > 1 and sys.argv[1] in ("-V", "--version", "-h", "--help"):
+        print("router-monitor — monitor obciążenia routera VPP w czasie rzeczywistym (usługa systemd)\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return
     load_conf()
     LOG = setup_log()
     try:
@@ -1707,8 +1877,14 @@ def main():
                           miss[:, i].sum() + nobuf[:, i].sum(), punt[:, i].sum())
 
             # heartbeat / zawieszenie
-            if hb != hb_last:
-                hb_last, hb_t = hb, t0
+            # VPP 26.06: /sys/heartbeat potrafi stać w miejscu przy żyjącym VPP, więc o życiu VPP świadczy też
+            # rosnący licznik pętli workerów (/sys/loops_per_worker)
+            try:
+                beat = (hb, sum(int(x) for x in lrow))
+            except (TypeError, ValueError):
+                beat = (hb, None)
+            if beat != hb_last:
+                hb_last, hb_t = beat, t0
             elif t0 - hb_t >= CFG["HANG_SECONDS"]:
                 emit("VPP", 1, "HANG", "brak heartbeat VPP od %ds" % int(t0 - hb_t))
                 if CFG["HANG_RESTART"] and t0 - last_restart > 300:
@@ -1867,6 +2043,7 @@ ROUTER_MONITOR_PY
 prog_router_notify() {
   cat <<'ROUTER_NOTIFY_PY'
 #!/usr/bin/python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # router-notify — powiadomienia e-mail o alarmach routera.
 #
 #   router-notify queue "%VPP-2-RX_MISS: opis"   dodaj zdarzenie do kolejki (wołają skrypty alarmów)
@@ -2130,6 +2307,9 @@ def test():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("-V", "--version"):
+        print("router-notify — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        sys.exit(0)
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "queue" and len(sys.argv) > 2:
         queue(" ".join(sys.argv[2:]))
@@ -2150,6 +2330,7 @@ if __name__ == "__main__":
               % (CFG["MAIL_SEND_CLEAR"], CFG["MAIL_MAX_SEV"]))
     else:
         print("użycie: router-notify queue \"%FAC-SEV-MNEM: opis\" | run | test | categories")
+        print("Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
         sys.exit(2)
 ROUTER_NOTIFY_PY
 }
@@ -2157,6 +2338,7 @@ ROUTER_NOTIFY_PY
 prog_router_bootcheck() {
   sed "s/@@BIRDUNIT@@/$(bird_unit)/" <<'EOF'
 #!/bin/bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # router-bootcheck — uruchamiany raz po starcie systemu (router-bootcheck.service).
 #   * wykrywa, że poprzedni start nie zakończył się normalnym wyłączeniem
 #     (kernel panic, watchdog, zanik zasilania) i czy zachował się zapis paniki (pstore),
@@ -2169,7 +2351,7 @@ UNITS="netns-dataplane vpp router-ifaces @@BIRDUNIT@@ snmpd-dataplane vpp-snmp-a
 mkdir -p "$STATE" /var/log/router
 report() {
   logger -t router-bootcheck -p "$1" "$2"
-  printf '%s %s\n' "$(date '+%F %T')" "$2" >>"$LOG"
+  case $1 in local0.notice|local0.info) ;; *) printf '%s %s\n' "$(date '+%F %T')" "$2" >>"$LOG" ;; esac   # alarmy.log: tylko problemy
   /opt/router/bin/router-notify queue "$2" >/dev/null 2>&1 || true
 }
 if [[ ${1:-} == --shutdown ]]; then date '+%F %T' >"$STATE/clean-shutdown"; exit 0; fi
@@ -2212,6 +2394,7 @@ EOF
 prog_router_fw() {
   cat <<'ROUTER_FW_PY'
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """router-fw — firewall tranzytu na VPP (acl-plugin) z pliku /etc/router/firewall.conf
 
   router-fw show                       strefy, reguły i stan w VPP
@@ -2291,6 +2474,12 @@ def color(s, c):
     return "\033[%sm%s\033[0m" % (c, s) if TTY else s
 
 
+def signature():
+    """Stopka z autorem na końcu wyniku polecenia: tylko na terminalu (skrypty i potoki dostają czysty wynik)."""
+    if sys.stdout.isatty():
+        print(color("— Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>", "2"))
+
+
 # --------------------------------------------------------------------------- logi
 def now():
     return time.strftime("%F %T")
@@ -2305,16 +2494,30 @@ def log(msg):
         pass
 
 
+def mon_max_sev():
+    """Najwyższy poziom zapisywany w alarmy.log (LOG_MAX_SEV w router-monitor.conf; 4 = ostrzeżenia i groźniejsze)."""
+    try:
+        with open(ROOT + "/etc/router/router-monitor.conf") as f:
+            m = re.search(r"^LOG_MAX_SEV=(\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else 4
+    except OSError:
+        return 4
+
+
+CLOSING_RE = re.compile(r"(_NORMAL|_END|RECOVERED)$")
+
+
 def event(sev, mnem, text, mail=True):
     """Zdarzenie w stylu Cisco: log router-monitor + syslog + (opcjonalnie) e-mail."""
     line = "%%FW-%d-%s: %s" % (sev, mnem, text)
     log(line)
-    try:
-        os.makedirs(LOGDIR, exist_ok=True)
-        with open(MONLOG, "a") as f:
-            f.write("%s %s\n" % (now(), line))
-    except OSError:
-        pass
+    if sev <= mon_max_sev() or CLOSING_RE.search(mnem):          # alarmy.log: ostrzeżenia i groźniejsze (+ zakończenia)
+        try:
+            os.makedirs(LOGDIR, exist_ok=True)
+            with open(MONLOG, "a") as f:
+                f.write("%s %s\n" % (now(), line))
+        except OSError:
+            pass
     prio = {1: "alert", 2: "crit", 3: "err", 4: "warning", 5: "notice"}.get(sev, "info")
     subprocess.run(["logger", "-t", "router-fw", "-p", "local0." + prio, line],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -3633,6 +3836,8 @@ def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(prog="router-fw", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
+    ap.add_argument("--version", action="version", version="router-fw — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
     ap.add_argument("cmd", nargs="?", default="show")
     ap.add_argument("rest", nargs="*")
     ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
@@ -3647,7 +3852,9 @@ def main():
     fn = COMMANDS.get(args.cmd)
     if fn is None:
         sys.exit("nieznane polecenie: %s (dostępne: %s)" % (args.cmd, ", ".join(sorted(COMMANDS)) or "brak"))
-    sys.exit(fn(args))
+    rc = fn(args)
+    signature()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
@@ -3658,6 +3865,7 @@ ROUTER_FW_PY
 prog_router_guard() {
   cat <<'ROUTER_GUARD_PY'
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """router-guard — filtr odbić (SYN-ACK, RST, UDP z portów amplifikacji) w VPP, włączany na żądanie
 
   router-guard on <prefiks|IP|grupa>[,...] [--monitor|--enforce] [--for 2h]   włącz ochronę wskazanych prefiksów
@@ -3708,6 +3916,12 @@ def color(s, c):
     return "\033[%sm%s\033[0m" % (c, s) if TTY else s
 
 
+def signature():
+    """Stopka z autorem na końcu wyniku polecenia: tylko na terminalu (skrypty i potoki dostają czysty wynik)."""
+    if sys.stdout.isatty():
+        print(color("— Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>", "2"))
+
+
 # --------------------------------------------------------------------------- logi
 def now():
     return int(time.time())
@@ -3726,16 +3940,30 @@ def log(msg):
         pass
 
 
+def mon_max_sev():
+    """Najwyższy poziom zapisywany w alarmy.log (LOG_MAX_SEV w router-monitor.conf; 4 = ostrzeżenia i groźniejsze)."""
+    try:
+        with open(ROOT + "/etc/router/router-monitor.conf") as f:
+            m = re.search(r"^LOG_MAX_SEV=(\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else 4
+    except OSError:
+        return 4
+
+
+CLOSING_RE = re.compile(r"(_NORMAL|_END|RECOVERED)$")
+
+
 def event(sev, mnem, text, mail=True):
     """Zdarzenie w stylu Cisco: log router-monitor + syslog + (opcjonalnie) e-mail."""
     line = "%%GUARD-%d-%s: %s" % (sev, mnem, text)
     log(line)
-    try:
-        os.makedirs(LOGDIR, exist_ok=True)
-        with open(MONLOG, "a") as f:
-            f.write("%s %s\n" % (stamp(), line))
-    except OSError:
-        pass
+    if sev <= mon_max_sev() or CLOSING_RE.search(mnem):          # alarmy.log: ostrzeżenia i groźniejsze (+ zakończenia)
+        try:
+            os.makedirs(LOGDIR, exist_ok=True)
+            with open(MONLOG, "a") as f:
+                f.write("%s %s\n" % (stamp(), line))
+        except OSError:
+            pass
     prio = {1: "alert", 2: "crit", 3: "err", 4: "warning", 5: "notice"}.get(sev, "info")
     subprocess.run(["logger", "-t", "router-guard", "-p", "local0." + prio, line],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -4315,13 +4543,15 @@ def cmd_status(args):
 def cmd_check(args):
     quiet = args.log
     conf, errs = load_conf()
+    st = load_state()
     if conf is None:
+        if quiet and not st["active"]:
+            return 0        # ochrona wyłączona i plik jeszcze nieuzupełniony: timer nie ma o czym alarmować
         for e in errs:
             print(color("  " + e, "31"))
         if quiet:
             event(2, "CONFIG_ERROR", "błędy w synack-guard.conf: %s" % "; ".join(errs[:3]), mail=False)
         return 2
-    st = load_state()
     if not st["active"]:
         if not quiet:
             print("synack-guard.conf: składnia OK. Ochrona wyłączona.")
@@ -4441,6 +4671,8 @@ def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(prog="router-guard", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
+    ap.add_argument("--version", action="version", version="router-guard — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
     ap.add_argument("cmd", nargs="?", default="status")
     ap.add_argument("rest", nargs="*")
     ap.add_argument("--monitor", action="store_true", help="on: zostaw tryb monitor (liczy, nie blokuje)")
@@ -4454,7 +4686,9 @@ def main():
     fn = COMMANDS.get(args.cmd)
     if fn is None:
         sys.exit("nieznane polecenie: %s (dostępne: %s)" % (args.cmd, ", ".join(sorted(COMMANDS))))
-    sys.exit(fn(args))
+    rc = fn(args)
+    signature()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
@@ -4466,6 +4700,7 @@ ROUTER_GUARD_PY
 prog_router_top() {
   cat <<'ROUTER_TOP_PY'
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """router-top — podgląd routera na żywo (odświeżanie co sekundę)
 
   router-top [N]          start na karcie N (domyślnie 1)
@@ -4490,8 +4725,10 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 
+AUTOR = "PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
 ROOT = os.environ.get("ROUTER_TOP_ROOT", "")                        # tylko do testów
 IFACES_CONF = ROOT + "/etc/router/ifaces.conf"
 ENV_FILE = ROOT + "/etc/router/router.env"
@@ -4884,6 +5121,11 @@ class App:
         return out
 
 
+def footer_line(foot):
+    """Dolny wiersz ekranu: informacja o przewijaniu (jeśli jest) i autor."""
+    return (foot.strip() + "   " if foot else "") + AUTOR
+
+
 def header(n, paused):
     tabs = "   ".join(("[%d %s]" if k == n else " %d %s ") % (k, v[0]) for k, v in SCREENS.items())
     return "router-top  %s  %s   p pauza  q wyjście%s" % (time.strftime("%H:%M:%S"), tabs, "   PAUZA" if paused else "")
@@ -4910,6 +5152,38 @@ def visible(lines, offset, height):
     return shown, offset, foot
 
 
+WAITING = [("  Zbieranie danych…", "dim")]
+
+
+class Poller(threading.Thread):
+    """Zbiera dane w tle. Interfejs nigdy nie czeka na vppctl (bariera VPP) ani na segment statystyk,
+    więc klawisze i przewijanie reagują od razu, nawet gdy odczyt trwa sekundy."""
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app, self.screen, self.results, self.stop = app, 1, {}, False
+        self.lock, self.wake = threading.Lock(), threading.Event()
+
+    def select(self, n):
+        self.screen = n
+        self.wake.set()                                  # odczyt nowej karty od razu, bez czekania na pełny interwał
+
+    def get(self, n):
+        with self.lock:
+            return self.results.get(n)
+
+    def run(self):
+        while not self.stop:
+            n = self.screen
+            try:
+                lines = self.app.lines(n)
+            except Exception as ex:                      # noqa: BLE001 — jedna zła karta nie może zabić zbierania danych
+                lines = [("  Nie można odczytać danych: %s: %s" % (type(ex).__name__, ex), "miss")]
+            with self.lock:
+                self.results[n] = lines
+            self.wake.wait(INTERVAL)
+            self.wake.clear()
+
+
 def run_curses(stdscr, start):
     curses.curs_set(0)
     curses.use_default_colors()
@@ -4920,50 +5194,64 @@ def run_curses(stdscr, start):
     for i, (k, (fg, a)) in enumerate(pal.items(), 1):
         curses.init_pair(i, fg, -1)
         attr[k] = curses.color_pair(i) | a
-    app, n, paused, lines, last = App(), start, False, [], 0.0
+    poller = Poller(App())
+    poller.select(start)
+    poller.start()
+    n, paused, lines, last_sig = start, False, WAITING, None
     offset = {k: 0 for k in SCREENS}                    # przewinięcie każdej karty osobno
     stdscr.timeout(100)
     stdscr.keypad(True)
-    while True:
-        if not paused and time.time() - last >= INTERVAL:
-            lines, last = app.lines(n), time.time()
-        h, w = stdscr.getmaxyx()
-        height = h - 2                                   # wiersz 0: nagłówek, wiersz 1: pusty
-        shown, offset[n], foot = visible(lines, offset[n], height)
-        stdscr.erase()
-        stdscr.addnstr(0, 0, header(n, paused).ljust(w), w - 1, curses.A_REVERSE)
-        for y, (text, style) in enumerate(shown[:height], 2):
-            stdscr.addnstr(y, 0, text, w - 1, attr.get(style, 0))
-        if foot:
-            stdscr.addnstr(h - 1, 0, foot.ljust(w), w - 1, curses.A_REVERSE)
-        stdscr.refresh()
-        k = stdscr.getch()
-        page = max(1, height - 3)
-        if k in (ord("q"), ord("Q"), 27):
-            return
-        elif k in (ord("p"), ord("P"), ord(" ")):
-            paused = not paused
-        elif k in (curses.KEY_DOWN, ord("j")):
-            offset[n] += 1
-        elif k in (curses.KEY_UP, ord("k")):
-            offset[n] = max(0, offset[n] - 1)
-        elif k == curses.KEY_NPAGE:
-            offset[n] += page
-        elif k == curses.KEY_PPAGE:
-            offset[n] = max(0, offset[n] - page)
-        elif k == curses.KEY_HOME:
-            offset[n] = 0
-        elif k == curses.KEY_END:
-            offset[n] = 10 ** 9                          # visible() przytnie do końca listy
-        elif ord("1") <= k <= ord("0") + len(SCREENS) and int(chr(k)) != n:
-            n, last = int(chr(k)), 0.0
-            app.lines(n)                                 # punkt odniesienia dla szybkości
-            time.sleep(min(INTERVAL, 0.5))
+    try:
+        while True:
+            if not paused:
+                lines = poller.get(n) or WAITING
+            h, w = stdscr.getmaxyx()
+            height = h - 3                               # wiersz 0: nagłówek, 1: pusty, ostatni: stopka z autorem
+            shown, offset[n], foot = visible(lines, offset[n], height)
+            sig = (n, paused, id(lines), offset[n], h, w, time.strftime("%H:%M:%S"))
+            if sig != last_sig:                          # rysujemy tylko przy zmianie (nowe dane, klawisz, zegar, rozmiar)
+                last_sig = sig
+                stdscr.erase()
+                stdscr.addnstr(0, 0, header(n, paused).ljust(w), w - 1, curses.A_REVERSE)
+                for y, (text, style) in enumerate(shown[:height], 2):
+                    stdscr.addnstr(y, 0, text, w - 1, attr.get(style, 0))
+                stdscr.addnstr(h - 1, 0, footer_line(foot).ljust(w), w - 1, curses.A_REVERSE if foot else curses.A_DIM)
+                stdscr.refresh()
+            k = stdscr.getch()
+            if k == -1:
+                continue
+            last_sig = None                              # każdy klawisz (także zmiana rozmiaru) odrysowuje ekran
+            page = max(1, height - 3)
+            if k in (ord("q"), ord("Q"), 27):
+                return
+            elif k in (ord("p"), ord("P"), ord(" ")):
+                paused = not paused
+            elif k in (curses.KEY_DOWN, ord("j")):
+                offset[n] += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                offset[n] = max(0, offset[n] - 1)
+            elif k == curses.KEY_NPAGE:
+                offset[n] += page
+            elif k == curses.KEY_PPAGE:
+                offset[n] = max(0, offset[n] - page)
+            elif k == curses.KEY_HOME:
+                offset[n] = 0
+            elif k == curses.KEY_END:
+                offset[n] = 10 ** 9                      # visible() przytnie do końca listy
+            elif ord("1") <= k <= ord("0") + len(SCREENS) and int(chr(k)) != n:
+                n = int(chr(k))
+                poller.select(n)
+                lines = poller.get(n) or WAITING
+    finally:
+        poller.stop = True
+        poller.wake.set()
 
 
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(prog="router-top", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
+    ap.add_argument("--version", action="version", version="router-top — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
     ap.add_argument("screen", nargs="?", type=int, choices=sorted(SCREENS), default=1, help="ekran startowy")
     ap.add_argument("--once", type=int, choices=sorted(SCREENS), metavar="N", help="jeden odczyt ekranu N jako tekst")
     args = ap.parse_args()
@@ -4974,10 +5262,14 @@ def main():
         print(header(args.once, False))
         for text, _style in app.lines(args.once):
             print(text)
+        print("— Autor: " + AUTOR)
         return 0
     if not sys.stdout.isatty():
         sys.exit("router-top potrzebuje terminala (do skryptów: router-top --once N)")
-    curses.wrapper(run_curses, args.screen)
+    try:
+        curses.wrapper(run_curses, args.screen)
+    except KeyboardInterrupt:           # Ctrl+C: zwykłe wyjście, terminal przywraca curses.wrapper
+        pass
     return 0
 
 
@@ -4986,7 +5278,471 @@ if __name__ == "__main__":
 ROUTER_TOP_PY
 }
 
-prog_router_check() { printf '#!/bin/sh\nexec /opt/router/install-router.sh --check "$@"\n'; }
+prog_router() {
+  cat <<'ROUTER_MENU_PY'
+#!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+"""router — menu zarządzania routerem: jedno wejście do wszystkich narzędzi
+
+  router                        menu: numer obszaru → lista czynności z opisem i wywołaniem → numer czynności
+  router help                   lista obszarów i skrótów
+  router files [obszar]         pliki konfiguracyjne: który plik, które narzędzie go czyta, jak zastosować zmiany
+  router <skrót> [argumenty]    uruchom narzędzie wprost, np. router ifaces diff, router fw apply, router guard status
+  skróty:  ifaces fw guard top notify check update bird
+
+Czynności zmieniające stan pokazują podgląd i pytają o potwierdzenie; zawsze widać też równoważne polecenie.
+W menu: numer = wybór, 0 = powrót, f = pliki konfiguracyjne, q = wyjście.
+"""
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+
+AUTOR = "PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
+BIN_DIRS = ("/opt/router/bin", "/usr/local/sbin")
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return "\033[%sm%s\033[0m" % (code, text) if COLOR else text
+
+
+# --------------------------------------------------------------------------- rejestr: obszary, czynności, pliki
+# plik: (ścieżka, narzędzie, zawartość, jak zastosować zmiany, czy można edytować z menu)
+# parametr: id, pytanie, wymagany, rodzaj (arg = argument pozycyjny; flag = --flaga WARTOŚĆ), flaga, domyślna wartość
+# czynność: tytuł, opis, argv, tryb (read | write), parametry, tail (stałe argumenty po parametrach pozycyjnych),
+#           preview (polecenie podglądu przed potwierdzeniem), confirm (pytanie bez podglądu)
+def P(pid, prompt, required=False, kind="arg", flag="", default=""):
+    return {"id": pid, "prompt": prompt, "required": required, "kind": kind, "flag": flag, "default": default}
+
+
+def A(title, desc, argv, mode="read", params=(), tail=(), preview=None, confirm=False, show=None):
+    return {"title": title, "desc": desc, "argv": list(argv), "mode": mode, "params": list(params), "tail": list(tail),
+            "preview": preview, "confirm": confirm, "show": show}
+
+
+def F(path, tool, what, how, edit=True):
+    return {"path": path, "tool": tool, "what": what, "how": how, "edit": edit}
+
+
+AREAS = [
+    {"key": "ifaces", "alias": "router-ifaces", "title": "Interfejsy",
+     "desc": "porty VPP, VLAN-y, adresy IPv4/IPv6, loopback loop0, opisy (router-ifaces)",
+     "files": [
+         F("/etc/router/ifaces.conf", "router-ifaces", "porty, VLAN-y, adresy IPv4/IPv6, loopbacki, opisy (jedyne źródło prawdy)",
+           "router-ifaces diff → router-ifaces apply"),
+         F("/etc/router/snmp-ifaces.yaml", "router-ifaces", "opisy interfejsów dla SNMP (ifAlias); generowany, nie edytuj",
+           "router-ifaces snmp", edit=False),
+         F("/var/lib/router/ifaces.last-good.conf", "router-ifaces", "ostatnia zastosowana konfiguracja (stan, nie edytuj)",
+           "—", edit=False)],
+     "actions": [
+         A("Pokaż interfejsy", "stan w VPP, adresy i opisy portów, VLAN-ów i loopbacków", ["router-ifaces"]),
+         A("Podgląd zmian (diff)", "co zmieni się w VPP po zastosowaniu ifaces.conf; niczego nie zmienia", ["router-ifaces", "diff"]),
+         A("Zastosuj ifaces.conf", "dodaje, usuwa i zmienia tylko różnice, na żywo, bez restartu VPP", ["router-ifaces", "apply", "-y"],
+           mode="write", preview=["router-ifaces", "diff"]),
+         A("Sprawdź rozjazd", "czy VPP zgadza się z ostatnio zastosowaną konfiguracją", ["router-ifaces", "check"]),
+         A("Pokaż jako polecenia vppctl", "pełna konfiguracja zapisana jako polecenia VPP", ["router-ifaces", "render"]),
+         A("Odśwież opisy SNMP", "przebuduj plik opisów dla SNMP bez dotykania VPP", ["router-ifaces", "snmp"], mode="write",
+           confirm=True)]},
+    {"key": "fw", "alias": "router-fw", "title": "Firewall tranzytu",
+     "desc": "ACL w VPP: strefy, reguły, blokady doraźne, liczniki trafień (router-fw)",
+     "files": [
+         F("/etc/router/firewall.conf", "router-fw", "strefy, listy i reguły ruchu przechodzącego przez router",
+           "router-fw check → router-fw diff → router-fw apply"),
+         F("/etc/router/fw-lists/*.list", "router-fw", "długie listy adresów (list NAZWA include …)", "router-fw check → apply",
+           edit=False),
+         F("/var/lib/router/fw.last-good.conf", "router-fw", "ostatnia zastosowana konfiguracja (stan, nie edytuj)", "—", edit=False),
+         F("/var/lib/router/fw-blocks.json", "router-fw", "blokady doraźne z czasem wygaśnięcia (stan, nie edytuj)",
+           "router-fw block / unblock", edit=False)],
+     "actions": [
+         A("Pokaż strefy i reguły", "strefy, reguły i stan list ACL w VPP", ["router-fw", "show"]),
+         A("Kontrola pliku", "składnia, reguły zacienione, ostrzeżenia o BGP/BFD, rozjazd VPP", ["router-fw", "check"]),
+         A("Podgląd zmian (diff)", "co zmieni się w VPP po zastosowaniu firewall.conf", ["router-fw", "diff"]),
+         A("Zastosuj firewall.conf", "różnicowo, na żywo", ["router-fw", "apply", "-y"], mode="write", preview=["router-fw", "diff"]),
+         A("Zastosuj z automatycznym cofnięciem", "po N sekundach zmiana wraca, jeśli jej nie potwierdzisz",
+           ["router-fw", "apply", "-y"], mode="write", preview=["router-fw", "diff"],
+           params=[P("sec", "Po ilu sekundach cofnąć, jeśli nie potwierdzisz", True, "flag", "--confirm", "120")]),
+         A("Potwierdź zmianę", "zatwierdza zmianę z „automatycznym cofnięciem”", ["router-fw", "confirm"], mode="write", confirm=True),
+         A("Aktywuj na stałe", "reguły wracają po każdym restarcie (po apply i potwierdzeniu)", ["router-fw", "enable"], mode="write",
+           confirm=True),
+         A("Dezaktywuj", "zdejmuje reguły z VPP; po restarcie firewall nie wraca", ["router-fw", "disable", "-y"], mode="write",
+           confirm=True),
+         A("Zablokuj adres", "blokada doraźna adresu lub prefiksu (źródło) w strefie internet", ["router-fw", "block"], mode="write",
+           params=[P("adres", "Adres lub prefiks do zablokowania (np. 198.51.100.7 albo 203.0.113.0/24)", True),
+                   P("czas", "Czas blokady (30m, 2h, 1d; Enter = bezterminowo)")]),
+         A("Zdejmij blokadę", "usuwa blokadę doraźną", ["router-fw", "unblock"], mode="write",
+           params=[P("adres", "Adres lub prefiks do odblokowania", True)]),
+         A("Lista blokad", "aktywne blokady doraźne i czas do wygaśnięcia", ["router-fw", "blocks"]),
+         A("Liczniki trafień", "pakiety i bajty każdej reguły z opisami", ["router-fw", "counters"]),
+         A("Liczniki na żywo", "odświeżanie co sekundę (Ctrl+C wraca do menu)", ["router-fw", "counters", "-w"]),
+         A("Wyzeruj liczniki", "punkt odniesienia liczników po stronie router-fw", ["router-fw", "counters", "clear"], mode="write",
+           confirm=True)]},
+    {"key": "guard", "alias": "router-guard", "title": "Ochrona przed odbiciami",
+     "desc": "SYN-ACK / RST / UDP z portów amplifikacji: włączana na żądanie per prefiks (router-guard)",
+     "files": [
+         F("/etc/router/synack-guard.conf", "router-guard", "interfejsy uplinków i klientów, grupy prefiksów, TTL, polityka RST/UDP",
+           "router-guard check; zmiany działają przy następnym „on”"),
+         F("/var/lib/router/guard.state.json", "router-guard", "co jest włączone teraz (stan, nie edytuj)", "—", edit=False)],
+     "actions": [
+         A("Status", "co jest chronione, tryb, liczniki i zapełnienie tablic", ["router-guard", "status"]),
+         A("Włącz ochronę (tryb monitor)", "uczenie i liczenie naruszeń, nic nie jest odrzucane", ["router-guard", "on"],
+           mode="write", tail=["--monitor"],
+           params=[P("cel", "Prefiks, adres lub grupa z pliku (po przecinku, np. web,203.0.113.0/24)", True),
+                   P("for", "Na jak długo (30m, 2h, 1d; Enter = domyślne max-on)", False, "flag", "--for")]),
+         A("Włącz ochronę z przejściem na enforce", "monitor przez czas rozgrzewki, potem odrzucanie", ["router-guard", "on"],
+           mode="write", tail=["--enforce"],
+           params=[P("cel", "Prefiks, adres lub grupa z pliku (po przecinku, np. web,203.0.113.0/24)", True),
+                   P("for", "Na jak długo (30m, 2h, 1d; Enter = domyślne max-on)", False, "flag", "--for")]),
+         A("Przełącz na enforce", "odrzucaj naruszenia (tylko gdy monitor nie pokazał fałszywych naruszeń)", ["router-guard", "enforce"],
+           mode="write", confirm=True),
+         A("Przełącz na monitor", "tylko licz, nie odrzucaj", ["router-guard", "monitor"], mode="write", confirm=True),
+         A("Zdejmij ochronę z prefiksu", "wyłącza wskazany prefiks, resztę zostawia", ["router-guard", "off"], mode="write",
+           params=[P("cel", "Prefiks, adres lub grupa do zdjęcia", True)]),
+         A("Wyłącz całkowicie", "zdejmuje wszystkie prefiksy i węzły ze ścieżki pakietów", ["router-guard", "off"], mode="write",
+           confirm=True),
+         A("Kontrola", "plik konfiguracyjny i zgodność VPP ze stanem", ["router-guard", "check"])]},
+    {"key": "status", "alias": "router-top", "title": "Status i podgląd na żywo",
+     "desc": "pełna kontrola stanu, podgląd obciążenia i ruchu, alarmy (router-check, router-top)",
+     "files": [
+         F("/etc/router/router.env", "install-router", "parametry instalacji (karta, rdzenie, community SNMP)",
+           "tylko do odczytu; zmiany robi instalator", edit=False),
+         F("/etc/router/version", "install-router", "wersja skryptu zainstalowana na routerze", "install-router --version",
+           edit=False),
+         F("/etc/router/hardware-audit.md", "install-router", "raport audytu sprzętu i BIOS z instalacji",
+           "install-router --audit", edit=False)],
+     "actions": [
+         A("Pełna kontrola stanu", "usługi, VPP, interfejsy, BIRD, SNMP, RAID, ostatnie alarmy", ["install-router", "--check"]),
+         A("Podgląd na żywo: VPP", "obciążenie workerów i ruch łącznie", ["router-top", "1"]),
+         A("Podgląd na żywo: interfejsy", "porty i VLAN-y: Gb/s i pakiety/s", ["router-top", "2"]),
+         A("Podgląd na żywo: firewall", "liczniki reguł ACL", ["router-top", "3"]),
+         A("Podgląd na żywo: guard", "naruszenia na żywo", ["router-top", "4"]),
+         A("Ostatnie alarmy", "50 ostatnich zdarzeń routera", ["tail", "-n", "50", "/var/log/router/alarmy.log"]),
+         A("Alarmy na żywo", "nowe zdarzenia na bieżąco (Ctrl+C wraca do menu)", ["tail", "-f", "/var/log/router/alarmy.log"]),
+         A("Usługi routera", "stan wszystkich usług z router.target", ["systemctl", "status", "router.target", "--no-pager"])]},
+    {"key": "monitor", "alias": "router-notify", "title": "Monitoring i alarmy e-mail",
+     "desc": "progi alarmów (router-monitor) i wysyłka e-mail (router-notify)",
+     "files": [
+         F("/etc/router/router-monitor.conf", "router-monitor", "progi alarmów obciążenia, punt, zawieszenie VPP",
+           "systemctl restart router-monitor"),
+         F("/etc/router/notify.conf", "router-notify", "SMTP, odbiorcy i kategorie e-mail (MAIL_SEND); działa w ciągu 5 s",
+           "router-notify test")],
+     "actions": [
+         A("Stan monitora", "czy router-monitor działa", ["systemctl", "status", "router-monitor", "--no-pager"]),
+         A("Ostatnie alarmy", "50 ostatnich zdarzeń", ["tail", "-n", "50", "/var/log/router/alarmy.log"]),
+         A("Kategorie e-mail", "co jest wysyłane mailem (MAIL_SEND)", ["router-notify", "categories"]),
+         A("Wyślij mail testowy", "sprawdza SMTP i odbiorców z notify.conf", ["router-notify", "test"], mode="write", confirm=True),
+         A("Restart monitora", "po zmianie progów w router-monitor.conf", ["systemctl", "restart", "router-monitor"], mode="write",
+           confirm=True)]},
+    {"key": "bird", "alias": "birdc", "title": "BGP / BIRD",
+     "desc": "sesje BGP, trasy, przeładowanie konfiguracji (birdc)",
+     "files": [
+         F("/etc/bird/bird.conf", "BIRD", "konfiguracja bazowa BIRD (BGP dokłada skrypt sieciowy w conf.d/)",
+           "birdc configure check → birdc configure"),
+         F("/etc/bird/conf.d/*.conf", "BIRD", "sesje BGP, filtry, RPKI (skrypt sieciowy)", "birdc configure check → birdc configure",
+           edit=False)],
+     "actions": [
+         A("Sesje BGP", "stan wszystkich protokołów", ["birdc", "show", "protocols"]),
+         A("Szczegóły protokołu", "pełne informacje o jednej sesji", ["birdc", "show", "protocols", "all"],
+           params=[P("nazwa", "Nazwa protokołu (z listy sesji)", True)]),
+         A("Liczba tras", "ile tras w tablicach", ["birdc", "show", "route", "count"]),
+         A("Trasa do adresu", "którą trasą pójdzie ruch do adresu", ["birdc", "show", "route", "for"],
+           params=[P("adres", "Adres IP", True)]),
+         A("Sprawdź konfigurację BIRD", "składnia bez przeładowania", ["birdc", "configure", "check"]),
+         A("Przeładuj konfigurację BIRD", "wczytuje bird.conf bez zrywania sesji", ["birdc", "configure"], mode="write",
+           preview=["birdc", "configure", "check"])]},
+    {"key": "access", "alias": "", "title": "SNMP, sFlow i SSH",
+     "desc": "dostęp zarządzający przez loop0 i port zarządzający, eksport sFlow",
+     "files": [
+         F("/etc/snmp/snmpd.conf", "snmpd (dataplane)", "SNMP na loop0: liczniki portów VPP, community, zaufane sieci",
+           "systemctl restart snmpd-dataplane"),
+         F("/etc/snmp/snmpd-mgmt.conf", "snmpd (port zarządzający)", "SNMP hosta: Linux, RAID, dyski",
+           "systemctl restart snmpd-mgmt"),
+         F("/etc/hsflowd.conf", "hsflowd", "kolektor sFlow (FastNetMon) i źródło próbek z VPP", "systemctl restart hsflowd"),
+         F("/etc/ssh/sshd_config_dataplane", "sshd (dataplane)", "sshd na adresie loop0 (hasło lub klucz)",
+           "sshd -t -f /etc/ssh/sshd_config_dataplane → systemctl restart sshd-dataplane"),
+         F("/etc/ssh/sshd_config.d/00-router-access.conf", "sshd (port zarządzający)", "PermitRootLogin na porcie zarządzającym",
+           "sshd -t → systemctl reload ssh"),
+         F("/etc/iptables/dataplane.rules.v4", "router-dataplane-fw", "ochrona SSH/SNMP w dataplane (IPv4); IPv6: dataplane.rules.v6",
+           "systemctl restart router-dataplane-fw"),
+         F("/etc/iptables/rules.v4", "netfilter-persistent", "ochrona SSH/SNMP na porcie zarządzającym (IPv4)",
+           "netfilter-persistent reload")],
+     "actions": [
+         A("Stan SNMP", "snmpd w dataplane, snmpd na porcie zarządzającym, agent VPP",
+           ["systemctl", "status", "snmpd-dataplane", "snmpd-mgmt", "vpp-snmp-agent", "--no-pager"]),
+         A("Stan sFlow", "hsflowd i wtyczka sFlow w VPP", ["systemctl", "status", "hsflowd", "--no-pager"]),
+         A("Stan SSH w dataplane", "sshd na adresie loop0", ["systemctl", "status", "sshd-dataplane", "--no-pager"]),
+         A("Gniazda nasłuchu w dataplane", "kto słucha na SSH (22) i SNMP (161) w namespace dataplane",
+           ["ip", "netns", "exec", "dataplane", "ss", "-tulnp"]),
+         A("Restart SNMP w dataplane", "po zmianie snmpd.conf", ["systemctl", "restart", "snmpd-dataplane"], mode="write",
+           confirm=True),
+         A("Restart sshd w dataplane", "po zmianie sshd_config_dataplane (sesje przez loop0 zostaną zerwane)",
+           ["systemctl", "restart", "sshd-dataplane"], mode="write", confirm=True)]},
+    {"key": "vpp", "alias": "vppctl", "title": "VPP (data plane)",
+     "desc": "podgląd VPP przez vppctl: porty, błędy, wątki, pary linux-cp",
+     "files": [
+         F("/etc/vpp/startup.conf", "VPP", "rdzenie, pamięć, porty DPDK, linux-cp; zmiana wymaga restartu VPP (przerwa w ruchu)",
+           "systemctl restart vpp"),
+         F("/etc/vpp/bootstrap.vpp", "VPP", "polecenia wykonywane po starcie VPP (MTU, porty up, sFlow)", "systemctl restart vpp")],
+     "actions": [
+         A("Wersja i wątki", "wersja VPP i przypisanie workerów do rdzeni", ["vppctl", "show", "threads"]),
+         A("Interfejsy", "stan i liczniki interfejsów VPP", ["vppctl", "show", "interface"]),
+         A("Sprzęt portów", "karta, kolejki, błędy startu portów", ["vppctl", "show", "hardware-interfaces"]),
+         A("Błędy węzłów", "liczniki błędów (w tym synack-guard)", ["vppctl", "show", "errors"]),
+         A("Obciążenie węzłów", "wektory na wywołanie i cykle (runtime)", ["vppctl", "show", "runtime"]),
+         A("Pary linux-cp", "interfejsy VPP sparowane z Linuksem w dataplane", ["vppctl", "show", "lcp"]),
+         A("Układ rdzeni i maksimum workerów", "ile workerów jest teraz, ile można i jak rozłożą się rdzenie (nic nie zmienia)",
+           ["install-router", "set_workers", "--dry-run"]),
+         A("Zmień liczbę workerów", "bez reinstalacji: GRUB (izolacja rdzeni) + startup.conf; działa po restarcie serwera",
+           ["install-router", "set_workers"], mode="write", params=[P("liczba", "Nowa liczba workerów", required=True)],
+           tail=["--yes"], preview=["install-router", "set_workers", "{0}", "--dry-run"])]},
+    {"key": "system", "alias": "install-router", "title": "System i aktualizacje",
+     "desc": "wersja, aktualizacja programów, firmware karty, RAID/UEFI, historia zmian /etc",
+     "files": [
+         F("/opt/router/install-router.sh", "install-router", "kopia instalatora (naprawa etapów, upgrade_script)",
+           "install-router --from <nr>", edit=False)],
+     "actions": [
+         A("Wersja instalatora", "wersja skryptu i wersja zainstalowana na routerze", ["install-router", "--version"]),
+         A("Aktualizacja programów: podgląd", "co zmieniłoby upgrade_script (niczego nie zapisuje)",
+           ["bash"], params=[P("plik", "Ścieżka do nowego install-router.sh", True, "arg", "", "/root/install-router.sh")],
+           tail=["upgrade_script", "--dry-run"]),
+         A("Aktualizacja programów: wykonaj", "podmienia tylko zmienione programy, bez restartu VPP i BIRD",
+           ["bash"], mode="write", params=[P("plik", "Ścieżka do nowego install-router.sh", True, "arg", "", "/root/install-router.sh")],
+           tail=["upgrade_script"], confirm=True),
+         A("Firmware karty: sprawdź", "obecna i dostępna wersja firmware ConnectX", ["router-fw-update", "--check"]),
+         A("Firmware karty: aktualizuj", "zapis firmware (pyta o potwierdzenie, wymaga restartu serwera)", ["router-fw-update"],
+           mode="write"),
+         A("RAID/UEFI: podgląd", "kopia ESP na drugi dysk RAID1 (dry-run)", ["install-uefi-mdadm", "--dry-run"]),
+         A("Historia zmian /etc", "20 ostatnich zmian zapisanych przez etckeeper", ["git", "-C", "/etc", "log", "--oneline", "-n", "20"])]},
+]
+
+ALIASES = {"ifaces": ["router-ifaces"], "fw": ["router-fw"], "guard": ["router-guard"], "top": ["router-top"],
+           "notify": ["router-notify"], "check": ["install-router", "--check"], "update": ["install-router"], "bird": ["birdc"]}
+
+
+# --------------------------------------------------------------------------- uruchamianie
+def resolve(argv0):
+    override = os.environ.get("ROUTER_MENU_BIN")
+    dirs = (override,) if override else BIN_DIRS
+    for d in dirs:
+        p = os.path.join(d, argv0)
+        if os.access(p, os.X_OK):
+            return p
+    return shutil.which(argv0)
+
+
+def cmdline(argv):
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def run(argv):
+    path = resolve(argv[0])
+    if not path:
+        print(c("  [BŁĄD] nie znaleziono polecenia: %s (czy usługa jest zainstalowana?)" % argv[0], "31"))
+        return 127
+    try:
+        return subprocess.call([path] + argv[1:])
+    except KeyboardInterrupt:
+        print("\n  (przerwano — powrót do menu)")
+        return 130
+
+
+class Quit(Exception):
+    pass
+
+
+def ask(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        raise Quit()
+    except KeyboardInterrupt:
+        print()
+        raise Quit()
+
+
+def yes(prompt):
+    return ask(prompt + " [t/N] ").strip().lower() in ("t", "tak", "y", "yes")
+
+
+def shown(action):
+    """Wywołanie z oznaczeniem parametrów, np. router-fw block ADRES [CZAS]."""
+    pos = [p["id"].upper() if p["required"] else "[%s]" % p["id"].upper() for p in action["params"] if p["kind"] == "arg"]
+    flags = ["%s %s" % (p["flag"], p["id"].upper()) if p["required"] else "[%s %s]" % (p["flag"], p["id"].upper())
+             for p in action["params"] if p["kind"] == "flag"]
+    return cmdline(action["argv"]) + "".join(" " + x for x in pos) + "".join(" " + shlex.quote(x) for x in action["tail"]) \
+        + "".join(" " + x for x in flags)
+
+
+def collect(action):
+    """Pyta o parametry czynności; zwraca (argv, błąd). Pole wymagane nie przejdzie pustego wpisu."""
+    pos, flags = [], []
+    for p in action["params"]:
+        while True:
+            hint = " [%s]" % p["default"] if p["default"] else (" (Enter = pomiń)" if not p["required"] else "")
+            val = ask("  %s%s: " % (p["prompt"], hint)).strip() or p["default"]
+            if val or not p["required"]:
+                break
+            print(c("  To pole jest wymagane.", "33"))
+        if not val:
+            continue
+        if p["kind"] == "flag":
+            flags += [p["flag"], val]
+        else:
+            pos.append(val)
+    return action["argv"] + pos + action["tail"] + flags, pos
+
+
+def execute(action):
+    argv, pos = collect(action)
+    print("  %s %s" % (c("→ polecenie:", "2"), cmdline(argv)))
+    if action["preview"]:
+        print(c("  Podgląd zmian:", "1"))
+        run([a.replace("{0}", pos[0]) if pos else a for a in action["preview"]])
+    if action["mode"] == "write" and (action["preview"] or action["confirm"]):
+        if not yes(c("  Zmienia stan routera. Wykonać?", "33")):
+            print("  Przerwano — nic nie zmieniono.")
+            return
+    rc = run(argv)
+    print(c("  [koniec, kod %d]" % rc, "2"))
+
+
+# --------------------------------------------------------------------------- ekrany
+def host():
+    return socket.gethostname()
+
+
+def show_files(files, numbered=False):
+    for i, f in enumerate(files, 1):
+        head = "  %d  %s" % (i, f["path"]) if numbered else "  %s" % f["path"]
+        print(c(head, "1"))
+        print("       narzędzie: %s" % f["tool"])
+        print("       zawiera:   %s" % f["what"])
+        print("       zmiany:    %s" % f["how"])
+
+
+def edit_file(f):
+    if not f["edit"]:
+        print(c("  Ten plik nie jest do ręcznej edycji.", "33"))
+        return
+    ed = os.environ.get("EDITOR") or shutil.which("nano") or "vi"
+    run([ed, f["path"]])
+    print("  Zastosuj zmiany: %s" % f["how"])
+
+
+def files_screen(files):
+    while True:
+        print()
+        print(c("Pliki konfiguracyjne", "1;36"))
+        show_files(files, numbered=True)
+        print()
+        ch = ask("  Numer pliku do edycji (Enter = powrót): ").strip()
+        if not ch:
+            return
+        if ch.isdigit() and 1 <= int(ch) <= len(files):
+            edit_file(files[int(ch) - 1])
+        else:
+            print(c("  Nieprawidłowy wybór: %s" % ch, "31"))
+
+
+def area_menu(area):
+    while True:
+        print()
+        print(c("%s — %s" % (area["title"], area["desc"]), "1;36"))
+        for f in area["files"]:
+            print("  plik: %s  (%s)" % (f["path"], f["tool"]))
+        print()
+        for i, a in enumerate(area["actions"], 1):
+            tag = c("[ZMIANA]", "33") if a["mode"] == "write" else c("[odczyt]", "32")
+            print(" %2d  %-44s %s" % (i, a["title"], tag))
+            print("       %s" % a["desc"])
+            if a["params"]:
+                print("       parametry: %s" % ", ".join(p["prompt"].split(" (")[0].lower() for p in a["params"]))
+            print(c("       → %s" % (a["show"] or shown(a)), "2"))
+        print("  f  Pliki konfiguracyjne tego obszaru")
+        print("  0  Powrót")
+        ch = ask("Wybierz: ").strip().lower()
+        if ch in ("0", "b", ""):
+            return
+        if ch == "f":
+            files_screen(area["files"])
+        elif ch.isdigit() and 1 <= int(ch) <= len(area["actions"]):
+            execute(area["actions"][int(ch) - 1])
+            ask(c("  Naciśnij Enter, aby wrócić do menu… ", "2"))
+        else:
+            print(c("  Nieprawidłowy wybór: %s" % ch, "31"))
+
+
+def main_menu():
+    all_files = [f for a in AREAS for f in a["files"]]
+    while True:
+        print()
+        print(c("router — zarządzanie routerem %s" % host(), "1;36"))
+        print()
+        for i, a in enumerate(AREAS, 1):
+            print("  %d  %-28s %s" % (i, a["title"], c(a["desc"], "2")))
+        print("  f  Pliki konfiguracyjne")
+        print("  q  Wyjście")
+        print(c("  Autor: " + AUTOR, "2"))
+        ch = ask("Wybierz: ").strip().lower()
+        if ch in ("q", "quit", "exit"):
+            return 0
+        if ch == "f":
+            files_screen(all_files)
+        elif ch.isdigit() and 1 <= int(ch) <= len(AREAS):
+            area_menu(AREAS[int(ch) - 1])
+        else:
+            print(c("  Nieprawidłowy wybór: %s" % ch, "31"))
+
+
+def help_text():
+    print(__doc__)
+    print("Obszary menu:")
+    for i, a in enumerate(AREAS, 1):
+        print("  %d  %-28s %s" % (i, a["title"], a["desc"]))
+    print("\nSkróty: " + "  ".join("%s → %s" % (k, cmdline(v)) for k, v in ALIASES.items()))
+    print("Autor: " + AUTOR)
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] in (["-V"], ["--version"]):
+        print("router — Autor: " + AUTOR)
+        return 0
+    if args[:1] in (["help"], ["-h"], ["--help"]):
+        help_text()
+        return 0
+    if args[:1] == ["files"]:
+        sel = args[1] if len(args) > 1 else ""
+        areas = [a for a in AREAS if not sel or sel in (a["key"], a["alias"])]
+        if not areas:
+            print("nieznany obszar: %s (dostępne: %s)" % (sel, ", ".join(a["key"] for a in AREAS)), file=sys.stderr)
+            return 2
+        for a in areas:
+            print(c("%s" % a["title"], "1;36"))
+            show_files(a["files"])
+            print()
+        return 0
+    if args:
+        base = ALIASES.get(args[0])
+        if base is None:
+            print("nieznane polecenie: %s (router help)" % args[0], file=sys.stderr)
+            return 2
+        return run(base + args[1:])
+    try:
+        return main_menu()
+    except Quit:
+        print()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ROUTER_MENU_PY
+}
+
+prog_router_check() { printf '#!/bin/sh\n# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>\nexec /opt/router/install-router.sh --check "$@"\n'; }
 
 # wersja skryptu zapisana na routerze (/etc/router/version): write_version install|upgrade
 write_version() {
@@ -5003,12 +5759,27 @@ write_version() {
   } >"$VERSION_FILE"
 }
 
+guard_plugin_log() {
+  local lines
+  lines=$( { vppctl show logging 2>/dev/null; journalctl -u vpp -b --no-pager 2>/dev/null; } | grep -i 'synack_guard' | sort -u | tail -5)
+  if [[ -z $lines ]]; then
+    warn "w logu VPP brak wpisu o synack_guard_plugin.so (vppctl show logging, journalctl -u vpp)"
+  elif grep -qiE 'Failed to load|mismatch|Not a plugin|disabled|Bad r2' <<<"$lines"; then
+    warn "VPP nie załadował wtyczki synack_guard:"
+    sed 's/^/    /' <<<"$lines"
+  else
+    ok "log VPP:"
+    sed 's/^/    /' <<<"$lines"
+  fi
+}
+
 # =============================================================================
 # TRYB --check
 # =============================================================================
 do_check() {
   SNMP_COMMUNITY=$(grep -sh '^SNMP_COMMUNITY=' /etc/router/router.env "$ENV_FILE" | head -n1 | cut -d= -f2 || true)
   printf '\n%s== Wersja ==%s\n' "$c_hdr" "$c_off"
+  printf '  autor: %s\n' "PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
   if [[ -f $VERSION_FILE ]]; then
     printf '  skrypt na routerze: %s (zainstalowany %s%s)\n' "$(sed -n 's/^SCRIPT_VERSION=//p' "$VERSION_FILE")" \
       "$(sed -n 's/^INSTALLED_AT=//p' "$VERSION_FILE")" "$(sed -n 's/^UPGRADED_AT=\(.*\)$/, ostatnia aktualizacja programów \1/p' "$VERSION_FILE")"
@@ -5033,7 +5804,7 @@ do_check() {
   printf '\n%s== Usługi ==%s\n' "$c_hdr" "$c_off"
   local u
   [[ -e /etc/router/firewall.enabled ]] || say "router-fw: firewall nieaktywny (aktywacja: router-fw enable) — usługa celowo nie działa"
-  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd; do
+  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd sshd-dataplane snmpd-mgmt; do
     if systemctl is-active --quiet "$u"; then ok "$u: active"; else warn "$u: $(systemctl is-active "$u" 2>/dev/null || true)"; fi
   done
 
@@ -5062,6 +5833,15 @@ do_check() {
   printf '\n%s== Ochrona przed odbiciami (router-guard) ==%s\n' "$c_hdr" "$c_off"
   if [[ -x /opt/router/bin/router-guard ]]; then /opt/router/bin/router-guard status 2>&1 || true
   else warn "brak router-guard — uruchom: install-router --from 23"; fi
+  printf '\n%s== Dostęp przez loop0 (SSH, SNMP) ==%s\n' "$c_hdr" "$c_off"
+  if [[ -n ${LOOP0_ADDR:-} ]]; then
+    ip -n dataplane -o addr show 2>/dev/null | grep -q " ${LOOP0_ADDR%%/*}/" && ok "loop0 ${LOOP0_ADDR%%/*} jest w dataplane" \
+      || warn "brak ${LOOP0_ADDR%%/*} w dataplane — sprawdź loop0 w /etc/router/ifaces.conf i: router-ifaces apply"
+    ip netns exec dataplane ss -H -tlnp 'sport = :22' 2>/dev/null | sed 's/^/  ssh  (dataplane): /'
+    ip netns exec dataplane ss -H -ulnp 'sport = :161' 2>/dev/null | sed 's/^/  snmp (dataplane): /'
+  else warn "LOOP0_ADDR puste — brak loop0 (SSH/SNMP w dataplane wyłączone)"; fi
+  ss -H -tlnp 'sport = :22' 2>/dev/null | sed 's/^/  ssh  (port zarządzający): /'
+  ss -H -ulnp 'sport = :161' 2>/dev/null | sed 's/^/  snmp (port zarządzający): /'
   printf '\n%s== BIRD ==%s\n' "$c_hdr" "$c_off"
   birdc show status || true
   birdc show protocols || true
@@ -5075,7 +5855,7 @@ do_check() {
 
   printf '\n%s== router-monitor (ostatnie zdarzenia) ==%s\n' "$c_hdr" "$c_off"
   tail -n 15 /var/log/router/alarmy.log 2>/dev/null || warn "brak logu router-monitor"
-  printf '\n  ostatnia kontrola po starcie: %s\n' "$(grep -h 'BOOT_' /var/log/router/alarmy.log 2>/dev/null | tail -n1)"
+  printf '\n  ostatnia kontrola po starcie: %s\n' "$(journalctl -t router-bootcheck -n 1 -o cat --no-pager -q 2>/dev/null | tail -n1)"
   printf '\n%s== Historia /etc (etckeeper) ==%s\n' "$c_hdr" "$c_off"
   git -C /etc log --oneline -n 5 2>/dev/null || true
   printf '\n%s== Odporność ==%s\n' "$c_hdr" "$c_off"
@@ -5131,7 +5911,7 @@ SSH (port zarządzający eth2) działa poza VPP — żadna zmiana interfejsów, 
 
 | Logi (`/var/log/router/`, rotacja codziennie, 20 dni) | Zawartość |
 |---|---|
-| `alarmy.log` | **wszystkie alarmy i zdarzenia** — od tego zaczynaj; z niego idą e-maile |
+| `alarmy.log` | **ostrzeżenia, błędy i zdarzenia krytyczne** (poziomy 1–4) oraz zakończenia alarmów — od tego zaczynaj; informacje (start, zmiany konfiguracji) są w logach narzędzi i w journalu |
 | `firewall.log`, `guard.log`, `ifaces.log` | każde polecenie wysłane do VPP i odpowiedź VPP (szczegóły zmian) |
 | `vpp.log`, `bird.log` | komunikaty VPP i BIRD |
 
@@ -5475,6 +6255,7 @@ UPGRADE_PROGRAMS=(
   "router-ifaces|/opt/router/bin/router-ifaces|755|prog_router_ifaces|"
   "router-fw|/opt/router/bin/router-fw|755|prog_router_fw|"
   "router-guard|/opt/router/bin/router-guard|755|prog_router_guard|"
+  "router|/opt/router/bin/router|755|prog_router|"
   "router-top|/opt/router/bin/router-top|755|prog_router_top|"
   "router-alert|/opt/router/bin/router-alert|755|prog_router_alert|"
   "router-bootcheck|/opt/router/bin/router-bootcheck|755|prog_router_bootcheck|"
@@ -5614,6 +6395,7 @@ do_upgrade() {
   [[ -e /opt/router/bin/router-top ]] && ln -sfn /opt/router/bin/router-top /usr/local/sbin/router-top
   ln -sfn /opt/router/bin/router-fw-update /usr/local/sbin/router-fw-update
   ln -sfn /opt/router/install-router.sh /usr/local/sbin/install-router
+  ln -sfn /opt/router/bin/router /usr/local/sbin/router
   ok "podmieniono: ${changed[*]}   (poprzednie wersje: $bdir)"
   migrate_logdir
   router_logrotate
@@ -5644,7 +6426,65 @@ do_upgrade() {
 
 if [[ $MODE == upgrade ]]; then do_upgrade; exit 0; fi
 
+# --- set_workers: zmiana liczby workerów VPP (rdzenie, izolacja, startup.conf) bez ponownej instalacji
+# różnice między /etc/vpp/startup.conf a tym, co wyliczył instalator (rdzenie, bufory, sterta, porty); kod 0 = są zmiany
+vpp_conf_diff() {
+  local f=${VPP_STARTUP_CONF:-/etc/vpp/startup.conf} cw cb ch cp chp rc=1
+  cw=$(grep -oE 'corelist-workers [0-9,]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
+  cb=$(grep -oE 'buffers-per-numa [0-9]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
+  ch=$(grep -oE 'main-heap-size [^ }]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
+  cp=$(grep -oE 'dev [0-9a-fA-F:.]+' "$f" 2>/dev/null | cut -d' ' -f2 | tr '\n' ' ' | sed 's/ $//')
+  chp=$(grep -oE 'vm.nr_hugepages *= *[0-9]+' "${VPP_SYSCTL_CONF:-/etc/sysctl.d/81-vpp-router.conf}" 2>/dev/null | head -n1 | grep -oE '[0-9]+$')
+  [[ $chp == "$HUGEPAGES_2M" ]] || { echo "  zmiana: hugepages ${chp:-brak} → $HUGEPAGES_2M"; rc=0; }
+  [[ $cw == "$WORKERS_CSV" ]] || { echo "  zmiana: rdzenie ${cw:-brak} → $WORKERS_CSV"; rc=0; }
+  [[ $cb == "$BUFFERS" ]] || { echo "  zmiana: bufory ${cb:-brak} → $BUFFERS"; rc=0; }
+  [[ $ch == "$MAIN_HEAP" ]] || { echo "  zmiana: sterta ${ch:-brak} → $MAIN_HEAP"; rc=0; }
+  [[ $cp == "${NIC_PCI[*]}" ]] || { echo "  zmiana: porty ${cp:-brak} → ${NIC_PCI[*]}"; rc=0; }
+  return $rc
+}
+
+workers_plan() {
+  local cur d
+  cur=$(sed -n 's/^[[:space:]]*corelist-workers[[:space:]]*//p' /etc/vpp/startup.conf 2>/dev/null | head -n1)
+  printf '\n%s== Workery VPP ==%s\n' "$c_hdr" "$c_off"
+  printf '  obecnie (startup.conf):    %s\n' "${cur:-brak}"
+  printf '  po zmianie:                %d workerów na rdzeniach %s (rdzeń główny VPP: %s)\n' "$VPP_WORKERS" "$WORKERS_CSV" "$MAIN_CORE"
+  printf '  izolowane rdzenie:         %s\n' "$ISOL_CSV"
+  printf '  maksimum na węźle %s:      %d (rdzenie fizyczne bez systemowego i głównego VPP)\n' "$NUMA" "$avail_w"
+  printf '  zalecane dla %s:   %d\n' "$NIC_MODEL" "$NIC_CAP"
+  printf '  porty VPP (%d): %s — bufory i kolejki RX liczone dla każdego; inny port: install-router set_workers N --choose-nic\n' \
+    "${#NIC_PCI[@]}" "${NIC_PCI[*]}"
+  printf '  bufory VPP: %d (tryb %s, maksimum %d), sterta %s, hugepages %d × 2 MB\n' "$BUFFERS" "$VPP_BUFFERS" "$BUF_MAX" "$MAIN_HEAP" "$HUGEPAGES_2M"
+  if ((VPP_WORKERS > NIC_CAP)); then
+    warn "$VPP_WORKERS workerów to więcej niż zalecane $NIC_CAP dla $NIC_MODEL — dodatkowe rdzenie dają zapas, nie większą przepustowość karty"
+  fi
+  if d=$(vpp_conf_diff); then
+    printf '%s\n' "$d"
+    printf '  Zmiana działa po restarcie serwera (nowe isolcpus w GRUB), a VPP wstanie z nową liczbą kolejek RX i buforami.\n'
+  else
+    ok "startup.conf jest już zgodny (rdzenie, bufory, sterta, porty) — bez zmian"
+  fi
+}
+
+do_set_workers() {
+  workers_plan
+  vpp_conf_diff >/dev/null || return 0
+  FROM_STAGE=5
+  run_stage 05 "Moduły mlx5, sysctl, hugepages" st_kernel
+  run_stage 06 "Izolacja rdzeni, taktowanie, panic (GRUB)" st_isolation
+  run_stage 09 "Konfiguracja VPP + automatyczny restart" st_vpp_config
+  ok "zapisano: $VPP_WORKERS workerów ($WORKERS_CSV), izolacja $ISOL_CSV — GRUB i /etc/vpp/startup.conf zaktualizowane"
+  warn "RESTART SERWERA wymagany (isolcpus); do tego czasu VPP pracuje na starym układzie rdzeni. Restart: systemctl reboot"
+  if ((REBOOT_AFTER)); then
+    printf '\n%sRestart serwera za 15 s (Ctrl+C przerywa)...%s\n' "$c_warn" "$c_off"
+    sleep 15
+    systemctl reboot
+  fi
+}
+
+
 printf '%s[%s] install-router.sh — start. Dane robocze i logi: %s%s\n' "$c_hdr" "$(now)" "$DATA_DIR" "$c_off"
+printf '%sAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>%s\n' "$c_dim" "$c_off"
 
 # =============================================================================
 # ETAP 01 — kontrola wstępna (zawsze wykonywany: wylicza parametry dla reszty)
@@ -5919,7 +6759,7 @@ if [[ $NIC_PSID == DEL* ]]; then
   audit WARN "Firmware" "${NIC_FW:-?} (karta z firmware Della)" "aktualizacja tylko pakietem Della"
   rec 2 "dell.com/support" "Zaktualizuj firmware karty pakietem Della dla PSID $NIC_PSID" "narzędzie NVIDIA mlxup nie obsługuje kart z PSID Della"
 elif [[ $NIC_DEV == 0x1013 && -n $NIC_FW && $(printf '%s\n%s\n' "$NIC_FW" "12.28.0" | sort -V | head -n1) != "12.28.0" ]]; then
-  audit WARN "Firmware" "$NIC_FW" "stary firmware"
+  audit WARN "Firmware" "$NIC_FW" "stary firmware — poniżej 12.28; poniżej 12.21.1000 (minimum DPDK) porty nie wstają (errno -95 przy starcie karty); router-fw-update / dell.com/support"
   rec 2 "system (po instalacji)" "Zaktualizuj firmware karty" "skrypt pobierze firmware i przygotuje polecenie: router-fw-update (uruchamiasz ręcznie, wymaga restartu)"
 else
   audit OK "Firmware" "${NIC_FW:-?}" ""
@@ -5996,14 +6836,26 @@ if ((HT)); then
 fi
 ISOL_CSV=$(join_by , "${ISOL[@]}")
 audit AUTO "Rdzenie" "węzeł $NUMA" "main $MAIN_CORE, workery $WORKERS_CSV, izolowane $ISOL_CSV"
-if [[ $HUGEPAGES_2M == auto ]]; then
-  HUGEPAGES_2M=$(( MEM_MB / 4 / 2 ))
-  ((HUGEPAGES_2M > 8192)) && HUGEPAGES_2M=8192
-  ((HUGEPAGES_2M < 2048)) && HUGEPAGES_2M=2048
-fi
+if ((MEM_MB >= 32768)); then MAIN_HEAP=4G; else MAIN_HEAP=2G; fi
+HEAP_MB=$(( ${MAIN_HEAP%G} * 1024 ))
+HP_AUTO=0; [[ $HUGEPAGES_2M == auto ]] && HP_AUTO=1
+case $VPP_BUFFERS in
+  max)  ((HP_AUTO)) && HUGEPAGES_2M=$(calc_hugepages "$MEM_MB")
+        BUFFERS=0 ;;
+  auto) BUFFERS=$(calc_buffers "${#NIC_PCI[@]}" "$VPP_WORKERS" "$VPP_RX_DESC" "$VPP_TX_DESC") ;;
+  *[!0-9]*|"") die "VPP_BUFFERS=$VPP_BUFFERS — dozwolone: auto, max albo liczba" ;;
+  *)    BUFFERS=$VPP_BUFFERS ;;
+esac
+# pamięć dobrana do zapotrzebowania (auto i liczba); przy "max" pula wynika z RAM, a bufory z puli
+((HP_AUTO && BUFFERS > 0)) && HUGEPAGES_2M=$(hugepages_for "$BUFFERS" "$HEAP_MB" "$NUMA_NODES" "$MEM_MB")
 HP_NODE_MB=$(( HUGEPAGES_2M * 2 / NUMA_NODES ))
-if ((HP_NODE_MB >= 6144)); then MAIN_HEAP=4G; BUFFERS=262144; else MAIN_HEAP=2G; BUFFERS=131072; fi
-audit AUTO "Pamięć VPP" "RAM $((MEM_MB / 1024)) GB" "hugepages $HUGEPAGES_2M × 2 MB, sterta $MAIN_HEAP, bufory $BUFFERS"
+BUF_MAX=$(max_buffers "$HP_NODE_MB" "$HEAP_MB")
+if [[ $VPP_BUFFERS == max ]]; then BUFFERS=$BUF_MAX
+elif ((BUFFERS > BUF_MAX)); then
+  warn "bufory $BUFFERS nie mieszczą się w hugepages węzła ($BUF_MAX) — ograniczam do $BUF_MAX (więcej RAM albo HUGEPAGES_2M)"
+  BUFFERS=$BUF_MAX
+fi
+audit AUTO "Pamięć VPP" "RAM $((MEM_MB / 1024)) GB" "hugepages $HUGEPAGES_2M × 2 MB, sterta $MAIN_HEAP, bufory $BUFFERS (tryb $VPP_BUFFERS, maksimum $BUF_MAX)"
 ((NODE_MEM_MB >= 16384)) || { audit WARN "Pamięć węzła karty" "$((NODE_MEM_MB / 1024)) GB" "mało na pełne tablice BGP"; rec 2 "sprzęt" "Dołóż RAM na procesorze karty (≥ 16 GB)" "VPP + pełne tablice BGP"; }
 EXTRA_CMDLINE+=("panic=$PANIC_REBOOT_SEC" "oops=panic")
 audit AUTO "Kernel panic" "restart po panic" "panic=$PANIC_REBOOT_SEC oops=panic w linii kernela + sysctl kernel.panic"
@@ -6092,6 +6944,9 @@ if [[ -z $ALERT_EMAILS && ! -f /etc/router/notify.conf ]] && ((INTERACTIVE)); th
   fi
 fi
 
+if [[ -z $ROUTER_ID && -n $LOOP0_ADDR ]]; then
+  ROUTER_ID=${LOOP0_ADDR%%/*}
+fi
 if [[ -z $ROUTER_ID ]]; then
   ROUTER_ID=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1 || true)
   [[ -n $ROUTER_ID ]] || die "Nie umiem ustalić ROUTER_ID — ustaw go w skrypcie"
@@ -6106,8 +6961,9 @@ if [[ ! -f $STATE_DIR/10.done ]]; then
 fi
 ok "wolne miejsce w $DATA_DIR: ${avail} GB"
 
-timeout 10 getent hosts github.com >/dev/null || die "Brak DNS/internetu (github.com) — skrypt pobiera źródła i paczki"
+[[ $MODE == workers ]] || timeout 10 getent hosts github.com >/dev/null || die "Brak DNS/internetu (github.com) — skrypt pobiera źródła i paczki"
 ok "internet dostępny"
+if [[ $MODE == workers ]] && ((DRY_RUN)); then workers_plan; exit 0; fi
 
 cat >"$ENV_FILE" <<EOF
 INST_NIC_PCI="${NIC_PCI[*]}"
@@ -6247,13 +7103,14 @@ Before=network.target network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-PrivateNetwork=yes
+# Bez PrivateNetwork: namespace musi być widoczny dla VPP, BIRD i snmpd w głównej przestrzeni montowań
+# (z PrivateNetwork=yes bind-mount /var/run/netns/dataplane był prywatny dla jednostki, a VPP dostawał
+#  "setns 'dataplane': Invalid argument" i linux-cp nie tworzył par TAP).
 ExecStart=-/usr/sbin/ip netns delete dataplane
 ExecStart=-/usr/bin/mkdir -p /etc/netns/dataplane
 ExecStart=-/usr/bin/touch /etc/netns/dataplane/resolv.conf
-ExecStart=-/usr/sbin/ip netns add dataplane
-ExecStart=-/usr/bin/umount /var/run/netns/dataplane
-ExecStart=-/usr/bin/mount --bind /proc/self/ns/net /var/run/netns/dataplane
+ExecStart=/usr/sbin/ip netns add dataplane
+ExecStart=/usr/sbin/ip -n dataplane link set lo up
 ExecStart=-/usr/sbin/ip netns exec dataplane /usr/lib/systemd/systemd-sysctl
 ExecStop=-/usr/sbin/ip netns delete dataplane
 
@@ -6275,7 +7132,7 @@ st_vpp_config() {
   IFNAMES=()
   for p in "${NIC_PCI[@]}"; do
     IFNAMES+=("hu$idx")
-    dpdk_devs+="  dev $p { name hu$idx num-rx-queues $VPP_WORKERS num-rx-desc 4096 num-tx-desc 4096 }"$'\n'
+    dpdk_devs+="  dev $p { name hu$idx num-rx-queues $VPP_WORKERS num-rx-desc $VPP_RX_DESC num-tx-desc $VPP_TX_DESC${VPP_NIC_DEVARGS:+ devargs $VPP_NIC_DEVARGS} }"$'\n'
     idx=$((idx + 1))
   done
   mkdir -p /var/log/vpp
@@ -6387,6 +7244,7 @@ emit_guard_plugin() {   # emit_guard_plugin <katalog>
   local d=$1
   mkdir -p "$d"
   cat >"$d/synack_guard_core.h" <<'GUARD_CORE_H'
+/* Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it> */
 /*
  * synack_guard_core.h — logika filtra odbić niezależna od VPP (testowana na hoście: tests/guard_core_test.c).
  *
@@ -7096,6 +7954,7 @@ gc_pset6_lookup (const gc_pset6_t *s, uint64_t hi, uint64_t lo)
 #endif /* SYNACK_GUARD_CORE_H */
 GUARD_CORE_H
   cat >"$d/synack_guard.c" <<'GUARD_PLUGIN_C'
+/* Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it> */
 /*
  * synack_guard.c — wtyczka VPP: filtr odbić (SYN-ACK, RST, UDP z portów amplifikacji) dla chronionych prefiksów.
  *
@@ -8214,6 +9073,7 @@ st_ifaces() {
 # interfejs  vlan  ipv4               ipv6                     opis
 EOF
       printf '%-12s %-5s %-18s %-24s %s\n' hu0 - - - "Port 100G: trunk VLAN do switcha"
+      [[ -z $LOOP0_ADDR ]] || printf '%-12s %-5s %-18s %-24s %s\n' loop0 - "$LOOP0_ADDR" - "Loopback: zarządzanie (SSH, SNMP), router-id"
       for ((i = 1; i < n; i++)); do
         printf '#%-11s %-5s %-18s %-24s %s\n' "hu$i" - - - "Port $((i + 1)) (nieużywany)"
       done
@@ -8292,7 +9152,7 @@ EOF
 st_snmp() {
   put_file /etc/snmp/snmpd.conf "snmpd (netns dataplane), community i AgentX dla vpp-snmp-agent" 600 <<EOF
 # install-router.sh — snmpd w netns dataplane, liczniki interfejsów dostarcza vpp-snmp-agent
-agentaddress udp:161,udp6:161
+agentaddress $([[ -n $LOOP0_ADDR ]] && echo "udp:127.0.0.1:161,udp:${LOOP0_ADDR%%/*}:161" || echo "udp:161,udp6:161")
 rocommunity $SNMP_COMMUNITY 127.0.0.1
 rocommunity $SNMP_COMMUNITY $SNMP_ALLOW
 $(snmp_trusted_block)
@@ -8385,7 +9245,10 @@ st_sflow() {
     echo "# install-router.sh — próbki z VPP (psample 3/4) wysyłane jako sFlow"
     echo "sflow {"
     if [[ -n $SFLOW_COLLECTOR ]]; then echo "  collector { ip=$SFLOW_COLLECTOR udpport=6343 }"
-    else echo "  # collector { ip=192.0.2.10 udpport=6343 }"; fi
+    else
+      # hsflowd 2.x nie startuje bez kolektora ("no collectors are defined"), a nieuruchomiona usługa psuje router-check i BOOT_PROBLEM
+      echo "  collector { ip=127.0.0.1 udpport=6343 }   # TYMCZASOWO: nikt nie nasłuchuje — wpisz IP kolektora (FastNetMon)"
+    fi
     echo "  psample { group=3 egress=on }"
     echo "  vpp { osIndex=off }"
     echo "}"
@@ -8393,7 +9256,7 @@ st_sflow() {
   systemctl enable hsflowd
   systemctl restart hsflowd || warn "hsflowd nie wystartował — journalctl -u hsflowd"
   man_add service hsflowd.service "eksport sFlow (próbki z VPP)"
-  [[ -n $SFLOW_COLLECTOR ]] || warn "SFLOW_COLLECTOR puste — hsflowd działa, ale nikomu nie wysyła (uzupełnij /etc/hsflowd.conf)"
+  [[ -n $SFLOW_COLLECTOR ]] || warn "SFLOW_COLLECTOR puste — w /etc/hsflowd.conf jest tymczasowy kolektor 127.0.0.1, wpisz prawdziwy (FastNetMon) i: systemctl restart hsflowd"
   ok "sFlow gotowe"
 }
 
@@ -8473,9 +9336,13 @@ PUNT_PPS=20000
 # rdzenie systemowe (poza VPP): % zajętości przez ile sekund
 HK_CPU_PCT=90
 HK_CPU_SECONDS=5
-# przypomnienie o trwającym zdarzeniu co N s; minutowe podsumowanie szczytów
+# przypomnienie o trwającym zdarzeniu co N s
 REPEAT_EVERY=10
-SUMMARY_EVERY=60
+# najwyższy poziom zapisywany w alarmy.log: 4 = tylko ostrzeżenia, błędy i zdarzenia krytyczne (plus zakończenia alarmów);
+# 6 = także informacje (start/zmiany konfiguracji). Wszystko jest zawsze w journalu i w logach narzędzi (interfejsy, firewall, guard).
+LOG_MAX_SEV=4
+# minutowe podsumowanie szczytów (%VPP-6-STATS): 0 = wyłączone (w logu tylko ostrzeżenia i zdarzenia), 60 = co minutę
+SUMMARY_EVERY=0
 XSTATS_EVERY=10
 MD_EVERY=10
 # zawieszenie VPP: brak heartbeat przez N s; 1 = restart VPP
@@ -9001,6 +9868,9 @@ net.ipv4.neigh.default.gc_thresh3 = $NEIGH_MAX
 net.ipv6.neigh.default.gc_thresh1 = $((NEIGH_MAX / 4))
 net.ipv6.neigh.default.gc_thresh2 = $((NEIGH_MAX / 2))
 net.ipv6.neigh.default.gc_thresh3 = $NEIGH_MAX
+# usługi w netns dataplane (sshd, snmpd) wiążą adres loop0 także zanim pojawi się w VPP (restart VPP, kolejność startu)
+net.ipv4.ip_nonlocal_bind = 1
+net.ipv6.ip_nonlocal_bind = 1
 EOF
 }
 
@@ -9071,6 +9941,151 @@ ip = ipaddress.ip_address(sys.argv[1])
 sys.exit(0 if any(ip in ipaddress.ip_network(n, strict=False) for n in sys.argv[2:]
                   if ipaddress.ip_network(n, strict=False).version == ip.version) else 1)
 PYEOF
+}
+
+# Adres loop0 w VPP jako stały punkt zarządzania: SSH (osobny sshd w dataplane) i SNMP (liczniki VPP) słuchają na nim,
+# a snmpd-mgmt obsługuje port zarządzający (host, RAID). Filtruje to router-dataplane-fw (SSH/SNMP tylko z TRUSTED_NETS).
+# Zwykły użytkownik (UID >= 1000, działająca powłoka, grupa sudo): bez niego nie wyłączamy logowania roota przez SSH
+ssh_admin_user() {
+  local u uid shell
+  while IFS=: read -r u _ uid _ _ _ shell; do
+    ((uid >= 1000 && uid < 65534)) || continue
+    [[ $shell == */nologin || $shell == */false ]] && continue
+    id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx sudo && { echo "$u"; return 0; }
+  done < <(getent passwd)
+  return 1
+}
+
+st_loop0_access() {
+  local ip=${LOOP0_ADDR%%/*} sshcfg=/etc/ssh/sshd_config_dataplane rootlogin=$SSH_ROOT_LOGIN admin
+  # --- logowanie roota przez SSH (oba sshd): wyłączamy tylko, gdy jest zwykły użytkownik z sudo
+  if [[ $rootlogin == no ]]; then
+    if admin=$(ssh_admin_user); then
+      say "login roota przez SSH wyłączony; administrator: $admin (sudo)"
+    else
+      warn "brak zwykłego użytkownika z sudo — login roota przez SSH NIE został wyłączony (adduser <nazwa>; usermod -aG sudo <nazwa>; potem: install-router.sh --from 26)"
+      rootlogin=prohibit-password
+    fi
+  fi
+  # root nie może logować się hasłem: przy włączonym haśle "yes" zamieniamy na samo logowanie kluczem
+  if [[ $rootlogin == yes && $SSH_PASSWORD_AUTH == yes ]]; then warn "SSH_ROOT_LOGIN=yes przy logowaniu hasłem — używam prohibit-password (root tylko kluczem)"; rootlogin=prohibit-password; fi
+  if [[ $SSH_ROOT_LOGIN != no || $rootlogin == no ]]; then
+    printf '# install-router.sh — logowanie roota przez SSH (SSH_ROOT_LOGIN); pierwszy trafiony wpis wygrywa\nPermitRootLogin %s\n' "$rootlogin" \
+      | put_file /etc/ssh/sshd_config.d/00-router-access.conf "sshd portu zarządzającego: PermitRootLogin $rootlogin" 644
+    if /usr/sbin/sshd -t; then
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn "nie przeładowano sshd — systemctl reload ssh"
+    else
+      rm -f /etc/ssh/sshd_config.d/00-router-access.conf
+      warn "sshd -t odrzucił konfigurację z PermitRootLogin $rootlogin — drop-in usunięty, sshd bez zmian"
+    fi
+  fi
+  if [[ -z $LOOP0_ADDR ]]; then
+    say "LOOP0_ADDR puste — pomijam loop0 oraz SSH/SNMP w dataplane"
+  else
+    # --- loop0 w ifaces.conf (istniejącego pliku nie nadpisujemy; dopisujemy tylko brakujący wiersz loop0)
+    if [[ -f /etc/router/ifaces.conf ]] && ! grep -Eq '^loop0[[:space:]]' /etc/router/ifaces.conf; then
+      printf '%-12s %-5s %-18s %-24s %s\n' loop0 - "$LOOP0_ADDR" - "Loopback: zarządzanie (SSH, SNMP), router-id" >>/etc/router/ifaces.conf
+      say "dopisano loop0 $LOOP0_ADDR do /etc/router/ifaces.conf"
+      if vppctl show version >/dev/null 2>&1; then
+        /opt/router/bin/router-ifaces apply -y || warn "router-ifaces apply nie powiódł się — popraw ifaces.conf i uruchom ręcznie"
+      else
+        warn "VPP nie odpowiada — loop0 powstanie przy starcie VPP (router-ifaces.service)"
+      fi
+    fi
+    # --- usługi w dataplane mogą wiązać adres loop0 także zanim pojawi się w VPP (restart VPP, kolejność startu)
+    neigh_sysctl | put_file /etc/sysctl.d/82-router-neigh.conf "duże tablice ARP/ND i ip_nonlocal_bind; stosowane też w netns dataplane"
+    ip netns exec dataplane sysctl -q -p /etc/sysctl.d/82-router-neigh.conf 2>/dev/null || true
+    # --- snmpd-dataplane: tylko loop0 i 127.0.0.1 (zamiast wszystkich adresów VPP)
+    if [[ -f /etc/snmp/snmpd.conf ]]; then
+      sed -i "s|^agentaddress .*|agentaddress udp:127.0.0.1:161,udp:$ip:161|" /etc/snmp/snmpd.conf
+      systemctl restart snmpd-dataplane.service 2>/dev/null || warn "snmpd-dataplane nie zrestartował się — journalctl -u snmpd-dataplane"
+      ok "SNMP w dataplane: $ip:161 i 127.0.0.1:161"
+    fi
+    # --- drugi sshd w dataplane na adresie loop0
+    if [[ $DATAPLANE_SSH == yes ]]; then
+      {
+        cat <<EOF
+# install-router.sh — instancja sshd w netns dataplane (adres loop0). Pierwszy trafiony wpis wygrywa,
+# więc nasz blok stoi przed resztą skopiowanej konfiguracji (także przed Include sshd_config.d).
+Port 22
+ListenAddress $ip
+PidFile /run/sshd-dataplane.pid
+PasswordAuthentication $SSH_PASSWORD_AUTH
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+PermitRootLogin $rootlogin
+
+EOF
+        sed -e '/^[[:space:]]*ListenAddress/d' -e '/^[[:space:]]*Port[[:space:]]/d' -e '/^[[:space:]]*PidFile/d' \
+            -e '/^[[:space:]]*PasswordAuthentication/d' -e '/^[[:space:]]*PubkeyAuthentication/d' -e '/^[[:space:]]*KbdInteractiveAuthentication/d' \
+            -e '/^[[:space:]]*PermitRootLogin/d' /etc/ssh/sshd_config
+      } | put_file "$sshcfg" "sshd w netns dataplane: adres loop0, hasło lub klucz, PermitRootLogin $rootlogin" 600
+      if /usr/sbin/sshd -t -f "$sshcfg"; then
+        put_file /etc/systemd/system/sshd-dataplane.service "sshd w netns dataplane (adres loop0)" <<'EOF'
+[Unit]
+Description=OpenSSH server in netns dataplane (adres loop0)
+Documentation=file:/opt/router/README.md
+After=netns-dataplane.service router-ifaces.service network.target
+Wants=router-ifaces.service
+BindsTo=netns-dataplane.service
+
+[Service]
+NetworkNamespacePath=/var/run/netns/dataplane
+ExecStartPre=/usr/sbin/sshd -t -f /etc/ssh/sshd_config_dataplane
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_dataplane
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable sshd-dataplane.service >/dev/null 2>&1 || true
+        systemctl restart sshd-dataplane.service || warn "sshd-dataplane nie wystartował — journalctl -u sshd-dataplane"
+        man_add service sshd-dataplane.service "sshd w dataplane na adresie loop0 ($ip:22), hasło lub klucz, root: $rootlogin"
+        ok "SSH w dataplane: $ip:22 (osobny sshd; port zarządzający zostaje drogą awaryjną)"
+      else
+        warn "sshd_config_dataplane nie przeszedł testu (sshd -t) — sshd-dataplane nie został uruchomiony"
+      fi
+    fi
+  fi
+  # --- snmpd na porcie zarządzającym (przestrzeń główna): host, RAID; liczniki portów VPP są tylko na loop0
+  if [[ $MGMT_SNMP == yes ]]; then
+    cat <<EOF | put_file /etc/snmp/snmpd-mgmt.conf "snmpd portu zarządzającego (przestrzeń główna): host, RAID" 600
+# install-router.sh — snmpd w głównej przestrzeni (port zarządzający); liczniki VPP: snmpd-dataplane na loop0
+agentaddress udp:161,udp6:161
+rocommunity $SNMP_COMMUNITY 127.0.0.1
+rocommunity $SNMP_COMMUNITY $SNMP_ALLOW
+$(snmp_trusted_block)
+sysName $(hostname -f 2>/dev/null || hostname)
+sysLocation R630 BGP router
+sysContact noc
+extend mdadm /etc/snmp/extend/mdadm
+EOF
+    put_file /etc/systemd/system/snmpd-mgmt.service "snmpd w przestrzeni głównej (port zarządzający)" <<'EOF'
+[Unit]
+Description=Net-SNMP agent (przestrzeń główna, port zarządzający)
+Documentation=file:/opt/router/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/snmpd -LOw -u Debian-snmp -I -smux,mteTrigger,mteTriggerConf -f -C -c /etc/snmp/snmpd-mgmt.conf -p /run/snmpd-mgmt.pid
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable snmpd-mgmt.service >/dev/null 2>&1 || true
+    systemctl restart snmpd-mgmt.service || warn "snmpd-mgmt nie wystartował — journalctl -u snmpd-mgmt"
+    man_add service snmpd-mgmt.service "snmpd portu zarządzającego (UDP 161, przestrzeń główna)"
+    ok "SNMP na porcie zarządzającym: snmpd-mgmt (host, RAID)"
+  fi
+  printf '[Unit]\nWants=sshd-dataplane.service snmpd-mgmt.service\n' \
+    | put_file /etc/systemd/system/router.target.d/30-access.conf "router.target obejmuje sshd-dataplane i snmpd-mgmt"
+  systemctl daemon-reload
 }
 
 st_system() {
@@ -9267,19 +10282,6 @@ ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/rou
 }
 
 # Dowód z logu VPP, że wtyczka się załadowała (komunikaty vlib/unix/plugin.c: "Loaded plugin: …" albo błąd)
-guard_plugin_log() {
-  local lines
-  lines=$( { vppctl show logging 2>/dev/null; journalctl -u vpp -b --no-pager 2>/dev/null; } | grep -i 'synack_guard' | sort -u | tail -5)
-  if [[ -z $lines ]]; then
-    warn "w logu VPP brak wpisu o synack_guard_plugin.so (vppctl show logging, journalctl -u vpp)"
-  elif grep -qiE 'Failed to load|mismatch|Not a plugin|disabled|Bad r2' <<<"$lines"; then
-    warn "VPP nie załadował wtyczki synack_guard:"
-    sed 's/^/    /' <<<"$lines"
-  else
-    ok "log VPP:"
-    sed 's/^/    /' <<<"$lines"
-  fi
-}
 
 st_guard() {
   mkdir -p /var/lib/router /var/log/router
@@ -9392,6 +10394,7 @@ Wszystkie wartości poniżej pochodzą z tej instalacji.
 Szybki stan routera w każdej chwili:
 
 ```
+router                            # menu: numer obszaru → czynności z opisem; f = pliki konfiguracyjne
 router-check                      # pełna kontrola: usługi, VPP, BIRD, SNMP, RAID, ostatnie alarmy
 systemctl status router.target    # wszystkie usługi routera naraz
 tail -f /var/log/router/alarmy.log   # alarmy na żywo
@@ -9530,7 +10533,7 @@ Wszystkie logi routera są w **jednym katalogu `/var/log/router/`** (rotacja cod
 
 | Plik | Co zawiera | Kto pisze |
 |---|---|---|
-| `alarmy.log` | **wszystkie alarmy i zdarzenia** w stylu Cisco (`%SYS-…`, `%FW-…`, `%GUARD-…`): monitor obciążenia, awarie usług, RAID, dyski, kontrola po starcie, firewall, guard, zmiany interfejsów, aktualizacje skryptu. Z tego pliku router-notify wysyła e-maile | programy routera |
+| `alarmy.log` | **tylko ostrzeżenia, błędy i zdarzenia krytyczne** w stylu Cisco (`%SYS-…`, `%FW-…`, `%GUARD-…`, poziomy 1–4) oraz zakończenia alarmów (`*_NORMAL`, `*_END`): monitor obciążenia, awarie usług, RAID, dyski, problemy po starcie, rozjazdy i błędy konfiguracji. Poziom ustawia `LOG_MAX_SEV` w `router-monitor.conf` (6 = także informacje). E-maile idą niezależnie, według `MAIL_SEND` | programy routera |
 | `firewall.log` | szczegóły router-fw: każde polecenie vppctl i odpowiedź VPP | router-fw |
 | `guard.log` | szczegóły router-guard: każde polecenie vppctl i odpowiedź VPP | router-guard |
 | `ifaces.log` | szczegóły router-ifaces: każde polecenie vppctl i odpowiedź VPP | router-ifaces |
@@ -9587,7 +10590,7 @@ Format jak w syslogu Cisco: `%OBSZAR-POZIOM-ZDARZENIE: opis`. Poziom: 1 = alarm 
 | `%VPP-4-PUNT_HIGH` | dużo ruchu do adresów routera | sprawdzić ACL i policer na control plane |
 | `%VPP-2-DOWN` / `%VPP-5-UP` | brak dostępu do statystyk VPP / powrót | zwykle restart VPP; patrz `journalctl -u vpp` |
 | `%VPP-1-HANG` | VPP żyje, ale nie odpowiada | monitor sam zrestartuje VPP (`HANG_RESTART=1`) |
-| `%VPP-6-STATS` | co minutę: szczyty z ostatniej minuty | historia obciążenia z dokładnością do minuty |
+| `%VPP-6-STATS` | (domyślnie wyłączone: `SUMMARY_EVERY=60` włącza co minutę) szczyty z ostatniej minuty | historia obciążenia z dokładnością do minuty; na żywo: `router-top` |
 | `%SYS-4-CPU_HIGH` | rdzeń systemowy zajęty ≥ `HK_CPU_PCT`% przez `HK_CPU_SECONDS` s | zwykle przeliczanie tras BGP; jeśli trwa długo — sprawdzić BIRD |
 | `%SYS-2-SERVICE_FAIL` | usługa (VPP/BIRD) padła, systemd ją restartuje | sprawdzić `journalctl -u <usługa>`, core dump: `coredumpctl` |
 | `%SYS-1-SERVICE_DOWN` | usługa nie wstaje mimo restartów | interwencja: konsola iDRAC lub eth2 |
@@ -9665,7 +10668,7 @@ Zmiany działają w ciągu 5 sekund (bez restartu). Test: `router-notify test`. 
 | `SYS_CPU` | `%SYS-4-CPU_HIGH` |
 | `FIREWALL` | `%FW-5-APPLIED`, `%FW-4-DRIFT`, `%FW-2-CONFIG_ERROR`, `%FW-5-BLOCK` (rozdział 10a) |
 | `IFACES` | `%IFACE-5-CONFIG_APPLIED`, `%IFACE-4-DRIFT`, `%IFACE-2-CONFIG_ERROR`, `%IFACE-3-APPLY_FAIL` (rozdział 10) |
-| `STATS` | `%VPP-6-STATS` co minutę — zwykle nie chcesz tego mailem |
+| `STATS` | `%VPP-6-STATS` (po włączeniu `SUMMARY_EVERY`) — zwykle nie chcesz tego mailem |
 | `OTHER` | wszystko, co nie pasuje do powyższych |
 | `ALL` | wszystkie kategorie |
 
@@ -10077,6 +11080,40 @@ Bez terminala (skrypty, szybki podgląd): `router-top --once 1` (albo 2, 3, 4) �
 
 ---
 
+## 10c. Dostęp zarządzający przez loop0 (SSH i SNMP)
+
+Instalator tworzy w VPP loopback **`loop0`** z adresem `LOOP0_ADDR` (domyślnie `10.10.10.10/32`) jako stały adres zarządzania i router-id BIRD. Adres jest w `/etc/router/ifaces.conf`, a `lcp-sync` kopiuje go do namespace `dataplane`.
+
+| Usługa | Gdzie słucha | Co daje |
+|---|---|---|
+| SSH (`sshd-dataplane`) | `loop0:22` w `dataplane`, osobny `sshd_config_dataplane`, hasło lub klucz SSH | logowanie przez adres `loop0`, także gdy port zarządzający nie działa |
+| SNMP (`snmpd-dataplane`) | `loop0:161` i `127.0.0.1:161` w `dataplane` | liczniki portów i VLAN-ów z VPP (LibreNMS po adresie `loop0`) |
+| SNMP (`snmpd-mgmt`) | wszystkie adresy portu zarządzającego (przestrzeń główna) | host: interfejsy Linuksa, CPU, dyski, RAID |
+| SSH (zwykły `sshd`) | port zarządzający (przestrzeń główna) | droga awaryjna, bez zmian |
+
+Ruch do `loop0:22` i `loop0:161` filtruje `router-dataplane-fw` (tylko `TRUSTED_NETS`; LibreNMS z `SNMP_ALLOW` ma SNMP zawsze). Instalator nie dodaje tras do `loop0`: switch lub BNG musi mieć trasę `10.10.10.10/32` przez router (statyczną albo z BGP), żeby adres był osiągalny z zewnątrz. Kontrola: `router-check` (sekcja „Dostęp przez loop0”) oraz `ip netns exec dataplane ss -tlnp`. **Login roota przez SSH jest wyłączony na obu `sshd`** (`SSH_ROOT_LOGIN=no`; drop-in `/etc/ssh/sshd_config.d/00-router-access.conf` i blok w `sshd_config_dataplane`), ale tylko jeśli istnieje zwykły użytkownik z grupą `sudo` (UID ≥ 1000). Bez niego instalator zostawia root-a (`prohibit-password`: tylko klucz) i ostrzega, żeby nie odciąć dostępu; utwórz użytkownika (`adduser nazwa; usermod -aG sudo nazwa`) i uruchom `install-router.sh --from 26`. Na obu `sshd` działa hasło lub klucz. Wyłączenie funkcji: `LOOP0_ADDR=""`, `DATAPLANE_SSH=no`, `MGMT_SNMP=no`, `SSH_ROOT_LOGIN=prohibit-password` w ustawieniach skryptu.
+
+---
+
+## 10d. Menu `router`
+
+Polecenie **`router`** to jedno wejście do wszystkich narzędzi. Po wpisaniu `router` widzisz numerowane obszary:
+
+```
+  1  Interfejsy                 2  Firewall tranzytu          3  Ochrona przed odbiciami
+  4  Status i podgląd na żywo   5  Monitoring i alarmy e-mail 6  BGP / BIRD
+  7  SNMP, sFlow i SSH          8  VPP (data plane)           9  System i aktualizacje
+  f  Pliki konfiguracyjne       q  Wyjście
+```
+
+Po wybraniu numeru pojawia się lista czynności tego obszaru: każda ma numer, opis, oznaczenie `[odczyt]` lub `[ZMIANA]` oraz wywołanie, które za nią stoi (np. `router-ifaces diff`). Czynności z parametrami (blokada adresu, włączenie guarda, nazwa sesji BGP) same pytają o brakujące wartości. Czynności zmieniające stan najpierw pokazują podgląd (`diff`) i pytają o potwierdzenie. W menu: numer = wybór, `0` = powrót, `f` = pliki konfiguracyjne, `q` = wyjście.
+
+Skróty bez menu: `router ifaces diff`, `router fw apply`, `router guard status`, `router top 2`, `router check`, `router bird show protocols`. `router help` wypisuje listę skrótów.
+
+**Pliki konfiguracyjne:** `router files` (albo `f` w menu) pokazuje dla każdego pliku, które narzędzie go czyta, co zawiera i jak zastosować zmiany. `router files fw` ogranicza listę do jednego obszaru. W menu można otworzyć plik w `$EDITOR`; po zapisie `router` podpowiada właściwe polecenie (`check`, `diff`, `apply`).
+
+---
+
 ## 11. Codzienna obsługa
 
 ```
@@ -10211,6 +11248,9 @@ READMEEOF
   ln -sfn /opt/router/install-router.sh /usr/local/sbin/install-router
   prog_router_check \
     | put_file /usr/local/sbin/router-check "polecenie router-check (pełna kontrola stanu)" 755
+  prog_router | put_file /opt/router/bin/router "menu zarządzania routerem: obszary, czynności z opisem, pliki konfiguracyjne" 755
+  ln -sfn /opt/router/bin/router /usr/local/sbin/router
+  man_add file /usr/local/sbin/router "polecenie router (menu: interfejsy, firewall, guard, monitoring, BIRD, SNMP, system)"
   man_add file /usr/local/sbin/install-router "dowiązanie do /opt/router/install-router.sh"
   write_version install
   man_add file "$VERSION_FILE" "wersja skryptu zainstalowana na routerze (install-router --version)"
@@ -10281,6 +11321,8 @@ st_report() {
   if command -v etckeeper >/dev/null; then etckeeper commit "install-router.sh: instalacja zakończona" >/dev/null 2>&1 || true; fi
 }
 
+if [[ $MODE == workers ]]; then do_set_workers; exit $?; fi
+
 run_stage 02 "Pakiety bazowe"                         st_packages
 run_stage 03 "Historia /etc (etckeeper)"              st_etckeeper
 run_stage 04 "Firmware karty: pobranie, kopia, router-fw-update" st_firmware
@@ -10306,6 +11348,7 @@ run_stage 22 "Firewall tranzytu (router-fw)"          st_fw
 run_stage 23 "Ochrona przed odbiciami (router-guard)"  st_guard
 run_stage 24 "Logi w plikach (rsyslog → /var/log/router)" st_logs
 run_stage 25 "System: czas, DNS, iptables (ochrona CPU)" st_system
+run_stage 26 "SSH i SNMP na loop0 (dataplane) + SNMP portu zarządzającego" st_loop0_access
 
 printf '\n%s[%s] INSTALACJA ZAKOŃCZONA.%s\n' "$c_ok" "$(now)" "$c_off"
 cat <<EOF

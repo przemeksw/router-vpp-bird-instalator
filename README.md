@@ -172,6 +172,24 @@ Ochrona rozpoznaje „odpowiedź bez pytania”:
 
 Wtyczka jest budowana razem z VPP (etap 10); na działającym routerze wymaga `install-router.sh --from 10` (restart VPP) oraz `--from 23` dla polecenia i jednostek. **Moduł C nie był kompilowany ani uruchamiany poza testami rdzenia** — przed produkcją przejdź `docs/synack-guard-lab-checklist.md`. Skrót projektu: `docs/synack-guard-design.md`.
 
+## Liczba workerów VPP (bez ponownej instalacji)
+
+Worker to wątek VPP przypięty do jednego odizolowanego rdzenia na węźle NUMA karty; każdy obsługuje własną kolejkę RX. Domyślnie `VPP_WORKERS=auto` (mniejsza z wartości: zalecane dla karty — ConnectX-4: 12 — oraz wolne rdzenie fizyczne węzła minus 2). Zmiana na działającym routerze:
+
+```bash
+router                                          # 8 → „Układ rdzeni i maksimum workerów” / „Zmień liczbę workerów”
+install-router set_workers --dry-run            # tylko plan: obecny układ, maksimum, rdzenie
+install-router set_workers 16 --dry-run         # plan dla 16 workerów
+install-router set_workers 16 [--reboot]        # zapis: GRUB (isolcpus, rcu_nocbs), irqbalance, startup.conf
+```
+
+Polecenie powtarza tylko etapy 06 (izolacja rdzeni) i 09 (konfiguracja VPP), bez pobierania pakietów i kompilacji. Wartość większa niż wolne rdzenie węzła jest odrzucana; powyżej zalecanej dla karty wypisze ostrzeżenie. Zmiana działa **po restarcie serwera** (nowe `isolcpus`); do tego czasu VPP pracuje na starym układzie. Po restarcie: `vppctl show threads`.
+
+### Port karty i bufory
+
+- **Wybór portu.** Instalator wykrywa porty Mellanox (mlx5_core) i na terminalu pokazuje je ponumerowane (adres PCI, interfejs, NUMA, prędkość, link). Wpisujesz numer, np. `1`; kilka portów po przecinku (`1,2`), Enter = proponowany. Pyta przy pierwszej instalacji, gdy portów jest więcej niż jeden; ponownie: `install-router set_workers --choose-nic` (albo `install-router --choose-nic --from 1`). Bez terminala lub z `--yes` zostaje zapisany wybór (`INST_NIC_PCI` w `/etc/router/router.env`), a gdy go brak — porty z linkiem. Adres podany w poleceniu (`install-router 0000:82:00.0`) ma pierwszeństwo.
+- **Bufory i hugepages dobierają się same z zasobów.** `VPP_BUFFERS=auto` (domyślnie) liczy bufory jako 8× zapotrzebowanie (porty × workery × (deskryptory RX + TX) + cache wątków), nie mniej niż 524288; dla 1 portu i 12 workerów to 704 512. Potem `HUGEPAGES_2M=auto` wylicza pulę od tego zapotrzebowania: sterta VPP + 1280 MB zapasu (statseg, DPDK) + bufory po 2496 B, +15%, po równo na węzły NUMA (dla 64 GB RAM ≈ 8110 stron 2 MB), z ograniczeniem do 50% RAM. Więcej workerów lub portów = większa pula. `VPP_BUFFERS=max` ustawia statycznie tyle buforów, ile mieści się w hugepages z 35% RAM; liczba (np. `VPP_BUFFERS=1000000`) ustawia ręcznie. Przy `show buffers` realnie zajęte jest tylko ok. 10% puli (deskryptory kolejek), więc większa pula to głównie zapas, a nie szybszy ruch. `set_workers` przelicza wszystko razem (etap 05, 06, 09); nowa pula hugepages pojawia się w pełni po restarcie serwera.
+
 ## Codzienna praca na routerze z VS Code (Remote-SSH)
 
 `Cmd+Shift+P → Remote-SSH: Connect to Host → root@192.168.80.111`, potem `File → Open… → /etc/router`. Edytujesz `ifaces.conf` jak lokalny plik, a w terminalu VS Code (już na routerze):
@@ -214,3 +232,7 @@ bash /root/install-uefi-mdadm.sh --dry-run    # plan: który dysk, która partyc
 bash /root/install-uefi-mdadm.sh              # wykonanie (pyta o potwierdzenie)
 ```
 Opcje: `--disk /dev/sdb` (wskaż drugi dysk ręcznie), `--yes`, `--no-hook`. Test startu z drugiego dysku: w oknie serwisowym F11 / iDRAC → „debian-sdb”.
+
+## Autor
+
+PHU VIPHOST Przemysław Świderski <biuro@viphost.it>

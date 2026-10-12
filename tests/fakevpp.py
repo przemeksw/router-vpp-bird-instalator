@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """Symulator vppctl / ip (netns) do testów router-ifaces. Stan w $FAKEVPP_STATE (JSON)."""
 import ipaddress
 import json

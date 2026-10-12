@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """Testy router-guard: plik konfiguracyjny, włączanie/wyłączanie na żądanie, tryby, wygasanie, odtwarzanie po restarcie
 VPP, wykrywanie rozjazdu i liczniki — na symulatorze VPP (tests/fakevpp.py).
 
@@ -138,12 +139,16 @@ class Cli(Base):
         with open(self.root + "/var/lib/router/guard.state.json", "w") as f:
             json.dump(s, f)
 
-    def log_text(self):
+    def read(self, name):
         try:
-            with open(self.root + "/var/log/router/alarmy.log") as f:
+            with open(self.root + "/var/log/router/" + name) as f:
                 return f.read()
         except OSError:
             return ""
+
+    def log_text(self):
+        """Wszystkie zdarzenia: alarmy.log (tylko ostrzeżenia i groźniejsze) plus własny log narzędzia (komplet)."""
+        return self.read("alarmy.log") + self.read("guard.log")
 
     def show(self):
         return self.vpp("show synack-guard")
@@ -243,6 +248,31 @@ class TestOn(Cli):
         self.assertIn("hu9.9", out)
 
 
+class TestSignature(Base):
+    def test_author_footer_only_on_a_terminal(self):
+        import io
+        from contextlib import redirect_stdout
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        for stream, want in ((Tty(), True), (io.StringIO(), False)):
+            with redirect_stdout(stream):
+                gd.signature()
+            self.assertEqual("PHU VIPHOST Przemysław Świderski" in stream.getvalue(), want)
+
+
+class TestAlarmLog(Cli):
+    def test_alarm_log_has_only_warnings_but_tool_log_has_everything(self):
+        self.guard("on", "web")
+        self.assertIn("%GUARD-5-ON", self.read("guard.log"))
+        self.assertNotIn("%GUARD-5-ON", self.read("alarmy.log"))
+        self.vpp("synack-guard prefix 203.0.113.0/24 del")
+        self.guard("check", "--log")
+        self.assertIn("%GUARD-4-DRIFT", self.read("alarmy.log"))
+
+
 class TestOff(Cli):
     def test_off_all_detaches_and_clears(self):
         self.guard("on", "web", "--enforce")
@@ -319,7 +349,7 @@ class TestCheckStatus(Cli):
         self.assertEqual(rc, 1, out)
         self.assertIn("%GUARD-4-DRIFT", self.log_text())
         self.guard("check", "--log")
-        self.assertEqual(self.log_text().count("%GUARD-4-DRIFT"), 1)
+        self.assertEqual(self.read("alarmy.log").count("%GUARD-4-DRIFT"), 1)
         self.assertEqual(self.guard("on", "web")[0], 0)                       # ponowne „on” naprawia
         self.assertEqual(self.guard("check", "--log")[0], 0)
         self.assertIn("%GUARD-5-DRIFT_END", self.log_text())
@@ -327,6 +357,20 @@ class TestCheckStatus(Cli):
     def test_check_reports_config_errors(self):
         self.write_conf("zle\n")
         self.assertEqual(self.guard("check")[0], 2)
+
+    def test_check_log_is_silent_when_guard_is_off_and_unconfigured(self):
+        self.write_conf("# wszystko w komentarzach\n#in-if hu0.100\n")
+        for _ in range(2):
+            rc, out = self.guard("check", "--log")
+            self.assertEqual(rc, 0, out)
+        self.assertNotIn("CONFIG_ERROR", self.log_text())
+        self.assertEqual(self.guard("check")[0], 2)                           # ręczny check nadal zgłasza brak konfiguracji
+
+    def test_check_log_reports_config_errors_when_guard_is_on(self):
+        self.guard("on", "web")
+        self.write_conf("zle\n")
+        self.assertEqual(self.guard("check", "--log")[0], 2)
+        self.assertIn("%GUARD-2-CONFIG_ERROR", self.log_text())
 
     def test_status_shows_state_and_counters(self):
         self.guard("on", "web")

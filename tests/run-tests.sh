@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # Testy router-ifaces na symulatorze VPP (tests/fakevpp.py) oraz trybu upgrade_script (tests/test-upgrade.sh) — bez VPP, bez roota, działa na macOS i Linuksie.
 #   bash tests/run-tests.sh
 set -uo pipefail
@@ -63,6 +64,8 @@ t "apply naprawia"                          0 $RI apply -y
 t "obcy adres usunięty"                     1 has "172.16.0.1" vpp show interface address
 t "ręczny VLAN 999 nietknięty"              0 has "hu0.999" vpp show interface
 t "DRIFT_END w logu"                        0 grep -q "IFACE-5-DRIFT_END" "$W/root/var/log/router/alarmy.log"
+t "informacje nie trafiają do alarmy.log"   1 grep -q "IFACE-5-CONFIG_APPLIED" "$W/root/var/log/router/alarmy.log"
+t "informacje są w logu narzędzia"          0 grep -q "IFACE-5-CONFIG_APPLIED" "$W/root/var/log/router/ifaces.log"
 
 echo "4. błędy w pliku = nic nie jest zmieniane"
 cp "$CONF" "$W/good.conf"
@@ -153,10 +156,19 @@ echo
 bash tests/test-installer.sh || fail=$((fail + 1))
 
 echo
+bash tests/test-author.sh || fail=$((fail + 1))
+
+echo
 bash tests/test-guard-core.sh || fail=$((fail + 1))
 
 echo
 python3 tests/test_router_guard.py || fail=$((fail + 1))
+
+echo
+python3 tests/test_router_menu.py || fail=$((fail + 1))
+
+echo
+python3 tests/test_router_monitor.py || fail=$((fail + 1))
 
 echo
 echo "10. router-top"

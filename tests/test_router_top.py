@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """Testy router-top: ekrany interfejsów, firewalla i guarda na symulatorze VPP (tests/fakevpp.py)."""
 import importlib.machinery
 import importlib.util
@@ -8,7 +9,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "build")
@@ -183,6 +187,71 @@ class TestIfacesCli(Cli):
         rc, out = self.top(1)
         self.assertEqual(rc, 0, out)
         self.assertIn("RUCH ŁĄCZNIE (porty fizyczne: 1, VLAN-y: 1)", out)
+        self.assertIn("PHU VIPHOST Przemysław Świderski", out)                              # autor widoczny także w wyniku --once
+
+    def test_curses_bottom_line_always_shows_the_author(self):
+        self.assertIn("PHU VIPHOST Przemysław Świderski", top.footer_line(""))
+        both = top.footer_line("  ↑↓ PgUp PgDn — wiersze 1–10 z 40")
+        self.assertIn("wiersze 1–10 z 40", both)
+        self.assertIn("PHU VIPHOST Przemysław Świderski", both)
+
+
+class TestUi(unittest.TestCase):
+    def test_ctrl_c_exits_quietly(self):
+        out = mock.MagicMock()
+        out.isatty.return_value = True
+        with mock.patch.object(top.sys, "argv", ["router-top"]), mock.patch.object(top.sys, "stdout", out), \
+                mock.patch.object(top.curses, "wrapper", side_effect=KeyboardInterrupt):
+            self.assertEqual(top.main(), 0)
+
+    def test_poller_never_blocks_the_ui(self):
+        class SlowApp:
+            def lines(self, n):
+                time.sleep(0.4)                          # np. vppctl, który czeka na barierę
+                return [("ekran %d" % n, "")]
+
+        p = top.Poller(SlowApp())
+        p.select(2)
+        t0 = time.time()
+        self.assertIsNone(p.get(2))                      # jeszcze nie ma danych, ale odczyt nie czeka
+        self.assertLess(time.time() - t0, 0.1)
+        p.start()
+        try:
+            end = time.time() + 3
+            while p.get(2) is None and time.time() < end:
+                time.sleep(0.05)
+            self.assertEqual(p.get(2), [("ekran 2", "")])
+            p.select(3)
+            t0 = time.time()
+            p.get(3)
+            self.assertLess(time.time() - t0, 0.1)       # przełączenie karty też nie blokuje
+            end = time.time() + 3
+            while p.get(3) is None and time.time() < end:
+                time.sleep(0.05)
+            self.assertEqual(p.get(3), [("ekran 3", "")])
+        finally:
+            p.stop = True
+            p.wake.set()
+
+    def test_poller_survives_errors_in_a_screen(self):
+        class BadApp:
+            calls = 0
+
+            def lines(self, n):
+                BadApp.calls += 1
+                raise RuntimeError("vppctl nie odpowiada")
+
+        p = top.Poller(BadApp())
+        p.select(1)
+        p.start()
+        try:
+            end = time.time() + 3
+            while p.get(1) is None and time.time() < end:
+                time.sleep(0.05)
+            self.assertIn("vppctl nie odpowiada", p.get(1)[0][0])
+        finally:
+            p.stop = True
+            p.wake.set()
 
 
 if __name__ == "__main__":

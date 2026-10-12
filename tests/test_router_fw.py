@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 """Testy router-fw: parser, kompilator ACL, plan zmian oraz polecenia na symulatorze VPP (tests/fakevpp.py).
 
   python3 tests/test_router_fw.py            (bez VPP i bez roota; działa na macOS i Linuksie)
@@ -195,10 +196,15 @@ class TestSmoke(Base):
         self.assertIn("nieznane polecenie", r.stderr)
 
     def test_event_writes_cisco_style_line(self):
-        line = fw.event(5, "APPLIED", "test", mail=False)
-        self.assertEqual(line, "%FW-5-APPLIED: test")
+        line = fw.event(4, "DRIFT", "test", mail=False)
+        self.assertEqual(line, "%FW-4-DRIFT: test")
         with open(fw.MONLOG) as f:
-            self.assertIn("%FW-5-APPLIED: test", f.read())
+            self.assertIn("%FW-4-DRIFT: test", f.read())               # ostrzeżenie trafia do alarmy.log
+        fw.event(5, "APPLIED", "info", mail=False)
+        with open(fw.LOG) as f:
+            self.assertIn("%FW-5-APPLIED: info", f.read())               # informacja tylko do własnego logu narzędzia
+        with open(fw.MONLOG) as f:
+            self.assertNotIn("%FW-5-APPLIED", f.read())
 
 
 class TestParser(Base):
@@ -447,12 +453,16 @@ class Cli(Base):
                            input=stdin or "")
         return r.returncode, r.stdout + r.stderr
 
-    def log_text(self):
+    def read(self, name):
         try:
-            with open(self.root + "/var/log/router/alarmy.log") as f:
+            with open(self.root + "/var/log/router/" + name) as f:
                 return f.read()
         except OSError:
             return ""
+
+    def log_text(self):
+        """Wszystkie zdarzenia: alarmy.log (tylko ostrzeżenia i groźniejsze) plus własny log narzędzia (komplet)."""
+        return self.read("alarmy.log") + self.read("firewall.log")
 
     def stats(self, data):
         with open(self.root + "/stats.json", "w") as f:
@@ -557,7 +567,7 @@ class TestCheckShow(Cli):
         self.assertEqual(rc, 1, out)
         self.assertIn("%FW-4-DRIFT", self.log_text())
         self.fw("check", "--log")
-        self.assertEqual(self.log_text().count("%FW-4-DRIFT"), 1)
+        self.assertEqual(self.read("alarmy.log").count("%FW-4-DRIFT"), 1)
         self.assertEqual(self.fw("apply", "-y")[0], 0)
         self.assertEqual(self.fw("check", "--log")[0], 0)
         self.assertIn("%FW-5-DRIFT_END", self.log_text())
@@ -617,6 +627,37 @@ class TestConfirm(Cli):
         self.assertIn("tag {rfw:", self.vpp("show acl-plugin acl"))
         self.assertEqual(self.fw("rollback")[0], 0)
         self.assertEqual(self.vpp("show acl-plugin acl").strip(), "")
+
+
+class TestSignature(Base):
+    def test_author_footer_only_on_a_terminal(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        for stream, want in ((Tty(), True), (io.StringIO(), False)):
+            with redirect_stdout(stream):
+                fw.signature()
+            self.assertEqual("PHU VIPHOST Przemysław Świderski" in stream.getvalue(), want)
+
+
+class TestAlarmLog(Cli):
+    def test_alarm_log_has_only_warnings_but_tool_log_has_everything(self):
+        self.fw("apply", "-y")
+        self.assertIn("%FW-5-APPLIED", self.read("firewall.log"))
+        self.assertNotIn("%FW-5-APPLIED", self.read("alarmy.log"))
+        self.vpp("set acl-plugin interface hu0.100 input acl 0 del")
+        self.fw("check", "--log")
+        self.assertIn("%FW-4-DRIFT", self.read("alarmy.log"))                      # ostrzeżenie trafia do alarmy.log
+        self.fw("apply", "-y")
+        self.fw("check", "--log")
+        self.assertIn("%FW-5-DRIFT_END", self.read("alarmy.log"))                  # zakończenie alarmu też
+
+    def test_threshold_from_router_monitor_conf(self):
+        with open(self.root + "/etc/router/router-monitor.conf", "w") as f:
+            f.write("LOG_MAX_SEV=6\n")
+        self.fw("apply", "-y")
+        self.assertIn("%FW-5-APPLIED", self.read("alarmy.log"))
 
 
 class TestBlocks(Cli):

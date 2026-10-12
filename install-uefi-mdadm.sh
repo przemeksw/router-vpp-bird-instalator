@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # install-uefi-mdadm.sh — start z drugiego dysku RAID1 (mdadm) przy rozruchu UEFI
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 #
 # Partycja EFI (ESP, /boot/efi) nie jest w RAID — jest tylko na pierwszym dysku. Gdy ten dysk padnie,
 # serwer nie wystartuje, mimo że RAID z systemem działa na drugim. Ten skrypt:
@@ -51,6 +52,7 @@ while (($#)); do
   shift
 done
 
+((QUIET)) || printf 'install-uefi-mdadm.sh — Autor: %s\n' "PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
 ((EUID == 0)) || die "uruchom jako root"
 [[ -d /sys/firmware/efi ]] || die "system nie wystartował w trybie UEFI — ten skrypt dotyczy tylko UEFI"
 mountpoint -q /boot/efi || die "/boot/efi nie jest zamontowane"

@@ -1,3 +1,4 @@
+/* Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it> */
 /* Testy synack_guard_core.h na hoście (bez VPP):  bash tests/test-guard-core.sh */
 #include <stdio.h>
 #include "../build/synack_guard/synack_guard_core.h"

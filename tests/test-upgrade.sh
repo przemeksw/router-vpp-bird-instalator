@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # Testy trybu upgrade_script (install-router.sh) — bez roota, bez routera, działa na macOS i Linuksie.
 # Wyciąga z install-router.sh funkcje programów i do_upgrade, przekierowuje ścieżki do katalogu tymczasowego.
 #   bash tests/test-upgrade.sh
@@ -65,6 +66,7 @@ t "router-monitor zainstalowany"            0 test -x "$W/opt/router/bin/router-
 t "router-check zainstalowany"              0 test -x "$W/sbin/router-check"
 t "router-fw zainstalowany"                 0 test -x "$W/opt/router/bin/router-fw"
 t "router-guard zainstalowany"              0 test -x "$W/opt/router/bin/router-guard"
+t "router (menu) zainstalowany"             0 test -x "$W/opt/router/bin/router"
 t "router-top zainstalowany"                0 test -x "$W/opt/router/bin/router-top"
 t "instrukcja w etc/router"                 0 grep -q 'instrukcja obsługi produkcyjnej' "$W/etc/router/INSTRUKCJA.md"
 t "plik wersji: 1.0.0"                      0 grep -qx 'SCRIPT_VERSION=1.0.0' "$W/etc/router/version"

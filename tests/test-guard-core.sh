@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # Testy logiki synack-guard niezależnej od VPP (build/synack_guard/synack_guard_core.h, wyciągany z install-router.sh) — kompilator C na hoście.
 #   bash tests/test-guard-core.sh
 set -uo pipefail

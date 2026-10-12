@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
 # Wyciąga programy osadzone w install-router.sh do build/ (do czytania, lintowania, testów).
 # Źródłem prawdy zostaje install-router.sh — zmiany rób tam, nie w build/.
 set -euo pipefail
@@ -15,6 +16,7 @@ extract ROUTER_MONITOR_PY router-monitor
 extract ROUTER_NOTIFY_PY  router-notify
 extract ROUTER_FW_PY      router-fw
 extract ROUTER_GUARD_PY   router-guard
+extract ROUTER_MENU_PY    router
 extract ROUTER_TOP_PY     router-top
 mkdir -p build/synack_guard
 extract GUARD_CORE_H      synack_guard/synack_guard_core.h
