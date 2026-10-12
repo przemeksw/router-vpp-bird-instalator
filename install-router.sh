@@ -82,6 +82,8 @@ LOG_KEEP_DAYS=20               # logi w /var/log/router: rotacja codziennie, tyl
 TIMEZONE="Europe/Warsaw"
 NTP_SERVERS="tempus1.gum.gov.pl tempus2.gum.gov.pl"   # GUM (194.146.251.100, .101); chrony, port zarządzający
 DNS_SERVERS="46.45.78.2 46.45.114.2 8.8.8.8"          # /etc/resolv.conf (także w netns dataplane)
+# Napis po zalogowaniu (konsola i SSH: /etc/motd) i przed logowaniem na konsoli (/etc/issue). Wiersze oddzielone "|".
+LOGIN_BANNER="ROUTER BGP VPP|VIPHOST.IT|p.swiderski@viphost.it"
 # Zaufane sieci: pełny dostęp do routera (SSH, SNMP, wszystko). Reszta świata: SSH i SNMP odrzucane.
 # Dotyczy portu zarządzającego (eth2) i adresów w VPP (netns dataplane: interfejsy, loop0). Format "prefiks|opis".
 TRUSTED_NETS=("10.0.0.0/8|LOCAL" "172.16.0.0/12|LOCAL" "192.168.0.0/16|LOCAL" "46.45.64.0/18|ALL BLOKOWE")
@@ -8070,7 +8072,8 @@ st_vpp_build() {
   # wtyczka synack_guard trafia do paczki vpp-plugin-core (domyślny komponent add_vpp_plugin)
   local core_deb
   core_deb=$(ls -1 "$DEB_DIR"/vpp-plugin-core_*.deb 2>/dev/null | grep -v -- '-dbg_' | head -1)
-  if [[ -n $core_deb ]] && dpkg-deb -c "$core_deb" | grep -q 'synack_guard_plugin\.so'; then
+  # bez "| grep -q": grep kończy przy pierwszym trafieniu, tar dostaje SIGPIPE i pipefail zgłasza błąd mimo trafienia
+  if [[ -n $core_deb ]] && grep -q 'synack_guard_plugin\.so' <(dpkg-deb -c "$core_deb"); then
     ok "wtyczka synack_guard_plugin.so skompilowana (w ${core_deb##*/})"
   else
     echo "Brak synack_guard_plugin.so w paczce vpp-plugin-core — kompilacja wtyczki nie powiodła się (szukaj 'synack_guard' w wyjściu make)"
@@ -9252,7 +9255,15 @@ ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/rou
   ip netns exec dataplane sysctl -q -p /etc/router/dataplane-sysctl.conf 2>/dev/null || warn "nie ustawiono IPv6 w netns dataplane"
   ok "IPv6: bez RA i SLAAC; tylko na interfejsach z adresem IPv6 w ifaces.conf — sprawdź: router-ifaces diff"
 
-  ok "czas, DNS, iptables, limity ICMP, ARP/ND i IPv6 ustawione"
+  # --- napis po zalogowaniu (motd: konsola i SSH) i przed logowaniem na konsoli (issue)
+  local banner
+  banner=$(tr '|' '\n' <<<"$LOGIN_BANNER" | sed 's/^/  /')
+  printf '\n%s\n  host: %s\n\n' "$banner" "$(hostname -f 2>/dev/null || hostname)" \
+    | put_file /etc/motd "napis po zalogowaniu (konsola i SSH)" 644
+  printf '\n%s\n\n  \\n  \\l  (\\4)\n\n' "$banner" | put_file /etc/issue "napis przed logowaniem na konsoli" 644
+  ok "napis logowania: $(tr '|' ' ' <<<"$LOGIN_BANNER")"
+
+  ok "czas, DNS, iptables, limity ICMP, ARP/ND, IPv6 i napis logowania ustawione"
 }
 
 # Dowód z logu VPP, że wtyczka się załadowała (komunikaty vlib/unix/plugin.c: "Loaded plugin: …" albo błąd)
