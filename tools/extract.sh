@@ -13,3 +13,9 @@ extract() {   # extract <znacznik heredoc> <plik wynikowy>
 extract RIFEOF            router-ifaces
 extract ROUTER_MONITOR_PY router-monitor
 extract ROUTER_NOTIFY_PY  router-notify
+extract ROUTER_FW_PY      router-fw
+extract ROUTER_GUARD_PY   router-guard
+mkdir -p build/synack_guard
+extract GUARD_CORE_H      synack_guard/synack_guard_core.h
+extract GUARD_PLUGIN_C    synack_guard/synack_guard.c
+extract GUARD_CMAKE       synack_guard/CMakeLists.txt

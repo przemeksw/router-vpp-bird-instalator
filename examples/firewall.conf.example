@@ -1,0 +1,26 @@
+# /etc/router/firewall.conf — przykład (router-fw). Skopiuj fragmenty, które potrzebujesz.
+# Po edycji:  router-fw check  →  router-fw diff  →  router-fw apply   (apply --confirm 120 = cofnięcie bez potwierdzenia)
+# Ruchu DO routera (BGP, BFD, SNMP, ICMP) ten plik nie dotyczy — to zadanie netfiltera w netns dataplane.
+
+# --- strefy: każdy filtrowany interfejs VPP (porty i VLAN-y z ifaces.conf) ---
+zone  hu0.100  internet     # Transit: EPIX
+zone  hu0.200  internet     # Transit: Upstream-2
+zone  hu0.300  clients      # Core: BNG
+
+# --- listy nazwane (@nazwa w regułach); długie listy w osobnym pliku ---
+list  smtp-ok   203.0.113.25/32  203.0.113.26/32            # serwery poczty klientów z prawem do portu 25
+list  bogony    10.0.0.0/8  172.16.0.0/12  192.168.0.0/16  100.64.0.0/10  169.254.0.0/16  127.0.0.0/8
+#list bogony    include /etc/router/fw-lists/bogony.list
+
+# --- ruch klientów do internetu ---
+# kierunek     akcja   proto  src       sport  dst   dport  opis
+->internet     permit  tcp    @smtp-ok  any    any   25     serwery poczty klientów (whitelist)
+->internet     deny    tcp    any       any    any   25     blokada SMTP od klientów
+
+# --- ruch z internetu ---
+internet->     deny    any    @bogony   any    any   any    bogony z internetu (anty-spoofing)
+internet->     deny    tcp    any       any    any   445    SMB z internetu
+internet->     deny    tcp    any       any    any   23     telnet z internetu
+internet->     deny    any    198.51.100.7/32  any  203.0.113.50/32  any   para src+dst
+
+set  counters  on

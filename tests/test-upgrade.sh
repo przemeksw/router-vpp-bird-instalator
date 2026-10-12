@@ -61,6 +61,8 @@ echo "6. upgrade_script"
 t "pierwsze wgranie (pliki NOWE)"           0 up SCRIPT_VERSION=1.0.0
 t "router-monitor zainstalowany"            0 test -x "$W/opt/router/bin/router-monitor"
 t "router-check zainstalowany"              0 test -x "$W/sbin/router-check"
+t "router-fw zainstalowany"                 0 test -x "$W/opt/router/bin/router-fw"
+t "router-guard zainstalowany"              0 test -x "$W/opt/router/bin/router-guard"
 t "plik wersji: 1.0.0"                      0 grep -qx 'SCRIPT_VERSION=1.0.0' "$W/etc/router/version"
 t "kopia skryptu w opt/router"              0 test -f "$W/opt/router/install-router.sh"
 : >"$W/systemctl.log"

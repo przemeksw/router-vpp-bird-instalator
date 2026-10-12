@@ -137,6 +137,116 @@ def vppctl(cmd):
             del st["if"][n]
         elif t[:4] == ["delete", "loopback", "interface", "intfc"]:
             del st["if"][t[4]]
+        elif t[:3] == ["set", "acl-plugin", "acl"]:
+            body, idx = cmd[len("set acl-plugin acl"):].strip(), None
+            m = re.match(r"index (\d+)\s+(.*)$", body)
+            if m:
+                idx, body = int(m.group(1)), m.group(2)
+            m = re.match(r"(.*)\s+tag (\S+)$", body)
+            if not m:
+                raise ValueError("unknown input `%s'" % body)
+            rules, tag = [r.strip() for r in m.group(1).split(",")], m.group(2)
+            for r in rules:
+                if not re.fullmatch(r"(permit|deny|permit\+reflect) src \S+ dst \S+( proto \d+)?"
+                                    r"( sport \d+(-\d+)?)?( dport \d+(-\d+)?)?", r):
+                    raise ValueError("unknown input `%s'" % r)
+            acl = st.setdefault("acl", {})
+            if idx is None:
+                idx = st.get("acl_next", 0)
+                st["acl_next"] = idx + 1
+                out = "ACL index:%d" % idx
+            elif str(idx) not in acl:
+                raise ValueError("ACL index %d not found" % idx)
+            acl[str(idx)] = {"rules": rules, "tag": tag}
+        elif t[:4] == ["delete", "acl-plugin", "acl", "index"]:
+            acl = st.setdefault("acl", {})
+            if t[4] not in acl:
+                raise ValueError("ACL not found")
+            if any(int(t[4]) in lst for b in st.get("aclbind", {}).values() for lst in b.values()):
+                raise ValueError("ACL is in use")
+            del acl[t[4]]
+        elif t[:3] == ["set", "acl-plugin", "interface"]:
+            name, way, idx, dele = t[3], t[4], int(t[6]), t[7:] == ["del"]
+            if name not in st["if"]:
+                raise ValueError("unknown input `%s'" % name)
+            if str(idx) not in st.get("acl", {}):
+                raise ValueError("ACL not found")
+            b = st.setdefault("aclbind", {}).setdefault(name, {"input": [], "output": []})
+            if dele:
+                if idx not in b[way]:
+                    raise ValueError("ACL not applied")
+                b[way].remove(idx)
+            else:
+                if idx in b[way]:
+                    raise ValueError("ACL already applied")
+                b[way].append(idx)
+        elif cmd == "show acl-plugin acl":
+            for i, a in sorted(st.get("acl", {}).items(), key=lambda x: int(x[0])):
+                out += "acl-index %s count %d tag {%s}\n" % (i, len(a["rules"]), a["tag"])
+                for n, r in enumerate(a["rules"]):
+                    out += "          %d: %s\n" % (n, r)
+        elif cmd == "show acl-plugin interface":
+            for n, b in sorted(st.get("aclbind", {}).items()):
+                if not b["input"] and not b["output"]:
+                    continue
+                out += "sw_if_index %d:\n  input acl(s): %s\n  output acl(s): %s\n" % (
+                    st["if"][n]["idx"], " ".join(map(str, b["input"])), " ".join(map(str, b["output"])))
+        elif t[:1] == ["synack-guard"] or cmd == "show synack-guard" or t[:2] == ["fake", "guard-errors"] \
+                or t[:2] == ["fake", "guard-used"]:
+            if os.environ.get("FAKEVPP_NO_GUARD") and t[0] != "fake":
+                raise ValueError("unknown input `%s'" % cmd)
+            g = st.setdefault("guard", {"mode": "off", "ifaces": {}, "prefixes": [], "config": {}, "used4": 0, "used6": 0,
+                                        "errors": {}})
+            if t[0] == "fake" and t[1] == "guard-errors":
+                g["errors"] = json.loads(cmd.split(None, 2)[2])
+            elif t[0] == "fake":
+                g["used" + t[2]] = int(t[3])
+            elif cmd == "show synack-guard":
+                c = g["config"]
+                out = "mode: %s\n" % g["mode"]
+                out += "config: ttl %s udp-ttl %s check-isn %s tcp-rst %s udp %s udp-frags %s udp-ports %s\n" % (
+                    c.get("ttl", 60), c.get("udp-ttl", 30), c.get("check-isn", "on"), c.get("tcp-rst", "pass"),
+                    c.get("udp", "on"), c.get("udp-frags", "pass"), c.get("udp-ports", "53"))
+                for n, d in sorted(g["ifaces"].items()):
+                    out += "interface: %s %s\n" % (n, d)
+                for pf in sorted(g["prefixes"]):
+                    out += "prefix: %s\n" % pf
+                out += "table-v4: %d/%s\ntable-v6: %d/%s\n" % (g["used4"], c.get("table-v4", 4000000), g["used6"],
+                                                             c.get("table-v6", 1000000))
+            elif t[1] == "interface":
+                if t[2] not in st["if"]:
+                    raise ValueError("unknown input `%s'" % t[2])
+                if t[3] not in ("in", "out"):
+                    raise ValueError("unknown input `%s'" % t[3])
+                if t[4:] == ["disable"]:
+                    g["ifaces"].pop(t[2], None)
+                else:
+                    g["ifaces"][t[2]] = t[3]
+            elif t[1] == "prefix":
+                ipaddress.ip_network(t[2])
+                if t[3:] == ["del"]:
+                    if t[2] not in g["prefixes"]:
+                        raise ValueError("prefix not found")
+                    g["prefixes"].remove(t[2])
+                elif t[2] not in g["prefixes"]:
+                    g["prefixes"].append(t[2])
+            elif t[1] == "mode":
+                if t[2] not in ("off", "monitor", "enforce"):
+                    raise ValueError("unknown input `%s'" % t[2])
+                g["mode"] = t[2]
+            elif t[1] == "config":
+                if ("table-v4" in t or "table-v6" in t) and g["mode"] != "off":
+                    raise ValueError("table sizes can be changed only when mode is off")
+                for k in range(2, len(t) - 1, 2):
+                    g["config"][t[k]] = t[k + 1]
+            else:
+                raise ValueError("unknown input `%s'" % cmd)
+        elif cmd == "show errors":
+            g = st.get("guard", {"errors": {}})
+            out = "   Count                    Node                  Reason               Severity\n"
+            for k, v in sorted(g["errors"].items()):
+                node, reason = k.split("|")
+                out += "%10d  %-28s %-24s error\n" % (v, node, reason)
         else:
             raise ValueError("unknown input `%s'" % cmd)
     except (ValueError, KeyError, IndexError, AssertionError) as ex:

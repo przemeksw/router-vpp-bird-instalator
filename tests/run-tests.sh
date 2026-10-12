@@ -92,5 +92,17 @@ t "loopback odtworzony"                     0 has "L3 203.0.113.1/32" vpp show i
 echo
 bash tests/test-upgrade.sh || fail=$((fail + 1))
 
+echo
+python3 tests/test_router_fw.py || fail=$((fail + 1))
+
+echo
+bash tests/test-installer.sh || fail=$((fail + 1))
+
+echo
+bash tests/test-guard-core.sh || fail=$((fail + 1))
+
+echo
+python3 tests/test_router_guard.py || fail=$((fail + 1))
+
 printf '\nWynik: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))

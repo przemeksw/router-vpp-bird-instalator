@@ -1,0 +1,27 @@
+# /etc/router/synack-guard.conf — przykład (router-guard). Ochrona przed odbiciami SYN-ACK / RST / UDP.
+# Włączanie na żądanie:  router-guard on web --monitor      (uczenie i liczenie, nic nie jest odrzucane)
+#                        router-guard status                (naruszenia przy normalnym ruchu powinny być bliskie zeru)
+#                        router-guard enforce               (odrzucaj)       router-guard off   (wyłącz)
+#
+# Interfejsy VPP: uplinki (sprawdzamy SYN-ACK) i strona klientów (zapisujemy SYN). Muszą być rozłączne.
+in-if    hu0.100 hu0.200
+out-if   hu0.300
+
+# Grupy prefiksów do wywołań "router-guard on web,hosting"
+group web      203.0.113.0/24
+group hosting  198.51.100.0/24  2001:db8:100::/48
+
+# Parametry (wartości domyślne)
+ttl            60        # sekundy ważności wpisu TCP (SYN-ACK wraca w kilka sekund, retransmisje do ok. 60 s)
+udp-ttl        30        # sekundy ważności wpisu UDP
+warmup         60        # monitor przed przejściem na enforce (tablica uczy się wychodzących SYN)
+max-on         6h        # automatyczne wyłączenie, jeśli operator zapomni
+default-mode   monitor   # monitor | enforce (po "on" bez opcji)
+tcp-rst        pass      # pass | handshake — RST przechodzi tylko jako odpowiedź na SYN z chronionego prefiksu
+udp            on        # filtr UDP ze źródłowych portów amplifikacji
+udp-ports      19 53 111 123 137 161 389 1900 3702 5353 11211
+udp-frags      pass      # pass | drop — niepierwsze fragmenty UDP do chronionych prefiksów
+check-isn      on        # numer potwierdzenia SYN-ACK musi być ISN+1
+table-v4       4000000   # rozmiary tablic stanów (zmiana tylko przy wyłączonej ochronie)
+table-v6       1000000
+alarm-pps      10000     # %GUARD-4-VIOLATIONS powyżej tylu naruszeń na sekundę

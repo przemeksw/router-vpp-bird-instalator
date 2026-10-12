@@ -11,11 +11,11 @@ if command -v shellcheck >/dev/null; then shellcheck -S warning install-router.s
 else echo "brak shellcheck (macOS: brew install shellcheck)"; fi
 step "programy osadzone (build/)"
 bash tools/extract.sh || rc=1
-for f in build/router-ifaces build/router-monitor build/router-notify; do
+for f in build/router-ifaces build/router-monitor build/router-notify build/router-fw build/router-guard; do
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" && echo "OK  $f" || rc=1
 done
 step "flake8"
 if python3 -m flake8 --version >/dev/null 2>&1; then
-  python3 -m flake8 --max-line-length 125 build/router-ifaces && echo OK || rc=1
+  python3 -m flake8 --max-line-length 125 build/router-ifaces build/router-fw build/router-guard && echo OK || rc=1
 else echo "brak flake8 (pip3 install flake8)"; fi
 exit $rc

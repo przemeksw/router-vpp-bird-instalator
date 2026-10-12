@@ -13,6 +13,7 @@
 #   * monitoring RAID (mdadm) i dysków (smartd), SNMP dla LibreNMS
 #   * router-monitor: logowanie przeciążeń VPP/CPU w czasie rzeczywistym (styl syslog ASR)
 #
+#   * firewall tranzytu: /etc/router/firewall.conf + router-fw (ACL w VPP, blokady doraźne, liczniki trafień)
 #   * interfejsy: /etc/router/ifaces.conf (VLAN-y, adresy IPv4/IPv6, loopbacki, opisy)
 #     + router-ifaces (zmiany różnicowe, odtwarzanie po starcie VPP, wykrywanie rozjazdu)
 #
@@ -49,7 +50,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.1.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.3.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -75,7 +76,7 @@ SMTP_USER=""                   # login SMTP
 SMTP_PASS=""                   # hasło SMTP (trafi tylko do /etc/router/notify.conf, tryb 600)
 SMTP_FROM=""                   # nadawca, np. router-lodz2@firma.pl
 MAIL_MAX_SEV=5                 # wysyłaj poziomy 1..N (1 = krytyczne ... 5 = zakończenia zdarzeń)
-MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES OTHER"  # co wysyłać (router-notify categories)
+MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"  # co wysyłać (router-notify categories)
 MAIL_SEND_CLEAR=yes            # yes = wysyłaj też zakończenia zdarzeń (np. LOAD_NORMAL z czasem trwania)
 # --- iDRAC: odczyt ustawień BIOS do audytu (Redfish); puste = audyt wnioskuje z Linuksa ---
 IDRAC_HOST=""                  # adres iDRAC, np. 192.168.80.110
@@ -97,7 +98,7 @@ MAIN_LOG=$LOG_DIR/install.log
 MANIFEST=$DATA_DIR/MANIFEST.txt
 MAN_DB=$STATE_DIR/manifest.tsv
 ENV_FILE=$DATA_DIR/router-install.env
-TOTAL_STAGES=21
+TOTAL_STAGES=23
 
 MODE=install
 ASSUME_YES=0
@@ -1827,7 +1828,7 @@ CFG = {
     "ALERT_EMAILS": "", "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls",
     "SMTP_USER": "", "SMTP_PASS": "", "SMTP_FROM": "",
     "MAIL_MAX_SEV": "5", "MAIL_MIN_INTERVAL": "60", "MAIL_MAX_PER_HOUR": "30",
-    "MAIL_SEND": "CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES OTHER",
+    "MAIL_SEND": "CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER",
     "MAIL_SEND_CLEAR": "yes",
 }
 # kategorie zdarzeń: (nazwa, opis, wzorzec na "OBSZAR-ZDARZENIE")
@@ -1844,6 +1845,7 @@ CATEGORIES = [
     ("VPP_PUNT", "duży ruch do samego routera (atak na control plane)", r"^VPP-PUNT_"),
     ("SYS_CPU", "przeciążenie rdzeni systemowych (BIRD, SNMP)", r"^SYS-CPU_"),
     ("IFACES", "interfejsy: zmiany z ifaces.conf, rozjazd VPP, błędy pliku", r"^IFACE-"),
+    ("FIREWALL", "firewall i router-guard: zmiany, rozjazd VPP, blokady, naruszenia", r"^(FW|GUARD)-"),
     ("STATS", "minutowe podsumowanie szczytów (dużo maili!)", r"^VPP-STATS$"),
     ("MAIL", "test wysyłki", r"^SYS-MAIL_"),
     ("OTHER", "pozostałe zdarzenia", r".*"),
@@ -2133,6 +2135,2043 @@ fi
 EOF
 }
 
+prog_router_fw() {
+  cat <<'ROUTER_FW_PY'
+#!/usr/bin/env python3
+"""router-fw — firewall tranzytu na VPP (acl-plugin) z pliku /etc/router/firewall.conf
+
+  router-fw show                       strefy, reguły i stan w VPP
+  router-fw diff                       co zmieni się w VPP po zastosowaniu firewall.conf (niczego nie zmienia)
+  router-fw check                      kontrola pliku i porównanie VPP z ostatnio zastosowaną konfiguracją
+  router-fw apply [-y] [--confirm N]   zastosuj różnicowo, na żywo; --confirm: cofnij po N s, jeśli nie wpiszesz "confirm"
+  router-fw confirm                    potwierdź zmianę z "apply --confirm"
+  router-fw block IP [czas]            blokada doraźna (czas: 30m, 2h, 1d; bez czasu = bezterminowo)
+  router-fw unblock IP                 zdejmij blokadę;  router-fw blocks = lista blokad
+  router-fw counters [-w]              liczniki trafień reguł (pakiety, bajty, pkt/s);  counters clear = zerowanie
+  router-fw boot                       (systemd) po starcie VPP odtwórz reguły
+  router-fw expire                     (systemd, timer) zdejmij wygasłe blokady
+
+Plik firewall.conf jest jedynym źródłem prawdy dla stref i reguł. Reguły działają tylko na ruch
+przechodzący przez VPP (acl-plugin, tryb bezstanowy). Ruchu do samego routera nie filtruje —
+to zadanie netfiltera w netns dataplane.
+"""
+import argparse
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("ROUTER_FW_ROOT", "")      # tylko do testów
+CONF = ROOT + "/etc/router/firewall.conf"
+LASTGOOD = ROOT + "/var/lib/router/fw.last-good.conf"
+PREV = ROOT + "/var/lib/router/fw.prev.conf"
+REJECTED = ROOT + "/var/lib/router/fw.rejected.conf"
+STATE = ROOT + "/var/lib/router/fw.state.json"
+BLOCKS = ROOT + "/var/lib/router/fw-blocks.json"
+PENDING = ROOT + "/var/lib/router/fw.pending.json"
+LOGDIR = ROOT + "/var/log/router-monitor"
+LOG = LOGDIR + "/router-fw.log"
+MONLOG = LOGDIR + "/router-monitor.log"
+LOCK = ROOT + "/run/router-fw.lock"
+NOTIFY = ROOT + "/opt/router/bin/router-notify"
+SELF = "/opt/router/bin/router-fw"
+VPPCTL = os.environ.get("ROUTER_FW_VPPCTL", "vppctl")
+SYSTEMD_RUN = os.environ.get("ROUTER_FW_SYSTEMD_RUN", "systemd-run")
+SYSTEMD = os.environ.get("ROUTER_FW_SYSTEMD", "1") == "1"
+STATS_JSON = os.environ.get("ROUTER_FW_STATS_JSON", "")      # tylko testy: liczniki z pliku zamiast z VPP
+TAG_PREFIX = "rfw"
+MAX_CMD = int(os.environ.get("ROUTER_FW_MAX_CMD", "120000"))       # limit jednego argumentu execve to 128 KB — dłuższej listy ACL nie da się wgrać przez vppctl
+
+ERR_RE = re.compile(r"unknown input|error|fail|invalid|conflict|not found|already|does not exist|not supported|in use",
+                    re.I)
+TTY = sys.stdout.isatty()
+COMMANDS = {}
+
+
+def command(name):
+    def deco(fn):
+        COMMANDS[name] = fn
+        return fn
+    return deco
+
+
+def run_quiet(cmd):
+    """Uruchamia polecenie bez wyjścia; zwraca kod (127, gdy programu nie ma)."""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode
+    except OSError:
+        return 127
+
+
+def color(s, c):
+    return "\033[%sm%s\033[0m" % (c, s) if TTY else s
+
+
+# --------------------------------------------------------------------------- logi
+def now():
+    return time.strftime("%F %T")
+
+
+def log(msg):
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (now(), msg))
+    except OSError:
+        pass
+
+
+def event(sev, mnem, text, mail=True):
+    """Zdarzenie w stylu Cisco: log router-monitor + syslog + (opcjonalnie) e-mail."""
+    line = "%%FW-%d-%s: %s" % (sev, mnem, text)
+    log(line)
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(MONLOG, "a") as f:
+            f.write("%s %s\n" % (now(), line))
+    except OSError:
+        pass
+    prio = {1: "alert", 2: "crit", 3: "err", 4: "warning", 5: "notice"}.get(sev, "info")
+    subprocess.run(["logger", "-t", "router-fw", "-p", "local0." + prio, line],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if mail and os.access(NOTIFY, os.X_OK):
+        subprocess.run([NOTIFY, "queue", line], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return line
+
+
+# --------------------------------------------------------------------------- plik firewall.conf
+IDENT = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+IFNAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+PROTOS = {"any": None, "tcp": 6, "udp": 17, "icmp": 1, "icmp6": 58}
+ANY = {4: ipaddress.ip_network("0.0.0.0/0"), 6: ipaddress.ip_network("::/0")}
+DIRECTION_RE = re.compile(r"^(?:([A-Za-z0-9_-]+)->|->([A-Za-z0-9_-]+))$")
+
+
+class Rule:
+    def __init__(self, lineno, direction, action, proto, src, sport, dst, dport, desc, raw):
+        self.lineno, self.direction, self.action, self.proto = lineno, direction, action, proto
+        self.src, self.sport, self.dst, self.dport = src, sport, dst, dport
+        self.desc, self.raw = desc, raw
+
+
+class Conf:
+    def __init__(self):
+        self.zones = {}                  # interfejs -> strefa
+        self.lists = {}                  # nazwa -> [ip_network]
+        self.rules = []                  # [Rule] w kolejności z pliku
+        self.settings = {"counters": "on"}
+
+
+def parse_ports(tok):
+    if tok == "any":
+        return None
+    out = []
+    for part in tok.split(","):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise ValueError("zły port '%s'" % part)
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if not 0 <= lo <= hi <= 65535:
+            raise ValueError("zły zakres portów '%s'" % part)
+        out.append((lo, hi))
+    return out
+
+
+def parse_addrs(tok, lists):
+    if tok == "any":
+        return None
+    out = []
+    for part in tok.split(","):
+        if part.startswith("@"):
+            if part[1:] not in lists:
+                raise ValueError("nieznana lista '%s' (lista musi być zdefiniowana wyżej)" % part)
+            out.extend(lists[part[1:]])
+        else:
+            try:
+                out.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                raise ValueError("zły adres '%s'" % part)
+    if not out:
+        raise ValueError("lista adresów '%s' jest pusta" % tok)
+    return out
+
+
+def read_list_file(path):
+    try:
+        with open(ROOT + path) as f:
+            lines = f.read().splitlines()
+    except OSError as ex:
+        raise ValueError("nie można czytać %s: %s" % (path, ex))
+    out = []
+    for raw in lines:
+        s = re.split(r"\s#|^#", raw.strip(), maxsplit=1)[0].strip()
+        if not s:
+            continue
+        try:
+            out.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            raise ValueError("%s: zły adres '%s'" % (path, s))
+    return out
+
+
+def parse_rule(t, comment):
+    """Kolumny reguły -> (kierunek, akcja, proto, src, sport, dst, dport, opis); ValueError przy błędzie."""
+    if len(t) < 7:
+        raise ValueError("za mało kolumn (kierunek akcja proto src sport dst dport [opis]): %s" % " ".join(t))
+    m = DIRECTION_RE.match(t[0])
+    if not m:
+        raise ValueError("zły kierunek '%s' (np. internet-> albo ->internet)" % t[0])
+    direction = (m.group(1), "in") if m.group(1) else (m.group(2), "out")
+    if t[1] not in ("permit", "deny"):
+        raise ValueError("akcja musi być permit albo deny, jest '%s'" % t[1])
+    if t[2] not in PROTOS:
+        raise ValueError("nieznany protokół '%s' (tcp, udp, icmp, icmp6, any)" % t[2])
+    return direction, t[1], PROTOS[t[2]], t[3], t[4], t[5], t[6], (t[7] if len(t) == 8 else comment.strip())
+
+
+def parse_conf(text):
+    """Zwraca (Conf, błędy). Błąd w pliku = nic nie zostanie zastosowane."""
+    conf, errs = Conf(), []
+    for no, raw in enumerate(text.splitlines(), 1):
+        parts = re.split(r"\s#", raw.strip(), maxsplit=1)
+        body, comment = parts[0].strip(), (parts[1] if len(parts) > 1 else "")
+        if not body or body.startswith("#"):
+            continue
+        t = body.split(None, 7)
+        try:
+            kw = t[0]
+            if kw == "zone":
+                if len(t) != 3:
+                    raise ValueError("składnia: zone INTERFEJS STREFA")
+                if not IFNAME.match(t[1]) or not IDENT.match(t[2]):
+                    raise ValueError("zła nazwa interfejsu lub strefy (litery, cyfry, _ - ; strefa do 24 znaków)")
+                if t[1] in conf.zones:
+                    raise ValueError("interfejs %s ma już strefę %s" % (t[1], conf.zones[t[1]]))
+                conf.zones[t[1]] = t[2]
+            elif kw == "list":
+                if len(t) < 3 or not IDENT.match(t[1]):
+                    raise ValueError("składnia: list NAZWA adres... | include /ścieżka")
+                items, k, nets = body.split()[2:], 0, []
+                while k < len(items):
+                    if items[k] == "include":
+                        if k + 1 >= len(items):
+                            raise ValueError("include wymaga ścieżki")
+                        nets.extend(read_list_file(items[k + 1]))
+                        k += 2
+                    else:
+                        nets.extend(parse_addrs(items[k], conf.lists))
+                        k += 1
+                conf.lists[t[1]] = nets
+            elif kw == "set":
+                if len(t) != 3 or t[1] != "counters" or t[2] not in ("on", "off"):
+                    raise ValueError("znane ustawienie: set counters on|off")
+                conf.settings["counters"] = t[2]
+            else:
+                direction, action, proto, src, sport, dst, dport, desc = parse_rule(t, comment)
+                r = Rule(no, direction, action, proto, parse_addrs(src, conf.lists), parse_ports(sport),
+                         parse_addrs(dst, conf.lists), parse_ports(dport), desc, " ".join(t[:7]))
+                if proto not in (6, 17) and (r.sport or r.dport):
+                    raise ValueError("porty można podać tylko dla tcp i udp")
+                if not flatten(r):
+                    raise ValueError("reguła nic nie obejmuje (src, dst i protokół z różnych rodzin adresów)")
+                conf.rules.append(r)
+        except ValueError as ex:
+            errs.append("linia %d: %s" % (no, ex))
+    zones = set(conf.zones.values())
+    for r in conf.rules:
+        if r.direction[0] not in zones:
+            errs.append("linia %d: strefa '%s' nie ma żadnego interfejsu (zone ...)" % (r.lineno, r.direction[0]))
+    return conf, errs
+
+# --------------------------------------------------------------------------- reguła -> reguły ACL VPP
+class Flat:
+    """Jedna reguła ACL VPP (jedna rodzina adresów, jeden zakres portów)."""
+    def __init__(self, action, src, dst, proto, sport, dport, parent):
+        self.action, self.src, self.dst, self.proto = action, src, dst, proto
+        self.sport, self.dport, self.parent = sport, dport, parent    # parent: nr linii | "block" | "default"
+
+    def text(self):
+        s = "%s src %s dst %s" % (self.action, self.src, self.dst)
+        if self.proto is not None:
+            s += " proto %d" % self.proto
+        for name, pr in (("sport", self.sport), ("dport", self.dport)):
+            if pr is not None:
+                s += " %s %s" % (name, str(pr[0]) if pr[0] == pr[1] else "%d-%d" % pr)
+        return s
+
+
+def flatten(rule):
+    """Reguła -> lista Flat: iloczyn adresów, portów i rodzin adresów (IPv4 / IPv6)."""
+    fams = {1: {4}, 58: {6}}.get(rule.proto, {4, 6})
+    out = []
+    for s in rule.src or [None]:
+        for d in rule.dst or [None]:
+            f = set(fams)
+            if s is not None:
+                f &= {s.version}
+            if d is not None:
+                f &= {d.version}
+            for v in sorted(f):
+                for sp in rule.sport or [None]:
+                    for dp in rule.dport or [None]:
+                        out.append(Flat(rule.action, s or ANY[v], d or ANY[v], rule.proto, sp, dp, rule.lineno))
+    return out
+
+# --------------------------------------------------------------------------- kompilacja reguł do ACL VPP
+class Group:
+    """Jedna lista ACL w VPP: strefa + kierunek (in = wejście na interfejsach strefy, out = wyjście)."""
+    def __init__(self, zone, direction, ifaces, flat):
+        self.zone, self.dir, self.ifaces, self.flat = zone, direction, ifaces, flat
+        self.key = "%s:%s" % (zone, direction)
+        self.texts = [f.text() for f in flat]
+        self.sha = hashlib.sha256("\n".join(self.texts).encode()).hexdigest()[:8]
+        self.tag = "%s:%s:%s" % (TAG_PREFIX, self.key, self.sha)     # sha w tagu = wykrywanie zmiany treści
+
+    def acl_command(self, index=None):
+        return "set acl-plugin acl%s %s tag %s" % ("" if index is None else " index %d" % index,
+                                                    ", ".join(self.texts), self.tag)
+
+
+def build_groups(conf, blocks=()):
+    """Conf + blokady doraźne -> {klucz: Group}. Blokady wchodzą na początek listy internet:in."""
+    groups = {}
+    for zone in sorted(set(conf.zones.values())):
+        for d in ("in", "out"):
+            flat = []
+            if zone == "internet" and d == "in":
+                for b in blocks:
+                    net = ipaddress.ip_network(b["net"])
+                    flat.append(Flat("deny", net, ANY[net.version], None, None, None, "block"))
+            for r in conf.rules:
+                if r.direction == (zone, d):
+                    flat.extend(flatten(r))
+            if not flat:
+                continue
+            flat.append(Flat("permit", ANY[4], ANY[4], None, None, None, "default"))
+            flat.append(Flat("permit", ANY[6], ANY[6], None, None, None, "default"))
+            ifaces = sorted(i for i, z in conf.zones.items() if z == zone)
+            g = Group(zone, d, ifaces, flat)
+            groups[g.key] = g
+    return groups
+
+
+# --------------------------------------------------------------------------- analiza reguł (check)
+CRITICAL = [("tcp", 6, 179, "BGP"), ("udp", 17, 3784, "BFD"), ("udp", 17, 4784, "BFD")]
+
+
+def _covers_nets(a, b):
+    """Czy zbiór adresów a (None = dowolny) obejmuje cały zbiór b."""
+    if a is None:
+        return True
+    if b is None:
+        return False
+    return all(any(x.version == y.version and x.subnet_of(y) for y in a) for x in b)
+
+
+def _covers_ports(a, b):
+    if a is None:
+        return True
+    if b is None:
+        return False
+    return all(any(y[0] <= x[0] and x[1] <= y[1] for y in a) for x in b)
+
+
+def _hits(ports, n):
+    return ports is not None and any(lo <= n <= hi for lo, hi in ports)
+
+
+def analyze(conf):
+    """Ostrzeżenia: reguły zacienione oraz deny, które mogą zerwać BGP/BFD z sąsiadami."""
+    warns, seen = [], {}
+    for r in conf.rules:
+        for p in seen.get(r.direction, []):
+            if ((p.proto is None or p.proto == r.proto) and _covers_nets(p.src, r.src)
+                    and _covers_nets(p.dst, r.dst) and _covers_ports(p.sport, r.sport)
+                    and _covers_ports(p.dport, r.dport)):
+                warns.append("linia %d jest zacieniona przez linię %d (nigdy nie zadziała)" % (r.lineno, p.lineno))
+                break
+        seen.setdefault(r.direction, []).append(r)
+        if r.action != "deny":
+            continue
+        blanket = r.src is None and r.dst is None and r.sport is None and r.dport is None
+        for name, proto, port, what in CRITICAL:
+            explicit = _hits(r.dport, port) or _hits(r.sport, port)
+            if r.proto in (None, proto) and (explicit or (blanket and r.proto == proto)):
+                warns.append("linia %d: deny obejmuje %s (%s/%d) — może zerwać sesje z sąsiadami"
+                             % (r.lineno, what, name, port))
+        if r.proto is None and r.src is None and r.dst is None and r.sport is None and r.dport is None:
+            warns.append("linia %d: deny dla całego ruchu — zablokuje także BGP i BFD" % r.lineno)
+    return warns
+
+# --------------------------------------------------------------------------- VPP: odczyt stanu i zmiany
+class VppError(Exception):
+    pass
+
+
+class Actual:
+    def __init__(self):
+        self.ifaces = {}     # nazwa -> sw_if_index
+        self.acls = {}       # klucz "strefa:kier" -> (indeks, tag): nasze ACL (o tagu rfw:...)
+        self.extra = []      # [(indeks, tag)]: duplikaty naszych ACL (po przerwanym apply)
+        self.binds = {}      # (nazwa interfejsu, "in"|"out") -> [indeksy ACL]
+
+
+def cli(cmd, timeout=15):
+    try:
+        r = subprocess.run([VPPCTL, cmd], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        raise VppError("vppctl: %s" % ex)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "connect" in out.lower() and "fail" in out.lower():
+        raise VppError("vppctl '%s': %s" % (cmd[:80], out.strip() or "kod %d" % r.returncode))
+    return out
+
+
+# Formaty wyjścia VPP, na których opiera się parser (do potwierdzenia w labie: docs/router-fw-lab-checklist.md):
+#   show acl-plugin acl        ->  "acl-index 3 count 12 tag {rfw:internet:in:1a2b3c4d}"  + wiersze reguł
+#   show acl-plugin interface  ->  "sw_if_index 5:" / "  input acl(s): 3 4" / "  output acl(s): 6"
+ACL_RE = re.compile(r"acl-index\s+(\d+)\s+count\s+\d+\s+tag\s+\{([^}]*)\}")
+SWIF_RE = re.compile(r"^\s*sw_if_index\s+(\d+)")
+BIND_RE = re.compile(r"^\s*(input|output)\s+acl\(s\):\s*([\d\s,]*)")
+
+
+def read_vpp():
+    act = Actual()
+    for line in cli("show interface").splitlines():
+        m = re.match(r"^(\S+)\s+(\d+)\s", line)
+        if m:
+            act.ifaces[m.group(1)] = int(m.group(2))
+    found = []
+    for m in ACL_RE.finditer(cli("show acl-plugin acl")):
+        if m.group(2).startswith(TAG_PREFIX + ":"):
+            found.append((int(m.group(1)), m.group(2)))
+    for idx, tag in sorted(found):
+        key = tag[len(TAG_PREFIX) + 1:].rsplit(":", 1)[0]
+        if key in act.acls:
+            act.extra.append(act.acls[key])
+        act.acls[key] = (idx, tag)
+    by_idx = {v: k for k, v in act.ifaces.items()}
+    cur = None
+    for line in cli("show acl-plugin interface").splitlines():
+        m = SWIF_RE.match(line)
+        if m:
+            cur = by_idx.get(int(m.group(1)))
+            continue
+        m = BIND_RE.match(line)
+        if m and cur:
+            ids = [int(x) for x in re.findall(r"\d+", m.group(2))]
+            if ids:
+                act.binds[(cur, "in" if m.group(1) == "input" else "out")] = ids
+    return act
+
+
+def wait_vpp(timeout):
+    end = time.time() + timeout
+    while True:
+        try:
+            cli("show version", timeout=5)
+            return True
+        except VppError:
+            if time.time() > end:
+                return False
+            time.sleep(2)
+
+
+class Step:
+    """Jeden krok doprowadzenia VPP do stanu docelowego: create | replace | bind | unbind | delete."""
+    def __init__(self, op, key, group=None, index=None, iface=None, direction=None):
+        self.op, self.key, self.group, self.index = op, key, group, index
+        self.iface, self.dir = iface, direction
+
+    def command(self, idx_map):
+        if self.op == "create":
+            return self.group.acl_command()
+        if self.op == "replace":
+            return self.group.acl_command(self.index)
+        idx = self.index if self.index is not None else idx_map[self.key]
+        if self.op in ("bind", "unbind"):
+            return "set acl-plugin interface %s %s acl %d%s" % (
+                self.iface, "input" if self.dir == "in" else "output", idx, " del" if self.op == "unbind" else "")
+        return "delete acl-plugin acl index %d" % idx
+
+    def human(self):
+        way = {"in": "wejście", "out": "wyjście"}.get(self.dir or (self.group.dir if self.group else ""), "")
+        if self.op == "create":
+            return "+ ACL %s (%d reguł)" % (self.key, len(self.group.flat))
+        if self.op == "replace":
+            return "~ ACL %s: nowa treść (%d reguł)" % (self.key, len(self.group.flat))
+        if self.op == "bind":
+            return "+ %s: %s na %s" % (self.key, way, self.iface)
+        if self.op == "unbind":
+            return "- %s: %s na %s" % (self.key, way, self.iface)
+        return "- ACL %s" % self.key
+
+
+def plan(groups, act):
+    """Różnice VPP -> stan docelowy: lista Step (create/replace, bind, unbind, delete). Cudzych ACL nie rusza."""
+    defs, binds, unbinds, deletes = [], [], [], []
+    for key, g in sorted(groups.items()):
+        cur = act.acls.get(key)
+        if cur is None:
+            defs.append(Step("create", key, group=g))
+        elif cur[1] != g.tag:
+            defs.append(Step("replace", key, group=g, index=cur[0]))
+    managed = {idx: key for key, (idx, _t) in act.acls.items()}
+    managed.update({idx: tag[len(TAG_PREFIX) + 1:].rsplit(":", 1)[0] for idx, tag in act.extra})
+    want = {}
+    for g in groups.values():
+        for ifn in g.ifaces:
+            if ifn in act.ifaces:
+                want[(ifn, g.dir)] = g.key
+    for (ifn, d), lst in sorted(act.binds.items()):
+        for idx in lst:
+            key = managed.get(idx)
+            if key is None:
+                continue
+            if not (want.get((ifn, d)) == key and act.acls.get(key, (None,))[0] == idx):
+                unbinds.append(Step("unbind", key, index=idx, iface=ifn, direction=d))
+    for (ifn, d), key in sorted(want.items()):
+        idx = act.acls.get(key, (None,))[0]
+        if idx is None or idx not in act.binds.get((ifn, d), []):
+            binds.append(Step("bind", key, index=idx, iface=ifn, direction=d))
+    for idx, key in sorted(managed.items()):
+        if key not in groups or act.acls.get(key, (None,))[0] != idx:
+            deletes.append(Step("delete", key, index=idx))
+    return defs + binds + unbinds + deletes
+
+
+def run_steps(steps):
+    """Wykonuje kroki po kolei; przy pierwszym błędzie staje. Zwraca (wykonane, nieudany_krok|None, tekst błędu)."""
+    idx_map, done = {}, []
+    for st in steps:
+        try:
+            cmd = st.command(idx_map)
+        except KeyError:
+            return done, st, "brak indeksu ACL %s" % st.key
+        log("vppctl: %s" % cmd)
+        try:
+            out = cli(cmd)
+        except VppError as ex:
+            log("BŁĄD: %s" % ex)
+            return done, st, str(ex)
+        if ERR_RE.search(out):
+            log("BŁĄD: %s" % out.strip())
+            return done, st, out.strip()
+        if st.op == "create":
+            act = read_vpp()
+            if st.key not in act.acls:
+                return done, st, "ACL %s nie pojawił się w VPP" % st.key
+            idx_map[st.key] = act.acls[st.key][0]
+        done.append(st)
+    return done, None, ""
+
+
+def enable_counters(on):
+    """Włącza (API acl_stats_intf_counters_enable) liczniki per reguła w segmencie statystyk VPP."""
+    if STATS_JSON or os.environ.get("ROUTER_FW_NO_PAPI"):
+        return True
+    try:
+        import glob
+        from vpp_papi import VPPApiClient
+        vpp = VPPApiClient(apifiles=glob.glob("/usr/share/vpp/api/**/*.api.json", recursive=True),
+                           server_address="/run/vpp/api.sock")
+        vpp.connect("router-fw")
+        try:
+            vpp.api.acl_stats_intf_counters_enable(enable=1 if on else 0)
+        finally:
+            vpp.disconnect()
+        return True
+    except Exception as ex:     # noqa: BLE001 — brak vpp_papi / pliku API / gniazda nie może blokować apply
+        log("liczniki ACL: nie udało się %s (%s)" % ("włączyć" if on else "wyłączyć", ex))
+        return False
+
+# --------------------------------------------------------------------------- stan, blokady, blokada współbieżności
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def lock():
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    fd = open(LOCK, "w")
+    end = time.time() + 120
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() > end:
+                sys.exit("inna instancja router-fw działa zbyt długo (%s)" % LOCK)
+            time.sleep(1)
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def pl(n, one, few, many):
+    if n == 1:
+        return "%d %s" % (n, one)
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "%d %s" % (n, few)
+    return "%d %s" % (n, many)
+
+
+def load_blocks(include_expired=False):
+    """Blokady doraźne: aktywne (wygasłe pomija; usuwa je dopiero 'expire') albo wszystkie wpisy z pliku."""
+    t = time.time()
+    return [b for b in load_json(BLOCKS, []) if include_expired or not b.get("expires") or b["expires"] > t]
+
+
+def freeze(text, conf):
+    """Treść pliku z rozwiniętymi listami (include): to zapisujemy jako last-good, żeby cofnięcie, boot i check
+    nie zależały od plików list, które operator mógł już zmienić. Numery linii zostają bez zmian."""
+    out = []
+    for raw in text.splitlines():
+        t = raw.split()
+        if len(t) >= 3 and t[0] == "list" and t[1] in conf.lists:
+            out.append("list %s %s" % (t[1], " ".join(str(n) for n in conf.lists[t[1]])))
+        else:
+            out.append(raw)
+    return "\n".join(out) + "\n"
+
+
+def get_desired(path):
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as ex:
+        return None, ["nie można czytać %s: %s" % (path, ex)], ""
+    conf, errs = parse_conf(text)
+    return (None if errs else conf), errs, text
+
+
+def summarize(steps, limit=6):
+    s = "; ".join(st.human() for st in steps[:limit])
+    return s + ("; … (+%d)" % (len(steps) - limit) if len(steps) > limit else "")
+
+
+def show_steps(steps, prefix="  "):
+    for st in steps:
+        c = "32" if st.human().startswith("+") else "31" if st.human().startswith("-") else "33"
+        print(prefix + color(st.human(), c))
+
+
+# --------------------------------------------------------------------------- apply / boot / diff
+def prepare(args, boot, source, lenient):
+    """Tylko odczyt: (kontekst, 0) albo (None, kod wyjścia). Wołane przed pytaniem i jeszcze raz pod blokadą."""
+    path, fallback = source or CONF, False
+    conf, errs, text = get_desired(path)
+    if conf is None and boot and os.path.exists(LASTGOOD):
+        event(2, "CONFIG_ERROR", "błędy w %s (%s) — używam ostatniej poprawnej konfiguracji" % (path, errs[0]))
+        path, fallback = LASTGOOD, True
+        conf, errs, text = get_desired(LASTGOOD)
+    if conf is None:
+        if boot:
+            event(2, "CONFIG_ERROR", "błędy w firewall.conf: %s" % "; ".join(errs[:3]))
+        for e in errs:
+            print(color("  " + e, "31"))
+        print(color("Nic nie zmieniono — popraw %s i uruchom ponownie." % path, "31"))
+        return None, 2
+    blocks = load_blocks()
+    if blocks and "internet" not in conf.zones.values():
+        msg = "są blokady doraźne, ale w pliku nie ma żadnego interfejsu ze strefą 'internet'"
+        if not boot:
+            print(color("  " + msg, "31"))
+            return None, 2
+        event(4, "BLOCKS_IGNORED", msg)
+        blocks = []
+    if boot and not wait_vpp(args.timeout):
+        event(2, "APPLY_FAIL", "VPP nie odpowiada po %d s — reguły nie zostały wgrane" % args.timeout)
+        return None, 3
+    try:
+        act = read_vpp()
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return None, 3
+    groups = build_groups(conf, blocks)
+    big = sorted(g.key for g in groups.values() if len(g.acl_command()) > MAX_CMD)
+    if big:
+        print(color("  lista ACL %s jest za długa dla jednego polecenia vppctl (limit ok. %d KB) — skróć listy"
+                    % (", ".join(big), MAX_CMD // 1000), "31"))
+        return None, 2
+    missing = sorted({i for g in groups.values() for i in g.ifaces if i not in act.ifaces})
+    if missing and not (boot or lenient):
+        print(color("  interfejsy spoza VPP: %s (sprawdź zone ... w firewall.conf i router-ifaces)" % ", ".join(missing), "31"))
+        return None, 2
+    if missing:
+        event(4, "IFACE_MISSING", "brak interfejsów w VPP: %s — reguły na nich zostaną wgrane po ich utworzeniu "
+              "(router-fw apply)" % ", ".join(missing), mail=False)
+    return {"conf": conf, "text": text, "path": path, "fallback": fallback, "groups": groups,
+            "steps": plan(groups, act)}, 0
+
+
+def report_plan(ctx):
+    for w in analyze(ctx["conf"]):
+        print(color("  UWAGA: " + w, "33"))
+    if not ctx["steps"]:
+        print("Brak zmian — VPP jest zgodny z %s." % ctx["path"])
+    else:
+        print("Zmiany do wprowadzenia (%s → VPP):" % ctx["path"])
+        show_steps(ctx["steps"])
+
+
+def do_apply(args, boot=False, source=None, lenient=False):
+    shown = None
+    if not boot and sys.stdin.isatty() and not args.yes:
+        # pytanie zadajemy BEZ blokady (operator może je zostawić otwarte); pod blokadą plan liczymy jeszcze raz
+        ctx, rc = prepare(args, boot, source, lenient)
+        if ctx is None:
+            return rc
+        report_plan(ctx)
+        if not ctx["steps"]:
+            return 0
+        try:
+            ans = input("Zastosować? [t/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("t", "tak", "y", "yes"):
+            print("Przerwano — nic nie zmieniono.")
+            return 1
+        shown = [s.human() for s in ctx["steps"]]
+    fd = lock()
+    state = load_json(STATE, {})
+    ctx, rc = prepare(args, boot, source, lenient)
+    if ctx is None:
+        return rc
+    conf, text, path, groups, steps = ctx["conf"], ctx["text"], ctx["path"], ctx["groups"], ctx["steps"]
+    if shown is not None and [s.human() for s in steps] != shown:
+        print(color("Stan VPP lub pliku zmienił się w trakcie pytania — nic nie zmieniono, uruchom apply ponownie.", "33"))
+        return 1
+    if not boot and shown is None:
+        report_plan(ctx)
+    if args.confirm and steps and not boot and not arm_rollback(args.confirm):
+        return 4
+    done, failed, err = run_steps(steps)
+    enable_counters(conf.settings["counters"] == "on")
+    frozen = freeze(text, conf)
+    keep = {g.tag for g in groups.values()}
+    state.update({"applied": now(), "conf_sha": sha(frozen), "source": path,
+                  "baseline": {t: v for t, v in state.get("baseline", {}).items() if t in keep}})
+    if failed is None and not ctx["fallback"]:
+        os.makedirs(os.path.dirname(LASTGOOD), exist_ok=True)
+        with open(LASTGOOD, "w") as f:
+            f.write(frozen)
+    if failed is not None:
+        save_json(STATE, state)
+        print(color("\nNie udało się doprowadzić VPP do zgodności: %s\n  krok: %s\nSzczegóły: %s"
+                    % (err, failed.human(), LOG), "31"))
+        event(3, "APPLY_FAIL", "nie udało się zastosować (%s): %s — szczegóły %s" % (failed.human(), err[:120], LOG))
+        return 4
+    if boot:
+        event(6, "RESTORED", "reguły firewalla odtworzone po starcie VPP (%s, %d list ACL, źródło %s)"
+              % (pl(len(done), "krok", "kroki", "kroków"), len(groups), path), mail=False)
+        state["drift"] = ""
+    elif done:
+        event(5, "APPLIED", summarize(done))
+        if state.get("drift"):
+            event(5, "DRIFT_END", "VPP znów zgodny z firewall.conf")
+        state["drift"] = ""
+        print(color("Zastosowano: %s. VPP zgodny z %s." % (pl(len(done), "zmiana", "zmiany", "zmian"), path), "32"))
+    save_json(STATE, state)
+    del fd
+    return 0
+
+
+@command("apply")
+def cmd_apply(args):
+    if os.path.exists(PENDING):
+        print(color("Poprzednia zmiana czeka na potwierdzenie — wykonaj: router-fw confirm (zostaje) "
+                    "albo router-fw rollback (cofnij).", "33"))
+        return 1
+    return do_apply(args)
+
+
+@command("boot")
+def cmd_boot(args):
+    settle_pending("po starcie VPP")          # niepotwierdzona zmiana (apply --confirm) nie przeżywa restartu
+    return do_apply(args, boot=True)
+
+
+@command("diff")
+def cmd_diff(args):
+    conf, errs, _text = get_desired(CONF)
+    if conf is None:
+        for e in errs:
+            print(color("  " + e, "31"))
+        return 2
+    try:
+        act = read_vpp()
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return 3
+    steps = plan(build_groups(conf, load_blocks()), act)
+    if not steps:
+        print("Brak różnic — VPP jest zgodny z %s." % CONF)
+        return 0
+    print("Po 'router-fw apply' w VPP zmieni się:")
+    show_steps(steps)
+    return 1
+
+
+# --------------------------------------------------------------------------- check / show
+@command("check")
+def cmd_check(args):
+    """Kontrola pliku firewall.conf + porównanie VPP z ostatnio zastosowaną konfiguracją (rozjazd)."""
+    quiet, rc = args.log, 0
+    conf, errs, text = get_desired(CONF)
+    if conf is None:
+        for e in errs:
+            print(color("  " + e, "31"))
+        if quiet:
+            event(2, "CONFIG_ERROR", "błędy w firewall.conf: %s" % "; ".join(errs[:3]), mail=False)
+        rc = 2
+    else:
+        for w in analyze(conf):
+            print(color("  UWAGA: " + w, "33"))
+        if not quiet:
+            print("firewall.conf: %d stref(y), %s, %s — składnia OK." % (
+                len(set(conf.zones.values())), pl(len(conf.rules), "reguła", "reguły", "reguł"),
+                pl(len(conf.lists), "lista", "listy", "list")))
+    state = load_json(STATE, {})
+    if not os.path.exists(LASTGOOD):
+        if not quiet:
+            print("Firewall nie był jeszcze stosowany (router-fw apply).")
+        return rc
+    applied, aerrs, _t = get_desired(LASTGOOD)
+    if applied is None:
+        print(color("  ostatnia zastosowana konfiguracja jest uszkodzona: %s" % aerrs[0], "31"))
+        return 2
+    try:
+        act = read_vpp()
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return 3
+    steps = plan(build_groups(applied, load_blocks(include_expired=True)), act)
+    if steps:
+        print(color("Rozjazd: VPP różni się od ostatnio zastosowanej konfiguracji:", "31"))
+        show_steps(steps)
+        if quiet and not state.get("drift"):
+            state["drift"] = summarize(steps)
+            save_json(STATE, state)
+            event(4, "DRIFT", "VPP różni się od firewall.conf: %s" % state["drift"])
+        rc = rc or 1
+    else:
+        if not quiet:
+            print("VPP jest zgodny z ostatnio zastosowaną konfiguracją.")
+        if state.get("drift"):
+            state["drift"] = ""
+            save_json(STATE, state)
+            event(5, "DRIFT_END", "VPP znów zgodny z firewall.conf")
+    if conf is not None and state.get("conf_sha") and sha(freeze(text, conf)) != state["conf_sha"] and not quiet:
+        print("Plik firewall.conf zmieniono po ostatnim apply — zobacz: router-fw diff")
+    return rc
+
+
+@command("show")
+def cmd_show(args):
+    conf, errs, _text = get_desired(CONF)
+    if conf is None:
+        for e in errs:
+            print(color("  " + e, "31"))
+        return 2
+    try:
+        act = read_vpp()
+    except VppError:
+        act = None
+    groups = build_groups(conf, load_blocks())
+    print(color("Strefy:", "1"))
+    for z in sorted(set(conf.zones.values())):
+        print("  %-12s %s" % (z, " ".join(sorted(i for i, zz in conf.zones.items() if zz == z))))
+    print(color("\nListy ACL:", "1"))
+    for key, g in sorted(groups.items()):
+        cur = act.acls.get(key) if act else None
+        state = ("ACL %d w VPP" % cur[0] if cur else "brak w VPP") if act else "VPP nie odpowiada"
+        bound = [i for i in g.ifaces if act and cur and cur[0] in act.binds.get((i, g.dir), [])]
+        print("  %-14s %3d reguł  %-16s przypięta do: %s" % (key, len(g.flat), state, " ".join(bound) or "—"))
+    print(color("\nReguły:", "1"))
+    for r in conf.rules:
+        print("  %4d  %s%s" % (r.lineno, r.raw, ("   # " + r.desc) if r.desc else ""))
+    blocks = load_blocks()
+    if blocks:
+        print(color("\nBlokady doraźne: %d (router-fw blocks)" % len(blocks), "1"))
+    return 0
+
+# --------------------------------------------------------------------------- apply --confirm / confirm / rollback
+def arm_rollback(sec):
+    """Zapamiętuje poprzednią konfigurację i uzbraja jednorazowy timer cofnięcia (systemd-run).
+    Zwraca False (i nic nie zostaje zmienione), gdy timera nie da się uzbroić."""
+    prev = ""
+    if os.path.exists(LASTGOOD):
+        with open(LASTGOOD) as f:
+            prev = f.read()
+    os.makedirs(os.path.dirname(PREV), exist_ok=True)
+    with open(PREV, "w") as f:
+        f.write(prev)
+    save_json(PENDING, {"deadline": int(time.time()) + sec, "prev": PREV})
+    log("apply --confirm %d: cofnięcie do %s, jeśli nie będzie 'router-fw confirm'" % (sec, PREV))
+    if SYSTEMD:
+        for unit in ("router-fw-rollback.timer", "router-fw-rollback.service"):
+            run_quiet(["systemctl", "stop", unit])
+        run_quiet(["systemctl", "reset-failed", "router-fw-rollback.service"])
+        rc = run_quiet([SYSTEMD_RUN, "--unit=router-fw-rollback", "--on-active=%ds" % sec,
+                        "--description=router-fw: automatyczne cofnięcie niepotwierdzonej zmiany", SELF, "rollback"])
+        if rc != 0:
+            os.remove(PENDING)
+            log("systemd-run zwrócił %d — timer cofnięcia nie został uzbrojony" % rc)
+            print(color("Nie udało się uzbroić timera cofnięcia (systemd-run, kod %d) — nic nie zmieniono." % rc, "31"))
+            return False
+    print(color("  Masz %d s na potwierdzenie: router-fw confirm (inaczej zmiana zostanie cofnięta)." % sec, "33"))
+    return True
+
+
+def settle_pending(why):
+    """Odrzuca niepotwierdzoną zmianę: firewall.conf wraca do poprzedniej zastosowanej wersji,
+    a odrzucona zostaje w fw.rejected.conf. Zwraca True, gdy była zmiana do odrzucenia."""
+    fd = lock()
+    pend = load_json(PENDING, None)
+    if not pend:
+        return False
+    prev = ""
+    try:
+        with open(pend["prev"]) as f:
+            prev = f.read()
+    except OSError:
+        pass
+    try:
+        with open(CONF) as f:
+            rejected = f.read()
+        os.makedirs(os.path.dirname(REJECTED), exist_ok=True)
+        with open(REJECTED, "w") as f:
+            f.write(rejected)
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        f.write(prev or "# firewall.conf — poprzednia zastosowana wersja była pusta; odrzucona zmiana: %s\n" % REJECTED)
+    os.remove(PENDING)
+    if SYSTEMD:
+        run_quiet(["systemctl", "stop", "router-fw-rollback.timer"])
+    fd.close()
+    event(4, "ROLLBACK", "%s: zmiana nie została potwierdzona — firewall.conf wrócił do poprzedniej wersji, "
+          "odrzucona zapisana w %s" % (why, REJECTED))
+    return True
+
+
+@command("confirm")
+def cmd_confirm(args):
+    fd = lock()
+    if not os.path.exists(PENDING):
+        print("Brak zmiany oczekującej na potwierdzenie.")
+        return 0
+    os.remove(PENDING)
+    if SYSTEMD:
+        run_quiet(["systemctl", "stop", "router-fw-rollback.timer"])
+    fd.close()
+    event(5, "CONFIRMED", "zmiana firewalla potwierdzona", mail=False)
+    print("Potwierdzono — zmiana zostaje.")
+    return 0
+
+
+@command("rollback")
+def cmd_rollback(args):
+    """(timer systemd) cofa niepotwierdzoną zmianę do konfiguracji sprzed 'apply --confirm'."""
+    if not settle_pending("timer"):
+        return 0
+    rc = do_apply(argparse.Namespace(yes=True, confirm=0, timeout=args.timeout), lenient=True)
+    if rc != 0:
+        event(2, "ROLLBACK_FAIL", "poprzednia konfiguracja firewalla nie została wgrana do VPP (kod %d) — "
+              "sprawdź: router-fw check" % rc)
+    return rc
+
+
+# --------------------------------------------------------------------------- blokady doraźne
+def parse_duration(s):
+    m = re.fullmatch(r"(\d+)([smhd]?)", s)
+    if not m:
+        raise ValueError("zły czas '%s' (np. 30m, 2h, 1d)" % s)
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def fmt_left(expires):
+    if not expires:
+        return "bezterminowo"
+    left = max(0, int(expires - time.time()))
+    return "%dd %02dh %02dm" % (left // 86400, left % 86400 // 3600, left % 3600 // 60) if left >= 86400 else \
+        "%dh %02dm" % (left // 3600, left % 3600 // 60) if left >= 3600 else "%dm %02ds" % (left // 60, left % 60)
+
+
+def apply_blocks():
+    """Wdraża blokady na podstawie OSTATNIO ZASTOSOWANEJ konfiguracji (nie niezatwierdzonej edycji pliku);
+    przy niedostępnym VPP blokada zostanie wgrana przy starcie VPP."""
+    src = LASTGOOD if os.path.exists(LASTGOOD) else None
+    rc = do_apply(argparse.Namespace(yes=True, confirm=0, timeout=0), source=src, lenient=True)
+    if rc == 3:
+        print(color("VPP nie odpowiada — zmiana zapisana, zostanie wgrana przy starcie VPP.", "33"))
+    return rc
+
+
+def modify_blocks(add=(), remove=()):
+    """Dopisuje i usuwa wpisy pliku blokad pod blokadą (równoległe wywołania nie gubią wpisów), wdraża je,
+    a gdy wdrożenie zostało odrzucone, cofa tylko własną zmianę. Zwraca (kod, usunięte wpisy)."""
+    nets = {a["net"] for a in add}
+    fd = lock()
+    cur = load_json(BLOCKS, [])
+    removed = [b for b in cur if b in remove or b["net"] in nets]
+    save_json(BLOCKS, [b for b in cur if b not in removed] + list(add))
+    fd.close()
+    rc = apply_blocks()
+    if rc not in (0, 3):
+        fd = lock()
+        cur = [b for b in load_json(BLOCKS, []) if b not in add]
+        have = {b["net"] for b in cur}
+        save_json(BLOCKS, cur + [b for b in removed if b["net"] not in have])
+        fd.close()
+        print(color("Zmiana blokad nie została wdrożona (kod %d) — plik blokad przywrócony." % rc, "31"))
+    return rc, removed
+
+
+@command("block")
+def cmd_block(args):
+    if not args.rest or len(args.rest) > 2:
+        print("użycie: router-fw block IP|prefiks [czas]   (czas: 30m, 2h, 1d; bez czasu = bezterminowo)")
+        return 2
+    try:
+        net = ipaddress.ip_network(args.rest[0], strict=False)
+        secs = parse_duration(args.rest[1]) if len(args.rest) == 2 else 0
+    except ValueError as ex:
+        print(color(str(ex), "31"))
+        return 2
+    entry = {"net": str(net), "added": int(time.time()), "expires": int(time.time()) + secs if secs else 0,
+             "by": os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"}
+    rc, _removed = modify_blocks(add=[entry])
+    if rc in (0, 3):
+        print("Zablokowano %s (%s)." % (net, fmt_left(entry["expires"])))
+        event(5, "BLOCK", "blokada %s (%s)" % (net, fmt_left(entry["expires"])))
+    return rc
+
+
+@command("unblock")
+def cmd_unblock(args):
+    if len(args.rest) != 1:
+        print("użycie: router-fw unblock IP|prefiks")
+        return 2
+    try:
+        net = str(ipaddress.ip_network(args.rest[0], strict=False))
+    except ValueError as ex:
+        print(color(str(ex), "31"))
+        return 2
+    found = [b for b in load_json(BLOCKS, []) if b["net"] == net]
+    if not found:
+        print("Nie ma blokady %s." % net)
+        return 1
+    rc, _removed = modify_blocks(remove=found)
+    if rc in (0, 3):
+        event(5, "UNBLOCK", "zdjęto blokadę %s" % net)
+    return rc
+
+
+@command("blocks")
+def cmd_blocks(args):
+    blocks = load_blocks()
+    if not blocks:
+        print("Brak blokad doraźnych.")
+        return 0
+    print("%-40s %-14s %s" % ("Adres", "Do końca", "Dodał"))
+    for b in sorted(blocks, key=lambda x: x["net"]):
+        print("%-40s %-14s %s  (%s)" % (b["net"], fmt_left(b["expires"]), b.get("by", "?"),
+                                        time.strftime("%F %T", time.localtime(b["added"]))))
+    return 0
+
+
+@command("expire")
+def cmd_expire(args):
+    """(timer) usuwa wygasłe blokady z pliku i z VPP."""
+    t = time.time()
+    gone = [b for b in load_json(BLOCKS, []) if b.get("expires") and b["expires"] <= t]
+    if not gone:
+        return 0
+    rc, removed = modify_blocks(remove=gone)
+    if rc in (0, 3):
+        event(5, "BLOCK_EXPIRED", "wygasły blokady: %s" % ", ".join(b["net"] for b in removed))
+    return rc
+
+
+# --------------------------------------------------------------------------- liczniki trafień (jak "show access-lists")
+def read_counters(index, n):
+    """Liczniki reguł jednego ACL: lista n krotek (pakiety, bajty). Źródło: /acl/<indeks>/matches."""
+    if STATS_JSON:
+        data = load_json(STATS_JSON, {}).get(str(index), [])
+        return [tuple(data[i]) if i < len(data) else (0, 0) for i in range(n)]
+    from vpp_papi.vpp_stats import VPPStats
+    stats = VPPStats(socketname="/run/vpp/stats.sock", timeout=2)
+    stats.connect()
+    try:
+        c = stats["/acl/%d/matches" % index]
+        return [(int(c[:, i].sum_packets()), int(c[:, i].sum_octets())) for i in range(n)]
+    finally:
+        try:
+            stats.disconnect()
+        except Exception:      # noqa: BLE001
+            pass
+
+
+def dir_label(zone, d):
+    return "%s->" % zone if d == "in" else "->%s" % zone
+
+
+def fmt_num(n):
+    return "{:,}".format(int(n)).replace(",", " ")
+
+
+def fmt_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return "%d B" % n if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1000.0
+    return "%.1f GB" % n
+
+
+def raw_counters(groups, act):
+    """{klucz: (Group, indeks|None, [(pakiety, bajty) na każdą regułę ACL])} — bez punktu odniesienia."""
+    out = {}
+    for key, g in groups.items():
+        idx = act.acls.get(key, (None,))[0]
+        out[key] = (g, idx, read_counters(idx, len(g.flat)) if idx is not None else [(0, 0)] * len(g.flat))
+    return out
+
+
+def counter_rows(raw, conf, state):
+    """Zlicza liczniki ACL do wierszy 'jedna reguła z pliku = jeden wiersz', odejmując punkt odniesienia."""
+    by_line = {r.lineno: r for r in conf.rules}
+    snap = []
+    for key in sorted(raw):
+        g, idx, vals = raw[key]
+        base = state.get("baseline", {}).get(g.tag) or [(0, 0)] * len(vals)
+        rows = []
+        for f, (p, b), (bp, bb) in zip(g.flat, vals, base):
+            if p < bp or b < bb:
+                bp, bb = 0, 0          # VPP wyzerował liczniki (restart, zmiana ACL) — punkt odniesienia jest nieaktualny
+            label = f.parent if isinstance(f.parent, str) else str(f.parent)
+            if rows and rows[-1]["parent"] == f.parent:
+                rows[-1]["pkts"] += p - bp
+                rows[-1]["bytes"] += b - bb
+                continue
+            if isinstance(f.parent, int):
+                r = by_line.get(f.parent)
+                text = (r.raw.split(None, 1)[1] if r else "?") + (("   # " + r.desc) if r and r.desc else "")
+            else:
+                label = "blokada" if f.parent == "block" else "domyślna"
+                text = "deny src %s" % f.src if f.parent == "block" else "permit any"
+            rows.append({"parent": f.parent, "label": label, "text": text, "pkts": p - bp, "bytes": b - bb})
+        snap.append({"group": g, "index": idx, "rows": rows})
+    return snap
+
+
+def print_counters(snap, prev=None, dt=1.0):
+    old = {s["group"].key: s["rows"] for s in (prev or [])}
+    for s in snap:
+        g = s["group"]
+        print(color("%s  (%s: %s)  %s" % (dir_label(g.zone, g.dir), "wejście" if g.dir == "in" else "wyjście",
+                                          " ".join(g.ifaces), "ACL %d" % s["index"] if s["index"] is not None
+                                          else "brak w VPP"), "1"))
+        print("  %-9s %-60s %18s %12s %10s" % ("reguła", "opis", "pakiety", "bajty", "pkt/s"))
+        for i, r in enumerate(s["rows"]):
+            rate = ""
+            prows = old.get(g.key)
+            if prows and i < len(prows) and prows[i]["parent"] == r["parent"] and dt > 0:
+                rate = fmt_num(max(0, r["pkts"] - prows[i]["pkts"]) / dt)
+            print("  %-9s %-60s %18s %12s %10s" % (r["label"], r["text"][:60], fmt_num(r["pkts"]),
+                                                   fmt_bytes(r["bytes"]), rate))
+
+
+def counters_snapshot():
+    """(snapshot, błąd): liczniki list ACL wgranych na podstawie ostatnio zastosowanej konfiguracji."""
+    conf, errs, _t = get_desired(LASTGOOD)
+    if conf is None:
+        return None, "firewall nie był jeszcze stosowany (router-fw apply)" if not os.path.exists(LASTGOOD) else errs[0]
+    try:
+        act = read_vpp()
+    except VppError as ex:
+        return None, "VPP nie odpowiada: %s" % ex
+    groups = build_groups(conf, load_blocks(include_expired=True))
+    return (conf, groups, act), ""
+
+
+@command("counters")
+def cmd_counters(args):
+    ctx, err = counters_snapshot()
+    if ctx is None:
+        print(color(err, "31"))
+        return 3
+    conf, groups, act = ctx
+    state = load_json(STATE, {})
+    if conf.settings["counters"] == "off":
+        print("Liczniki są wyłączone (set counters off w firewall.conf).")
+        return 0
+    stale = sorted(k for k, g in groups.items() if k in act.acls and act.acls[k][1] != g.tag)
+    for k in stale:
+        print(color("  lista %s: treść ACL w VPP różni się od zastosowanej konfiguracji — liczniki pominięte "
+                    "(router-fw check / apply)" % k, "33"))
+    groups = {k: g for k, g in groups.items() if k not in stale}
+    try:
+        if args.rest == ["clear"]:
+            state["baseline"] = {g.tag: [list(v) for v in vals] for g, _i, vals in raw_counters(groups, act).values()}
+            save_json(STATE, state)
+            print("Liczniki wyzerowane (punkt odniesienia po stronie router-fw).")
+            return 0
+        if args.rest:
+            print("użycie: router-fw counters [-w] | router-fw counters clear")
+            return 2
+        prev, t0 = counter_rows(raw_counters(groups, act), conf, state), time.time()
+        while True:
+            time.sleep(1)
+            snap = counter_rows(raw_counters(groups, act), conf, state)
+            dt = time.time() - t0
+            if args.watch and TTY:
+                sys.stdout.write("\033[H\033[J")
+            print_counters(snap, prev, dt)
+            if not args.watch:
+                return 0
+            prev, t0 = snap, time.time()
+    except KeyboardInterrupt:
+        return 0
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return 3
+    except Exception as ex:     # noqa: BLE001 — brak vpp_papi, segmentu statystyk albo wyłączone liczniki w VPP
+        print(color("nie można odczytać liczników (%s: %s) — czy w pliku jest 'set counters on' i wykonano router-fw apply?"
+                    % (type(ex).__name__, ex), "31"))
+        return 3
+
+# --- KONIEC MODUŁÓW (nowe funkcje wstawiaj powyżej tej linii) ---
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    ap = argparse.ArgumentParser(prog="router-fw", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", nargs="?", default="show")
+    ap.add_argument("rest", nargs="*")
+    ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
+    ap.add_argument("--confirm", type=int, default=0, metavar="SEK", help="apply: cofnij zmianę po SEK s bez 'confirm'")
+    ap.add_argument("-w", "--watch", action="store_true", help="counters: odświeżanie co 1 s")
+    ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
+    ap.add_argument("--timeout", type=int, default=180, help="boot: ile sekund czekać na VPP")
+    args = ap.parse_args()
+    if os.geteuid() != 0 and not ROOT:
+        sys.exit("Uruchom jako root.")
+    fn = COMMANDS.get(args.cmd)
+    if fn is None:
+        sys.exit("nieznane polecenie: %s (dostępne: %s)" % (args.cmd, ", ".join(sorted(COMMANDS)) or "brak"))
+    sys.exit(fn(args))
+
+
+if __name__ == "__main__":
+    main()
+ROUTER_FW_PY
+}
+
+prog_router_guard() {
+  cat <<'ROUTER_GUARD_PY'
+#!/usr/bin/env python3
+"""router-guard — filtr odbić (SYN-ACK, RST, UDP z portów amplifikacji) w VPP, włączany na żądanie
+
+  router-guard on <prefiks|IP|grupa>[,...] [--monitor|--enforce] [--for 2h]   włącz ochronę wskazanych prefiksów
+  router-guard off [prefiks|IP|grupa]      wyłącz wskazane (bez argumentu: wszystko, węzły schodzą ze ścieżki pakietów)
+  router-guard enforce | monitor           zmień tryb: enforce odrzuca, monitor tylko liczy
+  router-guard status                      co jest chronione, tryb, liczniki, zapełnienie tablic
+  router-guard check [--log]               kontrola pliku i zgodności VPP ze stanem; alarmy (--log: timer systemd)
+  router-guard boot                        (systemd) po starcie VPP odtwórz ochronę
+  router-guard expire                      (systemd, timer) wyłącz po upływie --for oraz przejdź na enforce po rozgrzewce
+
+Tryb monitor liczy, co zostałoby odrzucone, i niczego nie blokuje. "on --enforce" włącza najpierw monitor na czas
+rozgrzewki (warmup), żeby tablica zdążyła nauczyć się wychodzących SYN, i dopiero potem enforce.
+Konfiguracja: /etc/router/synack-guard.conf. Moduł VPP: vppctl show synack-guard.
+"""
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("ROUTER_GUARD_ROOT", "")      # tylko do testów
+CONF = ROOT + "/etc/router/synack-guard.conf"
+STATE = ROOT + "/var/lib/router/guard.state.json"
+LOGDIR = ROOT + "/var/log/router-monitor"
+LOG = LOGDIR + "/router-guard.log"
+MONLOG = LOGDIR + "/router-monitor.log"
+LOCK = ROOT + "/run/router-guard.lock"
+NOTIFY = ROOT + "/opt/router/bin/router-notify"
+SELF = "/opt/router/bin/router-guard"
+VPPCTL = os.environ.get("ROUTER_GUARD_VPPCTL", "vppctl")
+SYSTEMD = os.environ.get("ROUTER_GUARD_SYSTEMD", "1") == "1"
+SYSTEMD_RUN = os.environ.get("ROUTER_GUARD_SYSTEMD_RUN", "systemd-run")
+
+ERR_RE = re.compile(r"unknown input|error|fail|invalid|conflict|not found|already|does not exist|not supported|cannot|too many",
+                    re.I)
+IDENT = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+IFNAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+DEFAULT_PORTS = [19, 53, 111, 123, 137, 161, 389, 1900, 3702, 5353, 11211]
+TTY = sys.stdout.isatty()
+
+
+def color(s, c):
+    return "\033[%sm%s\033[0m" % (c, s) if TTY else s
+
+
+# --------------------------------------------------------------------------- logi
+def now():
+    return int(time.time())
+
+
+def stamp():
+    return time.strftime("%F %T")
+
+
+def log(msg):
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (stamp(), msg))
+    except OSError:
+        pass
+
+
+def event(sev, mnem, text, mail=True):
+    """Zdarzenie w stylu Cisco: log router-monitor + syslog + (opcjonalnie) e-mail."""
+    line = "%%GUARD-%d-%s: %s" % (sev, mnem, text)
+    log(line)
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(MONLOG, "a") as f:
+            f.write("%s %s\n" % (stamp(), line))
+    except OSError:
+        pass
+    prio = {1: "alert", 2: "crit", 3: "err", 4: "warning", 5: "notice"}.get(sev, "info")
+    subprocess.run(["logger", "-t", "router-guard", "-p", "local0." + prio, line],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if mail and os.access(NOTIFY, os.X_OK):
+        subprocess.run([NOTIFY, "queue", line], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return line
+
+
+def run_quiet(cmd):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode
+    except OSError:
+        return 127
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def lock():
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    fd = open(LOCK, "w")
+    end = time.time() + 120
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() > end:
+                sys.exit("inna instancja router-guard działa zbyt długo (%s)" % LOCK)
+            time.sleep(1)
+
+
+def fmt_num(n):
+    return "{:,}".format(int(n)).replace(",", " ")
+
+
+def parse_duration(s):
+    m = re.fullmatch(r"(\d+)([smhd]?)", s)
+    if not m:
+        raise ValueError("zły czas '%s' (np. 30m, 2h, 1d)" % s)
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def fmt_left(ts):
+    left = max(0, int(ts - time.time()))
+    if left >= 86400:
+        return "%dd %02dh %02dm" % (left // 86400, left % 86400 // 3600, left % 3600 // 60)
+    if left >= 3600:
+        return "%dh %02dm" % (left // 3600, left % 3600 // 60)
+    return "%dm %02ds" % (left // 60, left % 60)
+
+
+# --------------------------------------------------------------------------- plik synack-guard.conf
+class Conf:
+    def __init__(self):
+        self.in_if, self.out_if, self.groups = [], [], {}
+        self.ttl, self.udp_ttl, self.warmup, self.max_on, self.alarm_pps = 60, 30, 60, 6 * 3600, 10000
+        self.tcp_rst, self.udp, self.udp_frags, self.check_isn = "pass", "on", "pass", "on"
+        self.udp_ports = list(DEFAULT_PORTS)
+        self.table_v4, self.table_v6 = 4000000, 1000000
+        self.default_mode = "monitor"
+
+
+def parse_nets(tokens):
+    out = []
+    for tok in tokens:
+        try:
+            out.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            raise ValueError("zły adres '%s'" % tok)
+    return out
+
+
+def parse_conf(text):
+    """Zwraca (Conf, błędy). Błąd = ochrona nie zostanie włączona."""
+    c, errs = Conf(), []
+    ints = {"ttl": "ttl", "udp-ttl": "udp_ttl", "warmup": "warmup", "alarm-pps": "alarm_pps",
+            "table-v4": "table_v4", "table-v6": "table_v6"}
+    choices = {"tcp-rst": ("tcp_rst", ("pass", "handshake")), "udp": ("udp", ("on", "off")),
+               "udp-frags": ("udp_frags", ("pass", "drop")), "check-isn": ("check_isn", ("on", "off")),
+               "default-mode": ("default_mode", ("monitor", "enforce"))}
+    for no, raw in enumerate(text.splitlines(), 1):
+        body = re.split(r"\s#", raw.strip(), maxsplit=1)[0].strip()
+        if not body or body.startswith("#"):
+            continue
+        t = body.split()
+        try:
+            k, args = t[0], t[1:]
+            if k in ("in-if", "out-if"):
+                if not args or not all(IFNAME.match(a) for a in args):
+                    raise ValueError("%s wymaga nazw interfejsów" % k)
+                dest = c.in_if if k == "in-if" else c.out_if
+                dest.extend(a for a in args if a not in dest)
+            elif k == "group":
+                if len(args) < 2 or not IDENT.match(args[0]):
+                    raise ValueError("składnia: group NAZWA prefiks...")
+                c.groups[args[0]] = parse_nets(args[1:])
+            elif k in ints:
+                if len(args) != 1 or not args[0].isdigit():
+                    raise ValueError("%s wymaga liczby" % k)
+                setattr(c, ints[k], int(args[0]))
+            elif k == "max-on":
+                if len(args) != 1:
+                    raise ValueError("max-on wymaga czasu (np. 6h)")
+                c.max_on = parse_duration(args[0])
+            elif k in choices:
+                attr, allowed = choices[k]
+                if len(args) != 1 or args[0] not in allowed:
+                    raise ValueError("%s: %s" % (k, " | ".join(allowed)))
+                setattr(c, attr, args[0])
+            elif k == "udp-ports":
+                ports = []
+                for a in args:
+                    if not a.isdigit() or not 0 <= int(a) <= 65535:
+                        raise ValueError("zły port '%s'" % a)
+                    ports.append(int(a))
+                if not ports:
+                    raise ValueError("udp-ports wymaga listy portów")
+                c.udp_ports = ports
+            else:
+                raise ValueError("nieznane słowo '%s'" % k)
+        except ValueError as ex:
+            errs.append("linia %d: %s" % (no, ex))
+    if not c.in_if:
+        errs.append("brak in-if (interfejsy uplinków, np. in-if hu0.100 hu0.200)")
+    if not c.out_if:
+        errs.append("brak out-if (interfejs strony klientów, np. out-if hu0.300)")
+    both = sorted(set(c.in_if) & set(c.out_if))
+    if both:
+        errs.append("wspólny interfejs w in-if i out-if: %s" % ", ".join(both))
+    return c, errs
+
+
+def load_conf():
+    try:
+        with open(CONF) as f:
+            text = f.read()
+    except OSError as ex:
+        return None, ["nie można czytać %s: %s" % (CONF, ex)]
+    c, errs = parse_conf(text)
+    return (None if errs else c), errs
+
+
+def resolve_targets(conf, tokens):
+    """Grupy, prefiksy i adresy (po przecinku lub spacjach) -> posortowana lista prefiksów."""
+    out = set()
+    for tok in ",".join(tokens).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok in conf.groups:
+            out.update(str(n) for n in conf.groups[tok])
+        else:
+            try:
+                out.add(str(ipaddress.ip_network(tok, strict=False)))
+            except ValueError:
+                raise ValueError("'%s' to nie grupa z pliku, prefiks ani adres IP" % tok)
+    return sorted(out, key=lambda p: (ipaddress.ip_network(p).version, ipaddress.ip_network(p)))
+
+
+# --------------------------------------------------------------------------- VPP
+class VppError(Exception):
+    pass
+
+
+class GuardMissing(Exception):
+    pass
+
+
+class VState:
+    def __init__(self):
+        self.mode, self.ifaces, self.prefixes = "off", {}, set()
+        self.used4 = self.size4 = self.used6 = self.size6 = 0
+        self.names = set()
+
+
+def cli(cmd, timeout=15):
+    try:
+        r = subprocess.run([VPPCTL, cmd], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        raise VppError("vppctl: %s" % ex)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "connect" in out.lower() and "fail" in out.lower():
+        raise VppError("vppctl '%s': %s" % (cmd[:80], out.strip() or "kod %d" % r.returncode))
+    return out
+
+
+def read_vpp():
+    out = cli("show synack-guard")
+    if "unknown input" in out:
+        raise GuardMissing()
+    v = VState()
+    for line in out.splitlines():
+        m = re.match(r"^(mode|interface|prefix|table-v4|table-v6):\s*(.*)$", line.strip())
+        if not m:
+            continue
+        key, val = m.groups()
+        if key == "mode":
+            v.mode = val.strip()
+        elif key == "interface":
+            parts = val.split()
+            if len(parts) == 2:
+                v.ifaces[parts[0]] = parts[1]
+        elif key == "prefix":
+            v.prefixes.add(val.strip())
+        else:
+            mm = re.match(r"(\d+)/(\d+)", val)
+            if mm:
+                setattr(v, "used4" if key == "table-v4" else "used6", int(mm.group(1)))
+                setattr(v, "size4" if key == "table-v4" else "size6", int(mm.group(2)))
+    for line in cli("show interface").splitlines():
+        m = re.match(r"^(\S+)\s+(\d+)\s", line)
+        if m:
+            v.names.add(m.group(1))
+    return v
+
+
+def read_errors():
+    """Liczniki węzłów synack-guard z 'show errors': {powód: suma po węzłach}."""
+    tot = {}
+    for line in cli("show errors").splitlines():
+        m = re.match(r"^\s*(\d+)\s+(synack-guard-\S+)\s+(.+?)\s+(error|warn|info|debug)\s*$", line)
+        if m:
+            tot[m.group(3)] = tot.get(m.group(3), 0) + int(m.group(1))
+    return tot
+
+
+def counters_summary(tot):
+    return {"checked": tot.get("Checked", 0),
+            "passed": tot.get("Passed", 0),
+            "violations": sum(v for k, v in tot.items() if k.startswith("Violation")),
+            "dropped": tot.get("Dropped", 0),
+            "recorded": tot.get("SYN recorded", 0) + tot.get("UDP recorded", 0),
+            "insert_failed": tot.get("Insert failed", 0)}
+
+
+def wait_vpp(timeout):
+    end = time.time() + timeout
+    while True:
+        try:
+            cli("show version", timeout=5)
+            return True
+        except VppError:
+            if time.time() > end:
+                return False
+            time.sleep(2)
+
+
+def config_cmd(conf, with_tables):
+    s = ("synack-guard config ttl %d udp-ttl %d check-isn %s tcp-rst %s udp %s udp-frags %s udp-ports %s"
+         % (conf.ttl, conf.udp_ttl, conf.check_isn, conf.tcp_rst, conf.udp, conf.udp_frags,
+            ",".join(str(p) for p in conf.udp_ports)))
+    if with_tables:
+        s += " table-v4 %d table-v6 %d" % (conf.table_v4, conf.table_v6)
+    return s
+
+
+def sync_cmds(conf, prefixes, mode, v, with_config=True):
+    """Polecenia, które doprowadzą VPP do stanu: interfejsy z pliku, podane prefiksy, tryb."""
+    cmds = []
+    if with_config:
+        cmds.append(config_cmd(conf, with_tables=v.mode == "off"))
+    want = {i: "in" for i in conf.in_if}
+    want.update({i: "out" for i in conf.out_if})
+    for i, d in sorted(want.items()):
+        if v.ifaces.get(i) != d and i in v.names:
+            cmds.append("synack-guard interface %s %s" % (i, d))
+    for i in sorted(v.ifaces):
+        if i not in want:
+            cmds.append("synack-guard interface %s %s disable" % (i, v.ifaces[i]))
+    for p in sorted(set(prefixes) - v.prefixes):
+        cmds.append("synack-guard prefix %s" % p)
+    for p in sorted(v.prefixes - set(prefixes)):
+        cmds.append("synack-guard prefix %s del" % p)
+    if v.mode != mode:
+        cmds.append("synack-guard mode %s" % mode)
+    return cmds
+
+
+def off_cmds(v):
+    cmds = ["synack-guard mode off"] if v.mode != "off" else []
+    cmds += ["synack-guard interface %s %s disable" % (i, d) for i, d in sorted(v.ifaces.items())]
+    cmds += ["synack-guard prefix %s del" % p for p in sorted(v.prefixes)]
+    return cmds
+
+
+def run_cmds(cmds):
+    """Wykonuje polecenia po kolei; przy pierwszym błędzie staje. Zwraca tekst błędu albo ''."""
+    for c in cmds:
+        log("vppctl: %s" % c)
+        try:
+            out = cli(c)
+        except VppError as ex:
+            log("BŁĄD: %s" % ex)
+            return str(ex)
+        if ERR_RE.search(out):
+            log("BŁĄD: %s" % out.strip())
+            return "%s: %s" % (c, out.strip())
+    return ""
+
+
+def schedule_tick(at):
+    """Jednorazowy timer systemd, który w zadanej chwili wywoła 'router-guard expire' (przejście na enforce)."""
+    if not SYSTEMD or not at:
+        return
+    for unit in ("router-guard-tick.timer", "router-guard-tick.service"):
+        run_quiet(["systemctl", "stop", unit])
+    run_quiet(["systemctl", "reset-failed", "router-guard-tick.service"])
+    sec = max(1, int(at - time.time()) + 1)
+    rc = run_quiet([SYSTEMD_RUN, "--unit=router-guard-tick", "--on-active=%ds" % sec,
+                    "--description=router-guard: przejście na enforce po rozgrzewce", SELF, "expire"])
+    if rc != 0:
+        log("systemd-run zwrócił %d — przejście na enforce wykona minutowy router-guard-expire.timer" % rc)
+
+
+def load_state():
+    s = load_json(STATE, {})
+    s.setdefault("active", False)
+    s.setdefault("mode", "off")
+    s.setdefault("target_mode", "monitor")
+    s.setdefault("prefixes", [])
+    s.setdefault("expires", 0)
+    s.setdefault("enforce_at", 0)
+    s.setdefault("snapshot", {})
+    return s
+
+
+def state_prefixes(st):
+    return [p["net"] for p in st["prefixes"]] if st["active"] else []
+
+
+def missing_ifaces(conf, v):
+    return sorted(i for i in conf.in_if + conf.out_if if i not in v.names)
+
+
+def need_conf():
+    conf, errs = load_conf()
+    if conf is None:
+        for e in errs:
+            print(color("  " + e, "31"))
+        print(color("Nic nie zmieniono — popraw %s." % CONF, "31"))
+    return conf
+
+
+def open_vpp():
+    """(VState, kod) — kod 0 albo 3 z komunikatem."""
+    try:
+        return read_vpp(), 0
+    except GuardMissing:
+        print(color("Wtyczka synack_guard nie jest załadowana w VPP — przebuduj VPP: install-router.sh --from 10 "
+                    "(patrz docs/synack-guard-lab-checklist.md).", "31"))
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+    return None, 3
+
+
+# --------------------------------------------------------------------------- polecenia
+def cmd_on(args):
+    if not args.rest or (args.monitor and args.enforce):
+        print("użycie: router-guard on <prefiks|IP|grupa>[,...] [--monitor|--enforce] [--for 2h]")
+        return 2
+    conf = need_conf()
+    if conf is None:
+        return 2
+    try:
+        targets = resolve_targets(conf, args.rest)
+        secs = parse_duration(args.for_) if args.for_ else 0
+    except ValueError as ex:
+        print(color(str(ex), "31"))
+        return 2
+    if not targets:
+        print("użycie: router-guard on <prefiks|IP|grupa>[,...]")
+        return 2
+    fd = lock()
+    v, rc = open_vpp()
+    if v is None:
+        return rc
+    miss = missing_ifaces(conf, v)
+    if miss:
+        print(color("  interfejsy spoza VPP: %s (sprawdź %s i router-ifaces)" % (", ".join(miss), CONF), "31"))
+        return 2
+    st = load_state()
+    old = set(state_prefixes(st))
+    prefixes = old | set(targets)
+    fresh = not st["active"] or bool(set(targets) - old)
+    target = "enforce" if args.enforce else "monitor" if args.monitor else (st["target_mode"] if st["active"] else conf.default_mode)
+    t = now()
+    if target == "enforce" and (fresh or st["mode"] == "monitor" and st["enforce_at"]):
+        if conf.warmup > 0:
+            mode, enforce_at = "monitor", t + conf.warmup
+        else:
+            mode, enforce_at = "enforce", 0
+    else:
+        mode, enforce_at = target, 0
+    expires = t + min(secs or conf.max_on, conf.max_on)
+    err = run_cmds(sync_cmds(conf, prefixes, mode, v))
+    if err:
+        event(3, "APPLY_FAIL", "nie udało się włączyć ochrony: %s" % err[:150])
+        print(color("Nie udało się: %s" % err, "31"))
+        return 4
+    since = {p["net"]: p["added"] for p in st["prefixes"]} if st["active"] else {}
+    if st.get("drift"):
+        event(5, "DRIFT_END", "VPP znów zgodny ze stanem router-guard (naprawione przez 'on')")
+    st.update({"active": True, "mode": mode, "target_mode": target, "enforce_at": enforce_at, "expires": expires,
+               "prefixes": [{"net": p, "added": since.get(p, t)} for p in sorted(prefixes)], "applied": t, "drift": ""})
+    save_json(STATE, st)
+    schedule_tick(enforce_at)
+    note = "; enforce za %d s (rozgrzewka)" % conf.warmup if enforce_at else ""
+    event(5, "ON", "ochrona włączona: %s, tryb %s%s, wyłączenie za %s" % (", ".join(sorted(prefixes)), mode, note,
+                                                                       fmt_left(expires)))
+    print(color("Ochrona włączona (tryb %s%s). Wyłączy się za %s." % (mode, note, fmt_left(expires)), "32"))
+    del fd
+    return 0
+
+
+def full_off(why, mail=True):
+    """Wyłącza ochronę w VPP i w stanie. Zwraca kod."""
+    v, rc = open_vpp()
+    if v is None:
+        return rc
+    err = run_cmds(off_cmds(v))
+    if err:
+        event(3, "APPLY_FAIL", "nie udało się wyłączyć ochrony: %s" % err[:150])
+        print(color("Nie udało się: %s" % err, "31"))
+        return 4
+    st = load_state()
+    was = st["active"]
+    st.update({"active": False, "mode": "off", "prefixes": [], "expires": 0, "enforce_at": 0, "drift": ""})
+    save_json(STATE, st)
+    if SYSTEMD:
+        run_quiet(["systemctl", "stop", "router-guard-tick.timer"])
+    if was:
+        event(5, why[0], why[1], mail=mail)
+    return 0
+
+
+def cmd_off(args):
+    fd = lock()
+    st = load_state()
+    if args.rest:
+        conf = need_conf()
+        if conf is None:
+            return 2
+        try:
+            targets = resolve_targets(conf, args.rest)
+        except ValueError as ex:
+            print(color(str(ex), "31"))
+            return 2
+        left = sorted(set(state_prefixes(st)) - set(targets))
+        if left:
+            v, rc = open_vpp()
+            if v is None:
+                return rc
+            err = run_cmds(sync_cmds(conf, left, v.mode, v, with_config=False))
+            if err:
+                print(color("Nie udało się: %s" % err, "31"))
+                return 4
+            by = {p["net"]: p["added"] for p in st["prefixes"]}
+            st["prefixes"] = [{"net": p, "added": by.get(p, now())} for p in left]
+            save_json(STATE, st)
+            event(5, "OFF", "zdjęto ochronę: %s; nadal chronione: %s" % (", ".join(targets), ", ".join(left)))
+            print("Zdjęto ochronę wskazanych prefiksów; nadal chronione: %s." % ", ".join(left))
+            return 0
+    if not st["active"]:
+        v, rc = open_vpp()
+        if v is not None and (v.mode != "off" or v.ifaces or v.prefixes):
+            print(color("Stan zapisany jako wyłączony, ale VPP ma włączone elementy — czyszczę.", "33"))
+            return full_off(("OFF", "ręczne czyszczenie"))
+        print("Ochrona jest wyłączona.")
+        return rc
+    rc = full_off(("OFF", "ochrona wyłączona ręcznie"))
+    if rc == 0:
+        print(color("Ochrona wyłączona; węzły zdjęte ze ścieżki pakietów.", "32"))
+    del fd
+    return rc
+
+
+def set_mode(mode):
+    fd = lock()
+    st = load_state()
+    if not st["active"]:
+        print(color("Ochrona nie jest włączona (router-guard on <prefiks>).", "31"))
+        return 2
+    v, rc = open_vpp()
+    if v is None:
+        return rc
+    err = run_cmds(["synack-guard mode %s" % mode] if v.mode != mode else [])
+    if err:
+        print(color("Nie udało się: %s" % err, "31"))
+        return 4
+    st.update({"mode": mode, "target_mode": mode, "enforce_at": 0})
+    save_json(STATE, st)
+    if SYSTEMD:
+        run_quiet(["systemctl", "stop", "router-guard-tick.timer"])
+    event(5, "MODE", "tryb %s" % mode)
+    print(color("Tryb: %s." % mode, "32"))
+    del fd
+    return 0
+
+
+def cmd_enforce(args):
+    return set_mode("enforce")
+
+
+def cmd_monitor(args):
+    return set_mode("monitor")
+
+
+def cmd_status(args):
+    st = load_state()
+    v, rc = open_vpp()
+    if v is None:
+        return rc
+    if not st["active"]:
+        print("Ochrona wyłączona.")
+        if v.mode != "off":
+            print(color("  UWAGA: VPP ma tryb %s mimo wyłączonego stanu — router-guard off" % v.mode, "33"))
+        return 0
+    print(color("Ochrona WŁĄCZONA — tryb %s" % st["mode"], "1"))
+    if st["target_mode"] != st["mode"]:
+        print("  docelowo: %s za %s (rozgrzewka)" % (st["target_mode"], fmt_left(st["enforce_at"])))
+    print("  wyłączy się za: %s" % fmt_left(st["expires"]))
+    print("  prefiksy: %s" % ", ".join(p["net"] for p in st["prefixes"]))
+    print("  uplinki (in): %s   klienci (out): %s" % (" ".join(sorted(i for i, d in v.ifaces.items() if d == "in")),
+                                                     " ".join(sorted(i for i, d in v.ifaces.items() if d == "out"))))
+    print("  tablica IPv4: %s / %s   IPv6: %s / %s" % (fmt_num(v.used4), fmt_num(v.size4), fmt_num(v.used6), fmt_num(v.size6)))
+    cur = counters_summary(read_errors())
+    snap = st.get("snapshot") or {}
+    dt = max(1, now() - snap.get("ts", now())) if snap else 0
+    for key, label in (("checked", "sprawdzone odpowiedzi"), ("passed", "przepuszczone (jest wpis)"),
+                       ("violations", "naruszenia (brak wpisu / zły ISN)"), ("dropped", "odrzucone (enforce)"),
+                       ("recorded", "zapisane wpisy (SYN, UDP)"), ("insert_failed", "błędy zapisu do tablicy")):
+        rate = ""
+        if snap and dt and key in snap.get("vals", {}):
+            rate = "   ~%s/s" % fmt_num(max(0, cur[key] - snap["vals"][key]) / dt)
+        print("  %-38s %16s%s" % (label, fmt_num(cur[key]), rate))
+    return 0
+
+
+def cmd_check(args):
+    quiet = args.log
+    conf, errs = load_conf()
+    if conf is None:
+        for e in errs:
+            print(color("  " + e, "31"))
+        if quiet:
+            event(2, "CONFIG_ERROR", "błędy w synack-guard.conf: %s" % "; ".join(errs[:3]), mail=False)
+        return 2
+    st = load_state()
+    if not st["active"]:
+        if not quiet:
+            print("synack-guard.conf: składnia OK. Ochrona wyłączona.")
+        return 0
+    v, rc = open_vpp()
+    if v is None:
+        return rc
+    cmds = sync_cmds(conf, state_prefixes(st), st["mode"], v, with_config=False)
+    out = 0
+    if cmds:
+        print(color("Rozjazd: VPP różni się od zapisanego stanu:", "31"))
+        for c in cmds:
+            print("  " + c)
+        if quiet and not st.get("drift"):
+            st["drift"] = "; ".join(cmds[:4])
+            event(4, "DRIFT", "VPP różni się od stanu router-guard: %s" % st["drift"])
+        out = 1
+    else:
+        if not quiet:
+            print("VPP jest zgodny ze stanem (tryb %s)." % st["mode"])
+        if st.get("drift"):
+            st["drift"] = ""
+            event(5, "DRIFT_END", "VPP znów zgodny ze stanem router-guard")
+    if quiet:
+        t = now()
+        cur = counters_summary(read_errors())
+        snap = st.get("snapshot") or {}
+        if snap.get("vals") and t > snap.get("ts", t):
+            dt = t - snap["ts"]
+            rate = max(0, cur["violations"] - snap["vals"].get("violations", 0)) / dt
+            if rate > conf.alarm_pps and t - st.get("alarm_ts", 0) > 600:
+                st["alarm_ts"] = t
+                event(4, "VIOLATIONS", "%s pkt/s odpowiedzi bez wpisu (tryb %s, %s)" % (
+                    fmt_num(rate), st["mode"], "odrzucane" if st["mode"] == "enforce" else "tylko liczone"))
+        full = max(v.used4 / v.size4 if v.size4 else 0, v.used6 / v.size6 if v.size6 else 0)
+        if full >= 0.9 and t - st.get("full_ts", 0) > 600:
+            st["full_ts"] = t
+            if st["mode"] == "enforce":
+                err = run_cmds(["synack-guard mode monitor"])
+                if not err:
+                    st.update({"mode": "monitor", "target_mode": "monitor", "enforce_at": 0})
+            event(2, "TABLE_FULL", "tablica stanów zapełniona w %d%% — %s" % (
+                int(full * 100), "przełączono na monitor" if st["mode"] == "monitor" else "sprawdź rozmiary tablic"))
+        st["snapshot"] = {"ts": t, "vals": cur}
+    save_json(STATE, st)
+    return out
+
+
+def cmd_boot(args):
+    fd = lock()
+    st = load_state()
+    if not st["active"]:
+        return 0
+    if st["expires"] and st["expires"] <= now():
+        st.update({"active": False, "mode": "off", "prefixes": [], "expires": 0, "enforce_at": 0})
+        save_json(STATE, st)
+        event(5, "EXPIRED", "po restarcie: czas ochrony już minął — pozostaje wyłączona", mail=False)
+        return 0
+    conf, errs = load_conf()
+    if conf is None:
+        event(2, "CONFIG_ERROR", "błędy w synack-guard.conf: %s — ochrona nie została odtworzona" % "; ".join(errs[:3]))
+        return 2
+    if not wait_vpp(args.timeout):
+        event(2, "APPLY_FAIL", "VPP nie odpowiada po %d s — ochrona nie została odtworzona" % args.timeout)
+        return 3
+    v, rc = open_vpp()
+    if v is None:
+        event(2, "APPLY_FAIL", "wtyczka synack_guard niedostępna po starcie VPP — ochrona nie została odtworzona")
+        return rc
+    t = now()
+    target = st["target_mode"]
+    if target == "enforce" and conf.warmup > 0:
+        mode, enforce_at = "monitor", t + conf.warmup
+    else:
+        mode, enforce_at = target, 0
+    err = run_cmds(sync_cmds(conf, state_prefixes(st), mode, v))
+    if err:
+        event(3, "APPLY_FAIL", "nie udało się odtworzyć ochrony: %s" % err[:150])
+        return 4
+    st.update({"mode": mode, "enforce_at": enforce_at, "drift": "", "snapshot": {}})
+    save_json(STATE, st)
+    schedule_tick(enforce_at)
+    event(6, "RESTORED", "ochrona odtworzona po starcie VPP (%d prefiksów, tryb %s%s)" % (
+        len(st["prefixes"]), mode, ", enforce za %d s" % conf.warmup if enforce_at else ""), mail=False)
+    del fd
+    return 0
+
+
+def cmd_expire(args):
+    fd = lock()
+    st = load_state()
+    if not st["active"]:
+        return 0
+    t = now()
+    if st["expires"] and st["expires"] <= t:
+        return full_off(("EXPIRED", "minął czas ochrony — wyłączona"))
+    if st["enforce_at"] and st["enforce_at"] <= t and st["mode"] == "monitor" and st["target_mode"] == "enforce":
+        v, rc = open_vpp()
+        if v is None:
+            return rc
+        err = run_cmds(["synack-guard mode enforce"] if v.mode != "enforce" else [])
+        if err:
+            event(3, "APPLY_FAIL", "nie udało się przejść na enforce: %s" % err[:150])
+            return 4
+        st.update({"mode": "enforce", "enforce_at": 0})
+        save_json(STATE, st)
+        event(5, "MODE", "tryb enforce po rozgrzewce")
+    del fd
+    return 0
+
+
+COMMANDS = {"on": cmd_on, "off": cmd_off, "enforce": cmd_enforce, "monitor": cmd_monitor, "status": cmd_status,
+            "check": cmd_check, "boot": cmd_boot, "expire": cmd_expire}
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    ap = argparse.ArgumentParser(prog="router-guard", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", nargs="?", default="status")
+    ap.add_argument("rest", nargs="*")
+    ap.add_argument("--monitor", action="store_true", help="on: zostaw tryb monitor (liczy, nie blokuje)")
+    ap.add_argument("--enforce", action="store_true", help="on: po rozgrzewce przejdź na enforce")
+    ap.add_argument("--for", dest="for_", default="", metavar="CZAS", help="on: automatyczne wyłączenie po CZAS (30m, 2h, 1d)")
+    ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
+    ap.add_argument("--timeout", type=int, default=180, help="boot: ile sekund czekać na VPP")
+    args = ap.parse_args()
+    if os.geteuid() != 0 and not ROOT:
+        sys.exit("Uruchom jako root.")
+    fn = COMMANDS.get(args.cmd)
+    if fn is None:
+        sys.exit("nieznane polecenie: %s (dostępne: %s)" % (args.cmd, ", ".join(sorted(COMMANDS))))
+    sys.exit(fn(args))
+
+
+if __name__ == "__main__":
+    main()
+ROUTER_GUARD_PY
+}
+
 prog_router_check() { printf '#!/bin/sh\nexec /opt/router/install-router.sh --check "$@"\n'; }
 
 # wersja skryptu zapisana na routerze (/etc/router/version): write_version install|upgrade
@@ -2179,7 +4218,7 @@ do_check() {
 
   printf '\n%s== Usługi ==%s\n' "$c_hdr" "$c_off"
   local u
-  for u in router.target netns-dataplane vpp router-ifaces "$(bird_unit)" snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd; do
+  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd; do
     if systemctl is-active --quiet "$u"; then ok "$u: active"; else warn "$u: $(systemctl is-active "$u" 2>/dev/null || true)"; fi
   done
 
@@ -2199,6 +4238,12 @@ do_check() {
   if [[ -z $badmtu ]]; then ok "MTU $PORT_MTU (standard Ethernet) na portach i VLAN-ach"
   else warn "MTU inne niż $PORT_MTU: $badmtu"; fi
 
+  printf '\n%s== Firewall (/etc/router/firewall.conf) ==%s\n' "$c_hdr" "$c_off"
+  if [[ -x /opt/router/bin/router-fw ]]; then /opt/router/bin/router-fw check 2>&1 || true
+  else warn "brak router-fw — uruchom: install-router --from 22"; fi
+  printf '\n%s== Ochrona przed odbiciami (router-guard) ==%s\n' "$c_hdr" "$c_off"
+  if [[ -x /opt/router/bin/router-guard ]]; then /opt/router/bin/router-guard status 2>&1 || true
+  else warn "brak router-guard — uruchom: install-router --from 23"; fi
   printf '\n%s== BIRD ==%s\n' "$c_hdr" "$c_off"
   birdc show status || true
   birdc show protocols || true
@@ -2234,6 +4279,8 @@ UPGRADE_PROGRAMS=(
   "router-monitor|/opt/router/bin/router-monitor|755|prog_router_monitor|router-monitor.service"
   "router-notify|/opt/router/bin/router-notify|755|prog_router_notify|router-notify.service"
   "router-ifaces|/opt/router/bin/router-ifaces|755|prog_router_ifaces|"
+  "router-fw|/opt/router/bin/router-fw|755|prog_router_fw|"
+  "router-guard|/opt/router/bin/router-guard|755|prog_router_guard|"
   "router-alert|/opt/router/bin/router-alert|755|prog_router_alert|"
   "router-bootcheck|/opt/router/bin/router-bootcheck|755|prog_router_bootcheck|"
   "mdadm-alert|/opt/router/bin/mdadm-alert|755|prog_mdadm_alert|"
@@ -2787,7 +4834,7 @@ if [[ -z $ALERT_EMAILS && ! -f /etc/router/notify.conf ]] && ((INTERACTIVE)); th
         BOOT "wynik kontroli po starcie" RAID "mdadm: dyski, degradacja, odbudowa" DISKS "smartd: zdrowie dysków" \
         NIC_FW "aktualizacja firmware karty" VPP_STATE "VPP niedostępny/zawieszony" VPP_DROPS "utrata pakietów (rx-miss, karta)" \
         VPP_LOAD "przeciążenie workerów VPP" VPP_PUNT "atak na control plane" SYS_CPU "przeciążenie rdzeni systemowych" \
-        IFACES "interfejsy: zmiany, rozjazd, błędy ifaces.conf" \
+        IFACES "interfejsy: zmiany, rozjazd, błędy ifaces.conf" FIREWALL "firewall: zmiany reguł, rozjazd, blokady" \
         STATS "minutowe statystyki (dużo maili)" OTHER "pozostałe" ALL "wszystko"
       read -rp "  Kategorie [$MAIL_SEND]: " ans; MAIL_SEND=${ans:-$MAIL_SEND}
       read -rp "  Wysyłać też zakończenia zdarzeń (np. LOAD_NORMAL z czasem trwania)? [T/n] " ans
@@ -3094,6 +5141,1320 @@ EOF
   ok "porty VPP: ${IFNAMES[*]} = ${NIC_PCI[*]}"
 }
 
+# Źródła wtyczki VPP synack-guard (moduł C): kopiowane do drzewa VPP przed kompilacją (st_vpp_build)
+emit_guard_plugin() {   # emit_guard_plugin <katalog>
+  local d=$1
+  mkdir -p "$d"
+  cat >"$d/synack_guard_core.h" <<'GUARD_CORE_H'
+/*
+ * synack_guard_core.h — logika filtra odbić niezależna od VPP (testowana na hoście: tests/guard_core_test.c).
+ *
+ * Polityka (tryb zrównoważony): SYN przechodzi; odrzucamy tylko „odpowiedź bez pytania”:
+ *   SYN-ACK, opcjonalnie RST oraz UDP ze źródłowych portów amplifikacji, jeśli sieć chroniona nie wysłała wcześniej
+ *   pasującego SYN (albo pakietu UDP do takiego portu).
+ * Moduł VPP włącza ten plik po zdefiniowaniu GC_ALLOC / GC_FREE (clib_mem_*); na hoście to calloc / free.
+ */
+#ifndef SYNACK_GUARD_CORE_H
+#define SYNACK_GUARD_CORE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef GC_ALLOC
+#define GC_ALLOC(n) calloc (1, (n))
+#define GC_FREE(p)  free (p)
+#endif
+
+#define GC_TCP_FLAG_FIN 0x01
+#define GC_TCP_FLAG_SYN 0x02
+#define GC_TCP_FLAG_RST 0x04
+#define GC_TCP_FLAG_ACK 0x10
+
+typedef enum
+{
+  GC_NONE = 0,
+  GC_TCP_SYN,    /* SYN, bez ACK i RST */
+  GC_TCP_SYNACK, /* SYN + ACK, bez RST */
+  GC_TCP_RST,    /* RST (z ACK lub bez), bez SYN */
+  GC_UDP,
+} gc_class_t;
+
+typedef struct
+{
+  gc_class_t cls;
+  uint8_t is_v6;
+  uint8_t frag;  /* niepierwszy fragment: brak nagłówka L4 */
+  uint8_t proto; /* numer protokołu L4 (także dla fragmentów) */
+  uint8_t flags; /* flagi TCP */
+  uint8_t src[16], dst[16]; /* IPv4: pierwsze 4 bajty, kolejność sieciowa */
+  uint16_t sport, dport;    /* kolejność hosta */
+  uint32_t seq, ack;        /* kolejność hosta */
+} gc_pkt_t;
+
+static inline uint16_t
+gc_be16 (const uint8_t *p)
+{
+  return (uint16_t) (p[0] << 8 | p[1]);
+}
+
+static inline uint32_t
+gc_be32 (const uint8_t *p)
+{
+  return (uint32_t) p[0] << 24 | (uint32_t) p[1] << 16 | (uint32_t) p[2] << 8 | p[3];
+}
+
+static inline uint64_t
+gc_be64 (const uint8_t *p)
+{
+  return (uint64_t) gc_be32 (p) << 32 | gc_be32 (p + 4);
+}
+
+/* Klasyfikacja po nagłówkach L3/L4. Nic nie czyta poza `len` bajtów; fragmenty i nagłówki rozszerzeń → GC_NONE. */
+static inline gc_class_t
+gc_classify_l4 (gc_pkt_t *p, const uint8_t *l4, uint32_t avail)
+{
+  if (p->proto == 6)
+    {
+      if (avail < 14)
+        return GC_NONE;
+      p->sport = gc_be16 (l4);
+      p->dport = gc_be16 (l4 + 2);
+      p->seq = gc_be32 (l4 + 4);
+      p->ack = gc_be32 (l4 + 8);
+      p->flags = l4[13];
+      uint8_t f = p->flags;
+      if ((f & GC_TCP_FLAG_RST) && !(f & GC_TCP_FLAG_SYN))
+        return GC_TCP_RST;
+      if (f & GC_TCP_FLAG_RST)
+        return GC_NONE; /* SYN+RST to śmieć */
+      if ((f & GC_TCP_FLAG_SYN) && (f & GC_TCP_FLAG_ACK))
+        return GC_TCP_SYNACK;
+      if (f & GC_TCP_FLAG_SYN)
+        return GC_TCP_SYN;
+      return GC_NONE;
+    }
+  if (p->proto == 17)
+    {
+      if (avail < 8)
+        return GC_NONE;
+      p->sport = gc_be16 (l4);
+      p->dport = gc_be16 (l4 + 2);
+      return GC_UDP;
+    }
+  return GC_NONE;
+}
+
+static inline gc_class_t
+gc_classify_v4 (const uint8_t *ip, uint32_t len, gc_pkt_t *p)
+{
+  memset (p, 0, sizeof *p);
+  if (len < 20 || (ip[0] >> 4) != 4)
+    return p->cls = GC_NONE;
+  uint32_t ihl = (uint32_t) (ip[0] & 0x0f) * 4;
+  if (ihl < 20 || len < ihl)
+    return p->cls = GC_NONE;
+  p->proto = ip[9];
+  if (gc_be16 (ip + 6) & 0x1fff) /* offset fragmentu != 0 */
+    {
+      p->frag = 1;
+      return p->cls = GC_NONE;
+    }
+  memcpy (p->src, ip + 12, 4);
+  memcpy (p->dst, ip + 16, 4);
+  return p->cls = gc_classify_l4 (p, ip + ihl, len - ihl);
+}
+
+static inline gc_class_t
+gc_classify_v6 (const uint8_t *ip, uint32_t len, gc_pkt_t *p)
+{
+  memset (p, 0, sizeof *p);
+  p->is_v6 = 1;
+  if (len < 40 || (ip[0] >> 4) != 6)
+    return p->cls = GC_NONE;
+  p->proto = ip[6];
+  if (p->proto != 6 && p->proto != 17) /* nagłówki rozszerzeń (także fragmentu) przechodzą bez sprawdzania */
+    return p->cls = GC_NONE;
+  memcpy (p->src, ip + 8, 16);
+  memcpy (p->dst, ip + 24, 16);
+  return p->cls = gc_classify_l4 (p, ip + 40, len - 40);
+}
+
+/* ------------------------------------------------------------------------------------------- konfiguracja */
+typedef struct
+{
+  uint8_t enforce;        /* 0 = monitor, 1 = enforce */
+  uint8_t rst_handshake;  /* RST wymaga wpisu */
+  uint8_t check_isn;      /* ack == ISN + 1 */
+  uint8_t udp_enabled;    /* filtr UDP z portów amplifikacji */
+  uint8_t udp_frags_drop; /* niepierwsze fragmenty UDP do chronionych prefiksów */
+  uint32_t ttl, udp_ttl;  /* sekundy */
+  uint8_t udp_ports[8192]; /* mapa bitowa portów amplifikacji */
+} gc_cfg_t;
+
+static inline void
+gc_port_set (gc_cfg_t *c, uint16_t port)
+{
+  c->udp_ports[port >> 3] |= (uint8_t) (1u << (port & 7));
+}
+
+static inline int
+gc_port_test (const gc_cfg_t *c, uint16_t port)
+{
+  return (c->udp_ports[port >> 3] >> (port & 7)) & 1;
+}
+
+static inline void
+gc_ports_clear (gc_cfg_t *c)
+{
+  memset (c->udp_ports, 0, sizeof c->udp_ports);
+}
+
+static inline void
+gc_cfg_init (gc_cfg_t *c)
+{
+  static const uint16_t def[] = { 19, 53, 111, 123, 137, 161, 389, 1900, 3702, 5353, 11211 };
+  memset (c, 0, sizeof *c);
+  c->check_isn = 1;
+  c->udp_enabled = 1;
+  c->ttl = 60;
+  c->udp_ttl = 30;
+  for (size_t i = 0; i < sizeof def / sizeof def[0]; i++)
+    gc_port_set (c, def[i]);
+}
+
+/* ------------------------------------------------------------------------------------------- decyzje */
+typedef enum
+{
+  GC_OUT_IGNORE = 0,
+  GC_OUT_RECORD_TCP,
+  GC_OUT_RECORD_UDP,
+} gc_out_t;
+
+/* Pakiet wychodzący z chronionego prefiksu: czy zapisać wpis. */
+static inline gc_out_t
+gc_out_action (const gc_pkt_t *p, const gc_cfg_t *c)
+{
+  if (p->cls == GC_TCP_SYN)
+    return GC_OUT_RECORD_TCP;
+  if (p->cls == GC_UDP && c->udp_enabled && gc_port_test (c, p->dport))
+    return GC_OUT_RECORD_UDP;
+  return GC_OUT_IGNORE;
+}
+
+typedef enum
+{
+  GC_V_IGNORE = 0, /* pakiet nie podlega sprawdzaniu */
+  GC_V_PASS,       /* sprawdzony, jest wpis */
+  GC_V_NO_FLOW,    /* brak wpisu albo wpis przeterminowany */
+  GC_V_BAD_ISN,    /* wpis jest, ale numer potwierdzenia się nie zgadza */
+  GC_V_FRAG_DROP,  /* niepierwszy fragment UDP przy udp-frags drop */
+} gc_verdict_t;
+
+/* Pakiet przychodzący do chronionego prefiksu: czy trzeba szukać wpisu w tablicy. */
+static inline int
+gc_in_need_lookup (const gc_pkt_t *p, const gc_cfg_t *c)
+{
+  switch (p->cls)
+    {
+    case GC_TCP_SYNACK:
+      return 1;
+    case GC_TCP_RST:
+      return c->rst_handshake;
+    case GC_UDP:
+      return c->udp_enabled && gc_port_test (c, p->sport);
+    default:
+      return 0;
+    }
+}
+
+static inline uint64_t
+gc_val_pack (uint32_t isn, uint32_t ts)
+{
+  return (uint64_t) isn << 32 | ts;
+}
+
+static inline uint32_t
+gc_val_isn (uint64_t v)
+{
+  return (uint32_t) (v >> 32);
+}
+
+static inline uint32_t
+gc_val_ts (uint64_t v)
+{
+  return (uint32_t) v;
+}
+
+static inline gc_verdict_t
+gc_in_verdict (const gc_pkt_t *p, const gc_cfg_t *c, int found, uint64_t val, uint32_t now)
+{
+  if (p->frag && p->proto == 17 && c->udp_enabled && c->udp_frags_drop)
+    return GC_V_FRAG_DROP;
+  if (!gc_in_need_lookup (p, c))
+    return GC_V_IGNORE;
+  if (!found)
+    return GC_V_NO_FLOW;
+  uint32_t ts = gc_val_ts (val);
+  uint32_t age = now >= ts ? now - ts : 0;
+  if (age > (p->cls == GC_UDP ? c->udp_ttl : c->ttl))
+    return GC_V_NO_FLOW;
+  if (p->cls != GC_UDP && c->check_isn && (p->flags & GC_TCP_FLAG_ACK) && p->ack != gc_val_isn (val) + 1)
+    return GC_V_BAD_ISN;
+  return GC_V_PASS;
+}
+
+static inline int
+gc_should_drop (const gc_cfg_t *c, gc_verdict_t v)
+{
+  return c->enforce && (v == GC_V_NO_FLOW || v == GC_V_BAD_ISN || v == GC_V_FRAG_DROP);
+}
+
+/* ------------------------------------------------------------------------------------------- klucze tablicy stanów */
+typedef struct
+{
+  uint64_t k[2];
+} gc_key4_t; /* klient, serwer, port klienta, port serwera, protokół */
+
+typedef struct
+{
+  uint64_t k[6];
+} gc_key6_t;
+
+static inline uint64_t
+gc_key_ports (uint16_t cport, uint16_t sport, uint8_t proto)
+{
+  return (uint64_t) cport | (uint64_t) sport << 16 | (uint64_t) proto << 32;
+}
+
+/* pakiet wychodzący od klienta (SYN albo UDP do portu amplifikacji) */
+static inline void
+gc_key4_out (gc_key4_t *k, const gc_pkt_t *p)
+{
+  k->k[0] = (uint64_t) gc_be32 (p->src) | (uint64_t) gc_be32 (p->dst) << 32;
+  k->k[1] = gc_key_ports (p->sport, p->dport, p->proto);
+}
+
+/* pakiet przychodzący do klienta (odpowiedź serwera) */
+static inline void
+gc_key4_in (gc_key4_t *k, const gc_pkt_t *p)
+{
+  k->k[0] = (uint64_t) gc_be32 (p->dst) | (uint64_t) gc_be32 (p->src) << 32;
+  k->k[1] = gc_key_ports (p->dport, p->sport, p->proto);
+}
+
+static inline void
+gc_key6_out (gc_key6_t *k, const gc_pkt_t *p)
+{
+  memset (k, 0, sizeof *k);
+  memcpy (&k->k[0], p->src, 16);
+  memcpy (&k->k[2], p->dst, 16);
+  k->k[4] = gc_key_ports (p->sport, p->dport, p->proto);
+}
+
+static inline void
+gc_key6_in (gc_key6_t *k, const gc_pkt_t *p)
+{
+  memset (k, 0, sizeof *k);
+  memcpy (&k->k[0], p->dst, 16);
+  memcpy (&k->k[2], p->src, 16);
+  k->k[4] = gc_key_ports (p->dport, p->sport, p->proto);
+}
+
+/* ------------------------------------------------------------------------------------------- zbiory prefiksów */
+#define GC_MAX_LENS 8
+
+typedef struct
+{
+  uint32_t nlens;
+  uint8_t lens[GC_MAX_LENS]; /* malejąco */
+  uint32_t cap[GC_MAX_LENS]; /* potęgi dwójki */
+  uint64_t *tab[GC_MAX_LENS]; /* (1<<32) | zamaskowany adres; 0 = puste */
+} gc_pset4_t;
+
+static inline uint32_t
+gc_mask4 (uint8_t len)
+{
+  return len == 0 ? 0 : ~0u << (32 - len);
+}
+
+static inline uint32_t
+gc_pow2_at_least (uint32_t n)
+{
+  uint32_t c = 8;
+  while (c < n)
+    c <<= 1;
+  return c;
+}
+
+static inline uint32_t
+gc_hash4 (uint32_t key)
+{
+  return (key * 2654435761u) >> 7;
+}
+
+static inline void
+gc_pset4_free (gc_pset4_t *s)
+{
+  for (uint32_t i = 0; i < s->nlens; i++)
+    if (s->tab[i])
+      GC_FREE (s->tab[i]);
+  memset (s, 0, sizeof *s);
+}
+
+/* addr: kolejność hosta. Zwraca 0, -1 (więcej niż GC_MAX_LENS różnych długości) albo -2 (brak pamięci). */
+static inline int
+gc_pset4_build (gc_pset4_t *s, const uint32_t *addr, const uint8_t *len, size_t n)
+{
+  memset (s, 0, sizeof *s);
+  for (size_t i = 0; i < n; i++)
+    {
+      uint32_t j;
+      for (j = 0; j < s->nlens; j++)
+        if (s->lens[j] == len[i])
+          break;
+      if (j == s->nlens)
+        {
+          if (s->nlens == GC_MAX_LENS)
+            return -1;
+          s->lens[s->nlens++] = len[i];
+        }
+    }
+  for (uint32_t a = 0; a < s->nlens; a++) /* sortowanie malejące (kilka elementów) */
+    for (uint32_t b = a + 1; b < s->nlens; b++)
+      if (s->lens[b] > s->lens[a])
+        {
+          uint8_t t = s->lens[a];
+          s->lens[a] = s->lens[b];
+          s->lens[b] = t;
+        }
+  for (uint32_t j = 0; j < s->nlens; j++)
+    {
+      uint32_t cnt = 0;
+      for (size_t i = 0; i < n; i++)
+        cnt += len[i] == s->lens[j];
+      s->cap[j] = gc_pow2_at_least (cnt * 2);
+      s->tab[j] = (uint64_t *) GC_ALLOC (s->cap[j] * sizeof (uint64_t));
+      if (!s->tab[j])
+        {
+          gc_pset4_free (s);
+          return -2;
+        }
+      for (size_t i = 0; i < n; i++)
+        {
+          if (len[i] != s->lens[j])
+            continue;
+          uint32_t key = addr[i] & gc_mask4 (len[i]);
+          uint32_t h = gc_hash4 (key) & (s->cap[j] - 1);
+          while (s->tab[j][h] && s->tab[j][h] != ((1ull << 32) | key))
+            h = (h + 1) & (s->cap[j] - 1);
+          s->tab[j][h] = (1ull << 32) | key;
+        }
+    }
+  return 0;
+}
+
+static inline int
+gc_pset4_lookup (const gc_pset4_t *s, uint32_t addr)
+{
+  for (uint32_t j = 0; j < s->nlens; j++)
+    {
+      uint32_t key = addr & gc_mask4 (s->lens[j]);
+      uint32_t h = gc_hash4 (key) & (s->cap[j] - 1);
+      while (s->tab[j][h])
+        {
+          if (s->tab[j][h] == ((1ull << 32) | key))
+            return 1;
+          h = (h + 1) & (s->cap[j] - 1);
+        }
+    }
+  return 0;
+}
+
+typedef struct
+{
+  uint64_t hi, lo;
+  uint64_t used;
+} gc_e6_t;
+
+typedef struct
+{
+  uint32_t nlens;
+  uint8_t lens[GC_MAX_LENS];
+  uint32_t cap[GC_MAX_LENS];
+  gc_e6_t *tab[GC_MAX_LENS];
+} gc_pset6_t;
+
+static inline void
+gc_mask6 (uint8_t len, uint64_t *mh, uint64_t *ml)
+{
+  if (len >= 128)
+    *mh = *ml = ~0ull;
+  else if (len >= 64)
+    {
+      *mh = ~0ull;
+      *ml = len == 64 ? 0 : ~0ull << (128 - len);
+    }
+  else
+    {
+      *mh = len == 0 ? 0 : ~0ull << (64 - len);
+      *ml = 0;
+    }
+}
+
+static inline uint32_t
+gc_hash6 (uint64_t hi, uint64_t lo)
+{
+  return (uint32_t) ((hi * 0x9E3779B97F4A7C15ull ^ lo * 0xC2B2AE3D27D4EB4Full) >> 32);
+}
+
+static inline void
+gc_pset6_free (gc_pset6_t *s)
+{
+  for (uint32_t i = 0; i < s->nlens; i++)
+    if (s->tab[i])
+      GC_FREE (s->tab[i]);
+  memset (s, 0, sizeof *s);
+}
+
+static inline int
+gc_pset6_build (gc_pset6_t *s, const uint64_t *hi, const uint64_t *lo, const uint8_t *len, size_t n)
+{
+  memset (s, 0, sizeof *s);
+  for (size_t i = 0; i < n; i++)
+    {
+      uint32_t j;
+      for (j = 0; j < s->nlens; j++)
+        if (s->lens[j] == len[i])
+          break;
+      if (j == s->nlens)
+        {
+          if (s->nlens == GC_MAX_LENS)
+            return -1;
+          s->lens[s->nlens++] = len[i];
+        }
+    }
+  for (uint32_t a = 0; a < s->nlens; a++)
+    for (uint32_t b = a + 1; b < s->nlens; b++)
+      if (s->lens[b] > s->lens[a])
+        {
+          uint8_t t = s->lens[a];
+          s->lens[a] = s->lens[b];
+          s->lens[b] = t;
+        }
+  for (uint32_t j = 0; j < s->nlens; j++)
+    {
+      uint32_t cnt = 0;
+      for (size_t i = 0; i < n; i++)
+        cnt += len[i] == s->lens[j];
+      s->cap[j] = gc_pow2_at_least (cnt * 2);
+      s->tab[j] = (gc_e6_t *) GC_ALLOC (s->cap[j] * sizeof (gc_e6_t));
+      if (!s->tab[j])
+        {
+          gc_pset6_free (s);
+          return -2;
+        }
+      uint64_t mh, ml;
+      gc_mask6 (s->lens[j], &mh, &ml);
+      for (size_t i = 0; i < n; i++)
+        {
+          if (len[i] != s->lens[j])
+            continue;
+          uint64_t kh = hi[i] & mh, kl = lo[i] & ml;
+          uint32_t h = gc_hash6 (kh, kl) & (s->cap[j] - 1);
+          while (s->tab[j][h].used && !(s->tab[j][h].hi == kh && s->tab[j][h].lo == kl))
+            h = (h + 1) & (s->cap[j] - 1);
+          s->tab[j][h].hi = kh;
+          s->tab[j][h].lo = kl;
+          s->tab[j][h].used = 1;
+        }
+    }
+  return 0;
+}
+
+static inline int
+gc_pset6_lookup (const gc_pset6_t *s, uint64_t hi, uint64_t lo)
+{
+  for (uint32_t j = 0; j < s->nlens; j++)
+    {
+      uint64_t mh, ml;
+      gc_mask6 (s->lens[j], &mh, &ml);
+      uint64_t kh = hi & mh, kl = lo & ml;
+      uint32_t h = gc_hash6 (kh, kl) & (s->cap[j] - 1);
+      while (s->tab[j][h].used)
+        {
+          if (s->tab[j][h].hi == kh && s->tab[j][h].lo == kl)
+            return 1;
+          h = (h + 1) & (s->cap[j] - 1);
+        }
+    }
+  return 0;
+}
+
+#endif /* SYNACK_GUARD_CORE_H */
+GUARD_CORE_H
+  cat >"$d/synack_guard.c" <<'GUARD_PLUGIN_C'
+/*
+ * synack_guard.c — wtyczka VPP: filtr odbić (SYN-ACK, RST, UDP z portów amplifikacji) dla chronionych prefiksów.
+ *
+ * Węzły na łuku ip4-unicast / ip6-unicast, włączane tylko na wskazanych interfejsach:
+ *   synack-guard-out-ip{4,6}  (strona klientów): zapisuje SYN i UDP do portów amplifikacji do wspólnej tablicy stanów,
+ *   synack-guard-in-ip{4,6}   (uplinki): sprawdza SYN-ACK / RST / UDP z portów amplifikacji względem tablicy.
+ * Logika decyzji jest w synack_guard_core.h (testowana na hoście). Sterowanie: vppctl (patrz "synack-guard ...").
+ *
+ * UWAGA: ten plik nie był kompilowany na maszynie deweloperskiej (brak VPP). Wymaga weryfikacji na buildzie
+ * VPP 26.06 (patrz docs/synack-guard-lab-checklist.md); miejsca zależne od wersji API są oznaczone "WERSJA:".
+ */
+#include <vlib/vlib.h>
+#include <vnet/vnet.h>
+#include <vnet/feature/feature.h>
+#include <vnet/ip/ip.h>
+#include <vnet/plugin/plugin.h>
+#include <vpp/app/version.h>
+
+#include <vppinfra/bihash_16_8.h>
+#include <vppinfra/bihash_template.h>
+#include <vppinfra/bihash_template.c>
+#include <vppinfra/bihash_48_8.h>
+#include <vppinfra/bihash_template.h>
+#include <vppinfra/bihash_template.c>
+
+static inline void *
+sg_zalloc (uword n)
+{
+  void *p = clib_mem_alloc (n);
+  if (p)
+    clib_memset (p, 0, n);
+  return p;
+}
+
+#define GC_ALLOC(n) sg_zalloc ((n))
+#define GC_FREE(p)  clib_mem_free ((p))
+#include "synack_guard_core.h"
+
+/* WERSJA: w razie zmiany nazwy w VPP 26.06 popraw tylko to makro. */
+#define SG_FEATURE_NEXT(nextp, b) vnet_feature_next_u16 ((nextp), (b))
+
+typedef enum
+{
+  SG_MODE_OFF = 0,
+  SG_MODE_MONITOR = 1,
+  SG_MODE_ENFORCE = 2,
+} sg_mode_t;
+
+typedef struct
+{
+  u32 sw_if_index;
+  u8 is_out;
+} sg_if_t;
+
+typedef struct
+{
+  ip46_address_t addr;
+  u8 len;
+  u8 is_v6;
+} sg_prefix_t;
+
+typedef struct
+{
+  sg_mode_t mode;
+  gc_cfg_t cfg;
+  u8 tables_ready;
+  u32 table_v4, table_v6; /* docelowa liczba wpisów */
+  clib_bihash_16_8_t flows4;
+  clib_bihash_48_8_t flows6;
+  gc_pset4_t *pset4; /* wskaźniki podmieniane w barierze */
+  gc_pset6_t *pset6;
+  sg_if_t *ifs;
+  sg_prefix_t *prefixes;
+  vlib_main_t *vlib_main;
+  vnet_main_t *vnet_main;
+} sg_main_t;
+
+static sg_main_t sg_main;
+
+#define foreach_sg_error                                                                                      \
+  _ (SYN_RECORDED, "SYN recorded")                                                                            \
+  _ (UDP_RECORDED, "UDP recorded")                                                                            \
+  _ (CHECKED, "Checked")                                                                                      \
+  _ (PASSED, "Passed")                                                                                        \
+  _ (VIOL_NO_FLOW, "Violation no flow")                                                                       \
+  _ (VIOL_BAD_ISN, "Violation bad isn")                                                                       \
+  _ (VIOL_UDP_FRAG, "Violation udp fragment")                                                                 \
+  _ (DROPPED, "Dropped")                                                                                      \
+  _ (INSERT_FAILED, "Insert failed")
+
+typedef enum
+{
+#define _(sym, str) SG_ERROR_##sym,
+  foreach_sg_error
+#undef _
+    SG_N_ERROR,
+} sg_error_t;
+
+static char *sg_error_strings[] = {
+#define _(sym, str) str,
+  foreach_sg_error
+#undef _
+};
+
+typedef enum
+{
+  SG_NEXT_DROP,
+  SG_N_NEXT,
+} sg_next_t;
+
+/* ------------------------------------------------------------------------------------------- tablice stanów */
+static int
+sg_is_stale4 (clib_bihash_kv_16_8_t *kv, void *arg)
+{
+  u32 now = *(u32 *) arg;
+  u32 ts = gc_val_ts (kv->value);
+  u8 proto = (kv->key[1] >> 32) & 0xff;
+  u32 ttl = proto == 17 ? sg_main.cfg.udp_ttl : sg_main.cfg.ttl;
+  return now >= ts && now - ts > ttl;
+}
+
+static int
+sg_is_stale6 (clib_bihash_kv_48_8_t *kv, void *arg)
+{
+  u32 now = *(u32 *) arg;
+  u32 ts = gc_val_ts (kv->value);
+  u8 proto = (kv->key[4] >> 32) & 0xff;
+  u32 ttl = proto == 17 ? sg_main.cfg.udp_ttl : sg_main.cfg.ttl;
+  return now >= ts && now - ts > ttl;
+}
+
+static void
+sg_tables_init (sg_main_t *sm)
+{
+  if (sm->tables_ready)
+    return;
+  /* ok. 4 wpisy na stronę koszyka; pamięć z zapasem 1.5x */
+  clib_bihash_init_16_8 (&sm->flows4, "synack-guard-v4", clib_max (sm->table_v4 / 4, 1024),
+                         (uword) sm->table_v4 * sizeof (clib_bihash_kv_16_8_t) * 3 / 2);
+  clib_bihash_init_48_8 (&sm->flows6, "synack-guard-v6", clib_max (sm->table_v6 / 4, 1024),
+                         (uword) sm->table_v6 * sizeof (clib_bihash_kv_48_8_t) * 3 / 2);
+  sm->tables_ready = 1;
+}
+
+static void
+sg_tables_free (sg_main_t *sm)
+{
+  if (!sm->tables_ready)
+    return;
+  clib_bihash_free_16_8 (&sm->flows4);
+  clib_bihash_free_48_8 (&sm->flows6);
+  sm->tables_ready = 0;
+}
+
+/* ------------------------------------------------------------------------------------------- prefiksy */
+static void
+sg_rebuild_prefixes (vlib_main_t *vm)
+{
+  sg_main_t *sm = &sg_main;
+  u32 n4 = 0, n6 = 0;
+  sg_prefix_t *p;
+  vec_foreach (p, sm->prefixes) p->is_v6 ? n6++ : n4++;
+  uint32_t *a4 = n4 ? clib_mem_alloc (n4 * sizeof (uint32_t)) : 0;
+  uint8_t *l4 = n4 ? clib_mem_alloc (n4) : 0;
+  uint64_t *h6 = n6 ? clib_mem_alloc (n6 * sizeof (uint64_t)) : 0;
+  uint64_t *l6 = n6 ? clib_mem_alloc (n6 * sizeof (uint64_t)) : 0;
+  uint8_t *ln6 = n6 ? clib_mem_alloc (n6) : 0;
+  u32 i4 = 0, i6 = 0;
+  vec_foreach (p, sm->prefixes)
+    {
+      if (p->is_v6)
+        {
+          h6[i6] = clib_net_to_host_u64 (p->addr.ip6.as_u64[0]);
+          l6[i6] = clib_net_to_host_u64 (p->addr.ip6.as_u64[1]);
+          ln6[i6++] = p->len;
+        }
+      else
+        {
+          a4[i4] = clib_net_to_host_u32 (p->addr.ip4.as_u32);
+          l4[i4++] = p->len;
+        }
+    }
+  gc_pset4_t *new4 = sg_zalloc (sizeof (*new4));
+  gc_pset6_t *new6 = sg_zalloc (sizeof (*new6));
+  if (gc_pset4_build (new4, a4, l4, n4) || gc_pset6_build (new6, h6, l6, ln6, n6))
+    {
+      clib_warning ("synack-guard: nie udało się zbudować zbiorów prefiksów (za dużo różnych długości?)");
+      gc_pset4_free (new4);
+      gc_pset6_free (new6);
+      clib_mem_free (new4);
+      clib_mem_free (new6);
+      goto done;
+    }
+  vlib_worker_thread_barrier_sync (vm);
+  gc_pset4_t *old4 = sm->pset4;
+  gc_pset6_t *old6 = sm->pset6;
+  sm->pset4 = new4;
+  sm->pset6 = new6;
+  vlib_worker_thread_barrier_release (vm);
+  if (old4)
+    {
+      gc_pset4_free (old4);
+      clib_mem_free (old4);
+    }
+  if (old6)
+    {
+      gc_pset6_free (old6);
+      clib_mem_free (old6);
+    }
+done:
+  if (a4)
+    clib_mem_free (a4);
+  if (l4)
+    clib_mem_free (l4);
+  if (h6)
+    clib_mem_free (h6);
+  if (l6)
+    clib_mem_free (l6);
+  if (ln6)
+    clib_mem_free (ln6);
+}
+
+/* ------------------------------------------------------------------------------------------- węzły */
+always_inline uword
+sg_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame, int is_out, int is_ip6)
+{
+  sg_main_t *sm = &sg_main;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE];
+  gc_pkt_t pk[VLIB_FRAME_SIZE];
+  u8 need[VLIB_FRAME_SIZE];
+  u64 hashes[VLIB_FRAME_SIZE];
+  gc_key4_t keys4[VLIB_FRAME_SIZE];
+  gc_key6_t keys6[VLIB_FRAME_SIZE];
+  u32 n = n_left, i;
+  u32 c_syn = 0, c_udp = 0, c_checked = 0, c_pass = 0, c_nf = 0, c_isn = 0, c_frag = 0, c_drop = 0, c_fail = 0;
+
+  vlib_get_buffers (vm, from, bufs, n);
+
+  if (PREDICT_FALSE (sm->mode == SG_MODE_OFF || !sm->tables_ready))
+    {
+      for (i = 0; i < n; i++)
+        SG_FEATURE_NEXT (&nexts[i], bufs[i]);
+      vlib_buffer_enqueue_to_next (vm, node, from, nexts, n);
+      return n;
+    }
+
+  u32 now = (u32) vlib_time_now (vm);
+  gc_pset4_t *ps4 = sm->pset4;
+  gc_pset6_t *ps6 = sm->pset6;
+  const gc_cfg_t *cfg = &sm->cfg;
+
+  /* przejście 1: klasyfikacja, test prefiksu, (out) zapis wpisu, (in) policzenie skrótu i prefetch koszyka */
+  for (i = 0; i < n; i++)
+    {
+      if (i + 4 < n)
+        {
+          vlib_prefetch_buffer_header (b[4], LOAD);
+          CLIB_PREFETCH (vlib_buffer_get_current (b[4]), 64, LOAD);
+        }
+      vlib_buffer_t *b0 = b[0];
+      b++;
+      const u8 *ip = vlib_buffer_get_current (b0);
+      gc_pkt_t *p = &pk[i];
+      need[i] = 0;
+      SG_FEATURE_NEXT (&nexts[i], b0);
+      if (is_ip6)
+        gc_classify_v6 (ip, b0->current_length, p);
+      else
+        gc_classify_v4 (ip, b0->current_length, p);
+
+      if (is_out)
+        {
+          gc_out_t act = gc_out_action (p, cfg);
+          if (act == GC_OUT_IGNORE)
+            continue;
+          int hit = is_ip6 ? (ps6 && gc_pset6_lookup (ps6, gc_be64 (p->src), gc_be64 (p->src + 8))) :
+                             (ps4 && gc_pset4_lookup (ps4, gc_be32 (p->src)));
+          if (!hit)
+            continue;
+          u64 val = gc_val_pack (act == GC_OUT_RECORD_TCP ? p->seq : 0, now);
+          int rv;
+          if (is_ip6)
+            {
+              clib_bihash_kv_48_8_t kv;
+              gc_key6_t k;
+              gc_key6_out (&k, p);
+              clib_memcpy_fast (kv.key, k.k, sizeof kv.key);
+              kv.value = val;
+              rv = clib_bihash_add_or_overwrite_stale_48_8 (&sm->flows6, &kv, sg_is_stale6, &now);
+            }
+          else
+            {
+              clib_bihash_kv_16_8_t kv;
+              gc_key4_t k;
+              gc_key4_out (&k, p);
+              kv.key[0] = k.k[0];
+              kv.key[1] = k.k[1];
+              kv.value = val;
+              rv = clib_bihash_add_or_overwrite_stale_16_8 (&sm->flows4, &kv, sg_is_stale4, &now);
+            }
+          if (rv)
+            c_fail++;
+          else if (act == GC_OUT_RECORD_TCP)
+            c_syn++;
+          else
+            c_udp++;
+          continue;
+        }
+
+      /* kierunek przychodzący (uplinki) */
+      int frag_udp = p->frag && p->proto == 17 && cfg->udp_enabled && cfg->udp_frags_drop;
+      if (!frag_udp && !gc_in_need_lookup (p, cfg))
+        continue;
+      int hit = is_ip6 ? (ps6 && gc_pset6_lookup (ps6, gc_be64 (p->dst), gc_be64 (p->dst + 8))) :
+                         (ps4 && gc_pset4_lookup (ps4, gc_be32 (p->dst)));
+      if (!hit)
+        continue;
+      need[i] = 1;
+      if (frag_udp)
+        {
+          need[i] = 2; /* decyzja bez tablicy */
+          continue;
+        }
+      if (is_ip6)
+        {
+          gc_key6_in (&keys6[i], p);
+          clib_bihash_kv_48_8_t kv;
+          clib_memcpy_fast (kv.key, keys6[i].k, sizeof kv.key);
+          hashes[i] = clib_bihash_hash_48_8 (&kv);
+          clib_bihash_prefetch_bucket_48_8 (&sm->flows6, hashes[i]);
+        }
+      else
+        {
+          gc_key4_in (&keys4[i], p);
+          clib_bihash_kv_16_8_t kv;
+          kv.key[0] = keys4[i].k[0];
+          kv.key[1] = keys4[i].k[1];
+          hashes[i] = clib_bihash_hash_16_8 (&kv);
+          clib_bihash_prefetch_bucket_16_8 (&sm->flows4, hashes[i]);
+        }
+    }
+
+  /* przejście 2 (tylko uplinki): wyszukanie wpisów i werdykt */
+  if (!is_out)
+    {
+      for (i = 0; i < n; i++)
+        {
+          if (!need[i])
+            continue;
+          gc_verdict_t v;
+          if (need[i] == 2)
+            v = GC_V_FRAG_DROP;
+          else
+            {
+              int found;
+              u64 val = 0;
+              if (is_ip6)
+                {
+                  clib_bihash_kv_48_8_t kv, res;
+                  clib_memcpy_fast (kv.key, keys6[i].k, sizeof kv.key);
+                  found = clib_bihash_search_inline_2_with_hash_48_8 (&sm->flows6, hashes[i], &kv, &res) == 0;
+                  val = found ? res.value : 0;
+                }
+              else
+                {
+                  clib_bihash_kv_16_8_t kv, res;
+                  kv.key[0] = keys4[i].k[0];
+                  kv.key[1] = keys4[i].k[1];
+                  found = clib_bihash_search_inline_2_with_hash_16_8 (&sm->flows4, hashes[i], &kv, &res) == 0;
+                  val = found ? res.value : 0;
+                }
+              v = gc_in_verdict (&pk[i], cfg, found, val, now);
+            }
+          c_checked++;
+          switch (v)
+            {
+            case GC_V_PASS:
+              c_pass++;
+              break;
+            case GC_V_NO_FLOW:
+              c_nf++;
+              break;
+            case GC_V_BAD_ISN:
+              c_isn++;
+              break;
+            case GC_V_FRAG_DROP:
+              c_frag++;
+              break;
+            default:
+              break;
+            }
+          if (gc_should_drop (cfg, v))
+            {
+              nexts[i] = SG_NEXT_DROP;
+              bufs[i]->error = node->errors[SG_ERROR_DROPPED];
+              c_drop++;
+            }
+        }
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, n);
+
+#define _inc(sym, cnt)                                                                                        \
+  if (cnt)                                                                                                    \
+    vlib_node_increment_counter (vm, node->node_index, SG_ERROR_##sym, cnt);
+  _inc (SYN_RECORDED, c_syn) _inc (UDP_RECORDED, c_udp) _inc (CHECKED, c_checked) _inc (PASSED, c_pass)
+  _inc (VIOL_NO_FLOW, c_nf) _inc (VIOL_BAD_ISN, c_isn) _inc (VIOL_UDP_FRAG, c_frag) _inc (DROPPED, c_drop)
+  _inc (INSERT_FAILED, c_fail)
+#undef _inc
+  return n;
+}
+
+VLIB_NODE_FN (sg_in_ip4_node) (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return sg_node_inline (vm, node, frame, 0, 0);
+}
+
+VLIB_NODE_FN (sg_out_ip4_node) (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return sg_node_inline (vm, node, frame, 1, 0);
+}
+
+VLIB_NODE_FN (sg_in_ip6_node) (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return sg_node_inline (vm, node, frame, 0, 1);
+}
+
+VLIB_NODE_FN (sg_out_ip6_node) (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return sg_node_inline (vm, node, frame, 1, 1);
+}
+
+#define SG_REGISTER_NODE(sym, nm)                                                                             \
+  VLIB_REGISTER_NODE (sym) = {                                                                                \
+    .name = nm,                                                                                               \
+    .vector_size = sizeof (u32),                                                                              \
+    .type = VLIB_NODE_TYPE_INTERNAL,                                                                          \
+    .n_errors = SG_N_ERROR,                                                                                   \
+    .error_strings = sg_error_strings,                                                                        \
+    .n_next_nodes = SG_N_NEXT,                                                                                \
+    .next_nodes = { [SG_NEXT_DROP] = "error-drop" },                                                          \
+  }
+
+SG_REGISTER_NODE (sg_in_ip4_node, "synack-guard-in-ip4");
+SG_REGISTER_NODE (sg_out_ip4_node, "synack-guard-out-ip4");
+SG_REGISTER_NODE (sg_in_ip6_node, "synack-guard-in-ip6");
+SG_REGISTER_NODE (sg_out_ip6_node, "synack-guard-out-ip6");
+
+VNET_FEATURE_INIT (sg_in_ip4_feat, static) = {
+  .arc_name = "ip4-unicast",
+  .node_name = "synack-guard-in-ip4",
+  .runs_before = VNET_FEATURES ("ip4-lookup"),
+};
+VNET_FEATURE_INIT (sg_out_ip4_feat, static) = {
+  .arc_name = "ip4-unicast",
+  .node_name = "synack-guard-out-ip4",
+  .runs_before = VNET_FEATURES ("ip4-lookup"),
+};
+VNET_FEATURE_INIT (sg_in_ip6_feat, static) = {
+  .arc_name = "ip6-unicast",
+  .node_name = "synack-guard-in-ip6",
+  .runs_before = VNET_FEATURES ("ip6-lookup"),
+};
+VNET_FEATURE_INIT (sg_out_ip6_feat, static) = {
+  .arc_name = "ip6-unicast",
+  .node_name = "synack-guard-out-ip6",
+  .runs_before = VNET_FEATURES ("ip6-lookup"),
+};
+
+/* ------------------------------------------------------------------------------------------- CLI */
+static int
+sg_set_interface (vlib_main_t *vm, u32 sw_if_index, int is_out, int enable)
+{
+  sg_main_t *sm = &sg_main;
+  sg_if_t *e;
+  /* zdejmij poprzednie przypięcie (także w drugą stronę), żeby jeden interfejs miał jedną rolę */
+  vec_foreach (e, sm->ifs)
+    {
+      if (e->sw_if_index != sw_if_index)
+        continue;
+      vnet_feature_enable_disable ("ip4-unicast", e->is_out ? "synack-guard-out-ip4" : "synack-guard-in-ip4",
+                                   sw_if_index, 0, 0, 0);
+      vnet_feature_enable_disable ("ip6-unicast", e->is_out ? "synack-guard-out-ip6" : "synack-guard-in-ip6",
+                                   sw_if_index, 0, 0, 0);
+      vec_del1 (sm->ifs, e - sm->ifs);
+      break;
+    }
+  if (!enable)
+    return 0;
+  vnet_feature_enable_disable ("ip4-unicast", is_out ? "synack-guard-out-ip4" : "synack-guard-in-ip4", sw_if_index, 1,
+                               0, 0);
+  vnet_feature_enable_disable ("ip6-unicast", is_out ? "synack-guard-out-ip6" : "synack-guard-in-ip6", sw_if_index, 1,
+                               0, 0);
+  sg_if_t ne = { .sw_if_index = sw_if_index, .is_out = is_out };
+  vec_add1 (sm->ifs, ne);
+  return 0;
+}
+
+static clib_error_t *
+sg_interface_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  sg_main_t *sm = &sg_main;
+  u32 sw_if_index = ~0;
+  int is_out = -1, disable = 0;
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "%U", unformat_vnet_sw_interface, sm->vnet_main, &sw_if_index))
+        ;
+      else if (unformat (input, "in"))
+        is_out = 0;
+      else if (unformat (input, "out"))
+        is_out = 1;
+      else if (unformat (input, "disable"))
+        disable = 1;
+      else
+        return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
+    }
+  if (sw_if_index == ~0 || is_out < 0)
+    return clib_error_return (0, "usage: synack-guard interface <if> in|out [disable]");
+  sg_set_interface (vm, sw_if_index, is_out, !disable);
+  return 0;
+}
+
+static clib_error_t *
+sg_prefix_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  sg_main_t *sm = &sg_main;
+  ip46_address_t addr;
+  u32 len = ~0;
+  int del = 0, have = 0;
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "%U/%d", unformat_ip46_address, &addr, IP46_TYPE_ANY, &len))
+        have = 1;
+      else if (unformat (input, "del"))
+        del = 1;
+      else
+        return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
+    }
+  if (!have)
+    return clib_error_return (0, "usage: synack-guard prefix <addr>/<len> [del]");
+  int is_v6 = !ip46_address_is_ip4 (&addr);
+  if (len > (is_v6 ? 128 : 32))
+    return clib_error_return (0, "invalid prefix length");
+  /* adres zamaskowany do długości, żeby porównania były jednoznaczne */
+  if (is_v6)
+    {
+      ip6_address_t mask;
+      ip6_preflen_to_mask (len, &mask);
+      ip6_address_mask (&addr.ip6, &mask);
+    }
+  else
+    {
+      ip4_address_t mask;
+      ip4_preflen_to_mask (len, &mask);
+      addr.ip4.as_u32 &= mask.as_u32;
+    }
+  sg_prefix_t *p;
+  int idx = -1;
+  vec_foreach (p, sm->prefixes)
+    {
+      if (p->is_v6 == is_v6 && p->len == len && !memcmp (&p->addr, &addr, sizeof addr))
+        idx = p - sm->prefixes;
+    }
+  if (del)
+    {
+      if (idx < 0)
+        return clib_error_return (0, "prefix not found");
+      vec_del1 (sm->prefixes, idx);
+    }
+  else if (idx < 0)
+    {
+      sg_prefix_t np = { .addr = addr, .len = len, .is_v6 = is_v6 };
+      vec_add1 (sm->prefixes, np);
+    }
+  sg_rebuild_prefixes (vm);
+  return 0;
+}
+
+static clib_error_t *
+sg_mode_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  sg_main_t *sm = &sg_main;
+  sg_mode_t mode;
+  if (unformat (input, "off"))
+    mode = SG_MODE_OFF;
+  else if (unformat (input, "monitor"))
+    mode = SG_MODE_MONITOR;
+  else if (unformat (input, "enforce"))
+    mode = SG_MODE_ENFORCE;
+  else
+    return clib_error_return (0, "usage: synack-guard mode off|monitor|enforce");
+  if (mode != SG_MODE_OFF)
+    sg_tables_init (sm);
+  vlib_worker_thread_barrier_sync (vm);
+  sm->mode = mode;
+  sm->cfg.enforce = mode == SG_MODE_ENFORCE;
+  vlib_worker_thread_barrier_release (vm);
+  return 0;
+}
+
+static clib_error_t *
+sg_config_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  sg_main_t *sm = &sg_main;
+  gc_cfg_t nc = sm->cfg;
+  u32 v4 = sm->table_v4, v6 = sm->table_v6, x;
+  int tables_changed = 0;
+  u8 *word = 0;
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "ttl %u", &x))
+        nc.ttl = x;
+      else if (unformat (input, "udp-ttl %u", &x))
+        nc.udp_ttl = x;
+      else if (unformat (input, "check-isn %s", &word))
+        nc.check_isn = !strcmp ((char *) word, "on");
+      else if (unformat (input, "tcp-rst %s", &word))
+        nc.rst_handshake = !strcmp ((char *) word, "handshake");
+      else if (unformat (input, "udp-frags %s", &word))
+        nc.udp_frags_drop = !strcmp ((char *) word, "drop");
+      else if (unformat (input, "udp-ports"))
+        {
+          gc_ports_clear (&nc);
+          while (unformat (input, "%u", &x))
+            {
+              if (x > 65535)
+                return clib_error_return (0, "invalid port");
+              gc_port_set (&nc, x);
+              unformat (input, ",");
+            }
+        }
+      else if (unformat (input, "udp %s", &word))
+        nc.udp_enabled = !strcmp ((char *) word, "on");
+      else if (unformat (input, "table-v4 %u", &x))
+        {
+          v4 = x;
+          tables_changed = 1;
+        }
+      else if (unformat (input, "table-v6 %u", &x))
+        {
+          v6 = x;
+          tables_changed = 1;
+        }
+      else
+        {
+          vec_free (word);
+          return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
+        }
+      vec_free (word);
+    }
+  if (tables_changed && sm->mode != SG_MODE_OFF)
+    return clib_error_return (0, "table sizes can be changed only when mode is off");
+  vlib_worker_thread_barrier_sync (vm);
+  sm->cfg = nc;
+  sm->cfg.enforce = sm->mode == SG_MODE_ENFORCE;
+  vlib_worker_thread_barrier_release (vm);
+  if (tables_changed && (v4 != sm->table_v4 || v6 != sm->table_v6))
+    {
+      sg_tables_free (sm);
+      sm->table_v4 = v4;
+      sm->table_v6 = v6;
+    }
+  return 0;
+}
+
+static clib_error_t *
+sg_show_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  sg_main_t *sm = &sg_main;
+  const gc_cfg_t *c = &sm->cfg;
+  static const char *names[] = { "off", "monitor", "enforce" };
+  vlib_cli_output (vm, "mode: %s", names[sm->mode]);
+  u8 *ports = 0;
+  for (u32 p = 0; p < 65536; p++)
+    if (gc_port_test (c, p))
+      ports = format (ports, "%s%u", vec_len (ports) ? "," : "", p);
+  vlib_cli_output (vm, "config: ttl %u udp-ttl %u check-isn %s tcp-rst %s udp %s udp-frags %s udp-ports %v", c->ttl,
+                   c->udp_ttl, c->check_isn ? "on" : "off", c->rst_handshake ? "handshake" : "pass",
+                   c->udp_enabled ? "on" : "off", c->udp_frags_drop ? "drop" : "pass", ports);
+  vec_free (ports);
+  sg_if_t *e;
+  vec_foreach (e, sm->ifs)
+    vlib_cli_output (vm, "interface: %U %s", format_vnet_sw_if_index_name, sm->vnet_main, e->sw_if_index,
+                     e->is_out ? "out" : "in");
+  sg_prefix_t *p;
+  vec_foreach (p, sm->prefixes)
+    {
+      if (p->is_v6)
+        vlib_cli_output (vm, "prefix: %U/%u", format_ip6_address, &p->addr.ip6, p->len);
+      else
+        vlib_cli_output (vm, "prefix: %U/%u", format_ip4_address, &p->addr.ip4, p->len);
+    }
+  /* WERSJA: clib_bihash_elts_* przechodzi po koszykach (koszt rzędu ms) — używane tylko przy "show". */
+  vlib_cli_output (vm, "table-v4: %llu/%u", sm->tables_ready ? (u64) clib_bihash_elts_16_8 (&sm->flows4) : 0,
+                   sm->table_v4);
+  vlib_cli_output (vm, "table-v6: %llu/%u", sm->tables_ready ? (u64) clib_bihash_elts_48_8 (&sm->flows6) : 0,
+                   sm->table_v6);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sg_interface_command, static) = {
+  .path = "synack-guard interface",
+  .short_help = "synack-guard interface <interface> in|out [disable]",
+  .function = sg_interface_command_fn,
+};
+VLIB_CLI_COMMAND (sg_prefix_command, static) = {
+  .path = "synack-guard prefix",
+  .short_help = "synack-guard prefix <addr>/<len> [del]",
+  .function = sg_prefix_command_fn,
+};
+VLIB_CLI_COMMAND (sg_mode_command, static) = {
+  .path = "synack-guard mode",
+  .short_help = "synack-guard mode off|monitor|enforce",
+  .function = sg_mode_command_fn,
+};
+VLIB_CLI_COMMAND (sg_config_command, static) = {
+  .path = "synack-guard config",
+  .short_help = "synack-guard config [ttl <s>] [udp-ttl <s>] [check-isn on|off] [tcp-rst pass|handshake] [udp on|off] "
+                "[udp-frags pass|drop] [udp-ports <p,p,...>] [table-v4 <n>] [table-v6 <n>]",
+  .function = sg_config_command_fn,
+};
+VLIB_CLI_COMMAND (sg_show_command, static) = {
+  .path = "show synack-guard",
+  .short_help = "show synack-guard",
+  .function = sg_show_command_fn,
+};
+
+static clib_error_t *
+sg_init (vlib_main_t *vm)
+{
+  sg_main_t *sm = &sg_main;
+  sm->vlib_main = vm;
+  sm->vnet_main = vnet_get_main ();
+  gc_cfg_init (&sm->cfg);
+  sm->mode = SG_MODE_OFF;
+  sm->table_v4 = 4000000;
+  sm->table_v6 = 1000000;
+  return 0;
+}
+
+VLIB_INIT_FUNCTION (sg_init);
+
+VLIB_PLUGIN_REGISTER () = {
+  .version = VPP_BUILD_VER,
+  .description = "synack-guard: filtr odbić SYN-ACK / RST / UDP dla chronionych prefiksów",
+};
+GUARD_PLUGIN_C
+  cat >"$d/CMakeLists.txt" <<'GUARD_CMAKE'
+# synack-guard — wtyczka VPP (budowana razem z VPP: install-router.sh kopiuje ten katalog do src/plugins/)
+add_vpp_plugin(synack_guard
+  SOURCES
+  synack_guard.c
+)
+GUARD_CMAKE
+}
+
 st_vpp_build() {
   local vdir=$SRC_DIR/vpp
   if [[ -d $vdir/.git ]]; then
@@ -3104,6 +6465,9 @@ st_vpp_build() {
     git clone https://github.com/FDio/vpp.git "$vdir"
   fi
   git -C "$vdir" checkout -f "$VPP_VERSION"
+  say "wtyczka synack-guard → $vdir/src/plugins/synack_guard (kompilowana razem z VPP)"
+  emit_guard_plugin "$vdir/src/plugins/synack_guard"
+  man_add dir "$vdir/src/plugins/synack_guard" "źródła wtyczki VPP synack-guard (filtr odbić SYN-ACK/RST/UDP)"
   man_add dir "$vdir" "źródła VPP $VPP_VERSION (kompilacja)"
   cd "$vdir"
   say "make install-dep (zależności kompilacji z apt)"
@@ -3719,6 +7083,255 @@ EOF
   ((bad == 0)) && ok "autostart skonfigurowany: router.target + router-bootcheck" || warn "część usług nie jest włączona — patrz lista wyżej"
 }
 
+fw_example_conf() {
+  cat <<'EOF'
+# /etc/router/firewall.conf — firewall tranzytu na VPP (polecenie router-fw)
+# Po edycji:  router-fw check  →  router-fw diff  →  router-fw apply   (apply --confirm 120 = cofnięcie bez potwierdzenia)
+# Ruchu DO routera (BGP, BFD, SNMP, ICMP) ten plik nie dotyczy — to zadanie netfiltera w netns dataplane.
+#
+# zone   INTERFEJS  STREFA       strefa to dowolna nazwa do 24 znaków; blokady doraźne (router-fw block) działają w strefie "internet"
+# list   NAZWA      adres/prefiks ...        albo:  list NAZWA include /etc/router/fw-lists/plik.list
+# kierunek    akcja   proto  src   sport  dst   dport  opis
+#   kierunek: internet->  = ruch wchodzący z interfejsów strefy,   ->internet  = ruch wychodzący do strefy
+#   akcja: permit | deny      proto: tcp udp icmp icmp6 any      adres: any | prefiks | @lista | a,b,c
+#   port: any | 25 | 25,587 | 1024-65535 (tylko tcp i udp)
+# Kolejność ma znaczenie: pierwsza pasująca reguła wygrywa, wyjątki (whitelist) wpisuj nad blokadą.
+# Co nie pasuje do żadnej reguły, przechodzi.
+#
+#zone  hu0.100  internet     # Transit: EPIX
+#zone  hu0.300  clients      # Core: BNG
+#list  smtp-ok  203.0.113.25/32  203.0.113.26/32
+#->internet   permit  tcp  @smtp-ok  any  any  25     serwery poczty klientów
+#->internet   deny    tcp  any       any  any  25     blokada SMTP od klientów
+#internet->   deny    tcp  any       any  any  445    SMB z internetu
+
+set counters on
+EOF
+}
+
+st_fw() {
+  local bu; bu=$(bird_unit)
+  mkdir -p /var/lib/router /var/log/router-monitor /etc/router/fw-lists
+  prog_router_fw | put_file /opt/router/bin/router-fw "firewall tranzytu VPP (acl-plugin): strefy, reguły, blokady, liczniki" 755
+  ln -sfn /opt/router/bin/router-fw /usr/local/sbin/router-fw
+  man_add file /usr/local/sbin/router-fw "polecenie router-fw (show / diff / apply / check / block / counters)"
+  if [[ -f /etc/router/firewall.conf ]]; then
+    say "zostawiam istniejący /etc/router/firewall.conf"
+  else
+    fw_example_conf | put_file /etc/router/firewall.conf "firewall tranzytu: strefy, listy i reguły (domyślnie bez reguł)"
+  fi
+  man_add dir /etc/router/fw-lists "długie listy adresów dla firewall.conf (list NAZWA include ...)"
+  put_file /etc/systemd/system/router-fw.service "odtworzenie reguł firewalla po każdym starcie VPP" <<'EOF'
+[Unit]
+Description=Router: firewall tranzytu VPP (ACL z /etc/router/firewall.conf)
+Documentation=file:/opt/router/README.md
+BindsTo=vpp.service
+After=vpp.service netns-dataplane.service router-ifaces.service
+OnFailure=router-alert@%n.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/router/bin/router-fw boot
+TimeoutStartSec=300
+EOF
+  printf '[Unit]\nWants=router-fw.service\n' \
+    | put_file /etc/systemd/system/vpp.service.d/50-fw.conf "start VPP (także automatyczny restart) odtwarza reguły firewalla"
+  printf '[Unit]\nAfter=router-fw.service\n' \
+    | put_file "/etc/systemd/system/$bu.service.d/40-fw.conf" "BIRD startuje po wgraniu reguł firewalla"
+  printf '[Unit]\nWants=router-fw.service\nAfter=router-fw.service\n' \
+    | put_file /etc/systemd/system/router.target.d/10-fw.conf "router.target obejmuje router-fw.service"
+  put_file /etc/systemd/system/router-fw-check.service "kontrola zgodności VPP z firewall.conf (rozjazd → alarm)" <<'EOF'
+[Unit]
+Description=Router: kontrola zgodności ACL w VPP z firewall.conf
+Documentation=file:/opt/router/README.md
+After=router-fw.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/bin/router-fw check --log
+SuccessExitStatus=1 2 3
+EOF
+  put_file /etc/systemd/system/router-fw-check.timer "co 5 minut: kontrola zgodności firewalla" <<'EOF'
+[Unit]
+Description=Router: co 5 minut kontrola zgodności ACL w VPP z firewall.conf
+Documentation=file:/opt/router/README.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+  put_file /etc/systemd/system/router-fw-expire.service "zdejmowanie wygasłych blokad doraźnych" <<'EOF'
+[Unit]
+Description=Router: zdjęcie wygasłych blokad doraźnych firewalla
+Documentation=file:/opt/router/README.md
+After=router-fw.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/bin/router-fw expire
+SuccessExitStatus=1 2 3
+EOF
+  put_file /etc/systemd/system/router-fw-expire.timer "co minutę: wygasanie blokad doraźnych" <<'EOF'
+[Unit]
+Description=Router: co minutę zdejmij wygasłe blokady doraźne firewalla
+Documentation=file:/opt/router/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable router-fw.service router-fw-check.timer router-fw-expire.timer >/dev/null 2>&1 \
+    || warn "nie włączono jednostek router-fw"
+  systemctl start router-fw-check.timer router-fw-expire.timer >/dev/null 2>&1 || true
+  if vppctl show version >/dev/null 2>&1; then
+    systemctl start router-fw.service || warn "router-fw.service nie wystartował — journalctl -u router-fw"
+  else
+    warn "VPP nie odpowiada — reguły firewalla zostaną wgrane przy starcie VPP (router-fw.service)"
+  fi
+  systemd-analyze verify /etc/systemd/system/router-fw.service /etc/systemd/system/router-fw-check.timer \
+    /etc/systemd/system/router-fw-expire.timer 2>&1 | sed 's/^/    /' || true
+  man_add service router-fw.service "odtwarza reguły firewalla po starcie VPP (przed BIRD)"
+  man_add service router-fw-check.timer "co 5 min: rozjazd VPP vs firewall.conf → %FW-4-DRIFT"
+  man_add service router-fw-expire.timer "co 1 min: wygasanie blokad doraźnych (router-fw block)"
+  ok "firewall: edytuj /etc/router/firewall.conf, potem: router-fw check / diff / apply"
+}
+
+guard_example_conf() {
+  cat <<'EOF'
+# /etc/router/synack-guard.conf — ochrona przed odbiciami SYN-ACK / RST / UDP (polecenie router-guard)
+# Włączanie na żądanie:  router-guard on <prefiks|IP|grupa> [--enforce] [--for 2h]
+#                        router-guard status | enforce | monitor | off
+# Wymaga wtyczki VPP synack_guard (budowana razem z VPP, etap 10) i R630 widzącego oba kierunki ruchu.
+#
+# Interfejsy VPP: uplinki (tu sprawdzamy SYN-ACK) i strona klientów (tu zapisujemy SYN). Rozłączne.
+#in-if    hu0.100 hu0.200
+#out-if   hu0.300
+#
+# Grupy prefiksów do wywołań "router-guard on web"
+#group web      203.0.113.0/24
+#group hosting  198.51.100.0/24  2001:db8:100::/48
+#
+# Parametry (wartości domyślne)
+#ttl            60        # sekundy ważności wpisu TCP
+#udp-ttl        30        # sekundy ważności wpisu UDP
+#warmup         60        # monitor przed przejściem na enforce (tablica uczy się wychodzących SYN)
+#max-on         6h        # automatyczne wyłączenie
+#default-mode   monitor   # monitor | enforce (po "on" bez opcji)
+#tcp-rst        pass      # pass | handshake (RST przechodzi tylko jako odpowiedź na SYN z chronionego prefiksu)
+#udp            on        # filtr UDP z portów amplifikacji
+#udp-ports      19 53 111 123 137 161 389 1900 3702 5353 11211
+#udp-frags      pass      # pass | drop (niepierwsze fragmenty UDP)
+#check-isn      on        # numer potwierdzenia SYN-ACK musi być ISN+1
+#table-v4       4000000   # rozmiary tablic stanów (zmiana tylko przy wyłączonej ochronie)
+#table-v6       1000000
+#alarm-pps      10000     # %GUARD-4-VIOLATIONS powyżej tylu naruszeń na sekundę
+EOF
+}
+
+st_guard() {
+  mkdir -p /var/lib/router /var/log/router-monitor
+  prog_router_guard | put_file /opt/router/bin/router-guard "ochrona przed odbiciami SYN-ACK/RST/UDP (wtyczka VPP synack_guard): włączanie na żądanie" 755
+  ln -sfn /opt/router/bin/router-guard /usr/local/sbin/router-guard
+  man_add file /usr/local/sbin/router-guard "polecenie router-guard (on / off / status / enforce / monitor)"
+  if [[ -f /etc/router/synack-guard.conf ]]; then
+    say "zostawiam istniejący /etc/router/synack-guard.conf"
+  else
+    guard_example_conf | put_file /etc/router/synack-guard.conf "ochrona przed odbiciami: interfejsy, grupy prefiksów, parametry (domyślnie wszystko w komentarzach)" 644
+  fi
+  put_file /etc/systemd/system/router-guard.service "odtworzenie ochrony przed odbiciami po każdym starcie VPP (jeśli była włączona)" <<'EOF'
+[Unit]
+Description=Router: odtworzenie ochrony synack-guard po starcie VPP
+Documentation=file:/opt/router/README.md
+BindsTo=vpp.service
+After=vpp.service netns-dataplane.service router-ifaces.service router-fw.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/router/bin/router-guard boot
+TimeoutStartSec=300
+SuccessExitStatus=3
+EOF
+  printf '[Unit]\nWants=router-guard.service\n' \
+    | put_file /etc/systemd/system/vpp.service.d/60-guard.conf "start VPP (także automatyczny restart) odtwarza ochronę synack-guard"
+  printf '[Unit]\nWants=router-guard.service\nAfter=router-guard.service\n' \
+    | put_file /etc/systemd/system/router.target.d/20-guard.conf "router.target obejmuje router-guard.service"
+  put_file /etc/systemd/system/router-guard-check.service "kontrola zgodności VPP z router-guard, alarmy (naruszenia, zapełnienie tablic)" <<'EOF'
+[Unit]
+Description=Router: kontrola synack-guard (rozjazd, naruszenia, zapełnienie tablic)
+Documentation=file:/opt/router/README.md
+After=router-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/bin/router-guard check --log
+SuccessExitStatus=1 2 3
+EOF
+  put_file /etc/systemd/system/router-guard-check.timer "co minutę: kontrola synack-guard" <<'EOF'
+[Unit]
+Description=Router: co minutę kontrola synack-guard
+Documentation=file:/opt/router/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  put_file /etc/systemd/system/router-guard-expire.service "wyłączenie ochrony po upływie czasu, przejście na enforce po rozgrzewce" <<'EOF'
+[Unit]
+Description=Router: synack-guard — wygasanie ochrony i przejście na enforce
+Documentation=file:/opt/router/README.md
+After=router-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/bin/router-guard expire
+SuccessExitStatus=1 2 3 4
+EOF
+  put_file /etc/systemd/system/router-guard-expire.timer "co minutę: wygasanie ochrony synack-guard" <<'EOF'
+[Unit]
+Description=Router: co minutę wygaś ochronę synack-guard po upływie czasu
+Documentation=file:/opt/router/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable router-guard.service router-guard-check.timer router-guard-expire.timer >/dev/null 2>&1 \
+    || warn "nie włączono jednostek router-guard"
+  systemctl start router-guard-check.timer router-guard-expire.timer >/dev/null 2>&1 || true
+  if vppctl show synack-guard >/dev/null 2>&1 && ! vppctl show synack-guard 2>&1 | grep -q 'unknown input'; then
+    systemctl start router-guard.service || warn "router-guard.service nie wystartował — journalctl -u router-guard"
+    ok "wtyczka synack_guard załadowana w VPP"
+  else
+    warn "wtyczka synack_guard nie jest załadowana w VPP — wejdzie w życie po przebudowie VPP (install-router.sh --from 10) i restarcie VPP"
+  fi
+  systemd-analyze verify /etc/systemd/system/router-guard.service /etc/systemd/system/router-guard-check.timer \
+    /etc/systemd/system/router-guard-expire.timer 2>&1 | sed 's/^/    /' || true
+  man_add service router-guard.service "odtwarza ochronę synack-guard po starcie VPP (jeśli była włączona)"
+  man_add service router-guard-check.timer "co 1 min: rozjazd, naruszenia, zapełnienie tablic synack-guard"
+  man_add service router-guard-expire.timer "co 1 min: wygasanie ochrony i przejście na enforce"
+  ok "ochrona przed odbiciami: uzupełnij /etc/router/synack-guard.conf, potem: router-guard on <prefiks> [--enforce]"
+}
+
 st_docs() {
   local bu; bu=$(bird_unit)
   local ifn=() i
@@ -3826,6 +7439,8 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/opt/router/bin/router-bootcheck` | kontrola po starcie systemu, wykrywanie nieczystego restartu |
 | `/opt/router/bin/router-notify` | wysyłka alarmów e-mailem (SMTP) |
 | `/opt/router/bin/smartd-alert` | alarm z smartd (zdrowie dysków) |
+| `/opt/router/bin/router-fw` | firewall tranzytu VPP (`router-fw check / diff / apply / block / counters`), konfiguracja `/etc/router/firewall.conf` |
+| `/opt/router/bin/router-guard` | ochrona przed odbiciami SYN-ACK/RST/UDP w VPP (`router-guard on / off / status / enforce`), konfiguracja `/etc/router/synack-guard.conf` |
 | `/opt/router/bin/router-fw-update` | ręczna aktualizacja firmware karty (`router-fw-update`) |
 | `/opt/router/bin/router-ifaces` | interfejsy z `ifaces.conf` (`router-ifaces`, rozdział 10) |
 | `/opt/router/vpp-snmp-agent/` | agent SNMP dla VPP |
@@ -3964,7 +7579,7 @@ SMTP_SECURITY=starttls        # starttls (587) | ssl (465) | none (25)
 SMTP_USER=router@firma.pl
 SMTP_PASS="hasło"
 SMTP_FROM=router@firma.pl
-MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES OTHER"
+MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"
 MAIL_SEND_CLEAR=yes           # yes = wysyłaj też zakończenia zdarzeń (np. LOAD_NORMAL z czasem trwania)
 MAIL_MAX_SEV=5                # wysyłane poziomy 1..5
 MAIL_MIN_INTERVAL=60          # zdarzenia w ciągu 60 s idą jednym mailem
@@ -3988,6 +7603,7 @@ Zmiany działają w ciągu 5 sekund (bez restartu). Test: `router-notify test`. 
 | `VPP_LOAD` | `%VPP-4-LOAD_HIGH`, `%VPP-2-LOAD_CRITICAL` |
 | `VPP_PUNT` | `%VPP-4-PUNT_HIGH` |
 | `SYS_CPU` | `%SYS-4-CPU_HIGH` |
+| `FIREWALL` | `%FW-5-APPLIED`, `%FW-4-DRIFT`, `%FW-2-CONFIG_ERROR`, `%FW-5-BLOCK` (rozdział 10a) |
 | `IFACES` | `%IFACE-5-CONFIG_APPLIED`, `%IFACE-4-DRIFT`, `%IFACE-2-CONFIG_ERROR`, `%IFACE-3-APPLY_FAIL` (rozdział 10) |
 | `STATS` | `%VPP-6-STATS` co minutę — zwykle nie chcesz tego mailem |
 | `OTHER` | wszystko, co nie pasuje do powyższych |
@@ -4101,6 +7717,69 @@ Uwagi:
 - LibreNMS grupuje porty według początku opisu: `Transit:`, `Peering:`, `Core:`, `Cust:` (menu Ports → Transit/Peering/Core/Customers).
 - Adres na loopbacku nadaje się na router-id BGP i na adres, pod którym LibreNMS odpytuje SNMP. SSH działa w domyślnej przestrzeni (eth2), więc na adresy w VPP na razie nie odpowiada.
 - **MTU**: wszystkie porty i VLAN-y mają standardowe MTU Ethernet **1500**. VPP ustawia je na portach raz, przy starcie, zanim port zostanie podniesiony (`/etc/vpp/bootstrap.vpp`); VLAN-y i interfejsy w Linuksie dziedziczą je od portu. `router-ifaces` nigdy nie zmienia MTU, a wpis `mtu=` w pliku jest błędem.
+
+---
+
+## 10a. Firewall tranzytu (`router-fw`)
+
+`router-fw` steruje filtrami ruchu **przechodzącego** przez router (ACL w VPP, tryb bezstanowy). Ruchu **do samego routera** (BGP, BFD, SNMP, ICMP) nie dotyka — to zadanie netfiltera w netns `dataplane`. SSH przez eth2 jest poza VPP, więc błąd w regułach nie odetnie dostępu do routera.
+
+Reguły są w `/etc/router/firewall.conf` (w etckeeper). Strefa to nazwa nadana interfejsom, a kierunek mówi, czy reguła dotyczy ruchu wchodzącego z interfejsów strefy (`internet->`) czy wychodzącego do nich (`->internet`). Pierwsza pasująca reguła wygrywa, więc wyjątki (whitelist) stoją nad blokadą; co nie pasuje do żadnej reguły, przechodzi.
+
+```
+zone  hu0.100  internet                       # Transit: EPIX
+zone  hu0.300  clients                        # Core: BNG
+list  smtp-ok  203.0.113.25/32  203.0.113.26/32
+->internet    permit  tcp  @smtp-ok  any  any  25     serwery poczty klientów
+->internet    deny    tcp  any       any  any  25     blokada SMTP od klientów
+internet->    deny    any  @bogony   any  any  any    bogony z internetu
+internet->    deny    tcp  any       any  any  445    SMB z internetu
+```
+
+```
+router-fw check                  # składnia, reguły zacienione, ostrzeżenia o BGP/BFD, rozjazd VPP
+router-fw diff                   # co zmieni apply
+router-fw apply                  # wdrożenie na żywo (różnicowo, bez restartu VPP)
+router-fw apply --confirm 120    # j.w., ale zmiana wraca po 120 s, jeśli nie wpiszesz: router-fw confirm
+router-fw block 198.51.100.7 2h  # blokada doraźna (źródło) w strefie "internet"; bez czasu = bezterminowo
+router-fw unblock 198.51.100.7   # zdjęcie blokady;  router-fw blocks = lista
+router-fw counters [-w]          # liczniki trafień każdej reguły: pakiety, bajty, pkt/s;  counters clear = zerowanie
+```
+
+Reguły wracają same po każdym starcie VPP (`router-fw.service`, przed BIRD). Gdy `firewall.conf` ma błąd, po starcie używana jest ostatnia poprawna wersja (`/var/lib/router/fw.last-good.conf`). Wygasłe blokady zdejmuje co minutę `router-fw-expire.timer`, a rozjazd VPP względem pliku wykrywa co 5 minut `router-fw-check.timer`.
+
+| Zdarzenie w logu | Znaczenie |
+|---|---|
+| `%FW-5-APPLIED` | reguły zastosowane (lista zmian) |
+| `%FW-2-CONFIG_ERROR` | błędy w `firewall.conf` (po starcie: użyto ostatniej poprawnej wersji) |
+| `%FW-3-APPLY_FAIL` | VPP odrzucił polecenie; szczegóły w `/var/log/router-monitor/router-fw.log` |
+| `%FW-4-DRIFT` / `%FW-5-DRIFT_END` | VPP różni się od pliku (np. ręczna zmiana) / znów zgodny |
+| `%FW-5-BLOCK`, `%FW-5-UNBLOCK`, `%FW-5-BLOCK_EXPIRED` | blokady doraźne |
+| `%FW-4-ROLLBACK` | `apply --confirm` nie został potwierdzony, przywrócono poprzednią wersję |
+
+`block`, `unblock` i wygasanie blokad wgrywają **ostatnio zastosowaną** konfigurację (`fw.last-good.conf`) razem z blokadami — niezatwierdzona edycja `firewall.conf` nie wchodzi w życie przy okazji blokady. `apply --confirm` bez `confirm` (albo restart VPP w trakcie oczekiwania) przywraca poprzednią wersję także w pliku `firewall.conf`; odrzucona wersja zostaje w `/var/lib/router/fw.rejected.conf`. Listy z `include` są zapisywane w `last-good` w postaci rozwiniętej, więc cofnięcie nie zależy od późniejszych zmian w plikach list.
+
+Liczniki działają, gdy w pliku jest `set counters on` (domyślnie); VPP zeruje liczniki listy ACL przy każdej zmianie jej reguł. Alarmy e-mail: kategoria `FIREWALL` w `router-notify` (na routerach zainstalowanych wcześniej dopisz ją do `MAIL_SEND` w `/etc/router/notify.conf`; do tego czasu zdarzenia `%FW-` trafiają do kategorii `OTHER`).
+
+---
+
+## 10b. Ochrona przed odbiciami (`router-guard`)
+
+`router-guard` włącza na żądanie, dla wskazanych prefiksów lub adresów, filtr w VPP (wtyczka `synack_guard`, DPDK), który odrzuca „odpowiedzi bez pytania” przychodzące z internetu: **SYN-ACK** (opcjonalnie **RST**) bez SYN wysłanego z chronionego prefiksu oraz **UDP ze źródłowych portów amplifikacji** (DNS, NTP, CLDAP, SSDP, memcached…) bez wcześniejszego pakietu UDP do takiego portu. Nowe połączenia przychodzące (sam SYN), ACK i dane TCP nie są filtrowane, więc P2P, gry, VoIP, VPN i serwery działają normalnie. Poza włączoną ochroną filtr nie jest w ścieżce pakietów i nie kosztuje nic.
+
+Warunek: R630 musi widzieć oba kierunki połączeń chronionego prefiksu (SYN wychodzący i odpowiedź wracająca). Dlatego zawsze zaczynaj od trybu monitor.
+
+```
+router-guard on 203.0.113.0/24 --monitor        # uczenie i liczenie, nic nie jest odrzucane (domyślnie)
+router-guard status                             # naruszenia przy normalnym ruchu powinny być bliskie zeru
+router-guard enforce                            # odrzucaj (albo od razu: on ... --enforce = monitor 60 s, potem enforce)
+router-guard on web --enforce --for 2h          # grupa z pliku, automatyczne wyłączenie po 2 h
+router-guard off 203.0.113.0/24                 # zdejmij jeden prefiks;  router-guard off = wszystko
+```
+
+Konfiguracja w osobnym pliku `/etc/router/synack-guard.conf` (interfejsy uplinków `in-if` i strony klientów `out-if`, grupy prefiksów, TTL, `tcp-rst`, `udp-ports`, `udp-frags`, rozmiary tablic). Stan włączenia przeżywa restart VPP (`router-guard.service`: po starcie monitor, po rozgrzewce enforce). Zdarzenia: `%GUARD-5-ON/OFF/MODE/EXPIRED`, `%GUARD-4-VIOLATIONS` (naruszeń na sekundę ponad `alarm-pps`), `%GUARD-4-DRIFT`, `%GUARD-2-TABLE_FULL` (tablica zapełniona: automatyczny powrót do monitora). Liczniki: `router-guard status` albo `vppctl show errors` (węzły `synack-guard-*`).
+
+Wtyczka jest budowana razem z VPP (etap 10). Na routerze zainstalowanym wcześniej wymaga `install-router.sh --from 10` (30–60 min) i restartu VPP; do tego czasu `router-guard` zgłasza, że wtyczka nie jest załadowana. Odpowiedź na atak większy niż pojemność łączy upstreamowych to nadal RTBH lub Flowspec u upstreamów.
 
 ---
 
@@ -4329,6 +8008,8 @@ run_stage 19 "Usługi i autostart (router.target)"     st_services
 FROM_STAGE=20
 run_stage 20 "Dokumentacja (/opt/router)"             st_docs
 run_stage 21 "Raport instalacji"                      st_report
+run_stage 22 "Firewall tranzytu (router-fw)"          st_fw
+run_stage 23 "Ochrona przed odbiciami (router-guard)"  st_guard
 
 printf '\n%s[%s] INSTALACJA ZAKOŃCZONA.%s\n' "$c_ok" "$(now)" "$c_off"
 cat <<EOF
