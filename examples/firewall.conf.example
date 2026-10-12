@@ -1,26 +1,117 @@
 # /etc/router/firewall.conf — przykład (router-fw). Skopiuj fragmenty, które potrzebujesz.
 # Po edycji:  router-fw check  →  router-fw diff  →  router-fw apply   (apply --confirm 120 = cofnięcie bez potwierdzenia)
-# Ruchu DO routera (BGP, BFD, SNMP, ICMP) ten plik nie dotyczy — to zadanie netfiltera w netns dataplane.
+# Firewall po instalacji jest NIEAKTYWNY. Po dopasowaniu pliku i udanym apply/confirm: router-fw enable (na stałe).
+# Ten plik jest do ruchu PRZECHODZĄCEGO (tranzyt). Reguły widzą też pakiety do adresów routera, ale ochrona samego
+# routera (SSH, SNMP, loop0) jest w iptables: /etc/iptables/dataplane.rules.v4 — nie blokuj tu portów 22/161/179.
+#
+# ZASADA DOMYŚLNA: na końcu KAŻDEJ listy reguł jest zawsze "przepuść resztę" (permit, IPv4 i IPv6) — nie da się
+# tego zmienić. Firewall działa jak czarna lista: wpisujesz, co blokować (deny), wszystko inne przechodzi.
+# "permit" piszesz tylko jako wyjątek NAD blokadą. Interfejs bez żadnych reguł (swoich ani strefy) nie ma
+# w ogóle ACL — ruch przez niego przechodzi bez filtra. W "router-fw counters" widać to jako
+# "Domyślnie: przepuść resztę".
 
-# --- strefy: każdy filtrowany interfejs VPP (porty i VLAN-y z ifaces.conf) ---
+# ============================================================ STREFY
+# każdy filtrowany interfejs VPP (porty i VLAN-y z ifaces.conf)
 zone  hu0.100  internet     # Transit: EPIX
 zone  hu0.200  internet     # Transit: Upstream-2
 zone  hu0.300  clients      # Core: BNG
 
-# --- listy nazwane (@nazwa w regułach); długie listy w osobnym pliku ---
-list  smtp-ok   203.0.113.25/32  203.0.113.26/32            # serwery poczty klientów z prawem do portu 25
-list  bogony    10.0.0.0/8  172.16.0.0/12  192.168.0.0/16  100.64.0.0/10  169.254.0.0/16  127.0.0.0/8
-#list bogony    include /etc/router/fw-lists/bogony.list
+# ============================================================ LISTY ADRESÓW (@nazwa w regułach)
+# nagłówek: list NAZWA "opis";  pod nim adresy we WCIĘTYCH liniach, komentarz po # opisuje adres
+list smtp-ok  "Serwery poczty klientów z prawem do portu 25"
+    203.0.113.25/32     # klient A — mail.klient-a.pl
+    203.0.113.26/32     # klient B — mx.klient-b.pl
 
-# --- ruch klientów do internetu ---
-# kierunek     akcja   proto  src       sport  dst   dport  opis
-->internet     permit  tcp    @smtp-ok  any    any   25     serwery poczty klientów (whitelist)
-->internet     deny    tcp    any       any    any   25     blokada SMTP od klientów
+list bogony  "Bogony – adresy nieroutowalne (anty-spoofing)"
+    10.0.0.0/8          # RFC1918
+    172.16.0.0/12       # RFC1918
+    192.168.0.0/16      # RFC1918
+    100.64.0.0/10       # CGNAT (RFC6598)
+    169.254.0.0/16      # link-local
+    127.0.0.0/8         # loopback
+#   include /etc/router/fw-lists/bogony-extra.list    # długą listę można trzymać w osobnym pliku
 
-# --- ruch z internetu ---
-internet->     deny    any    @bogony   any    any   any    bogony z internetu (anty-spoofing)
-internet->     deny    tcp    any       any    any   445    SMB z internetu
-internet->     deny    tcp    any       any    any   23     telnet z internetu
-internet->     deny    any    198.51.100.7/32  any  203.0.113.50/32  any   para src+dst
+# --- nasze prefiksy (BCP38: tylko z tych adresów klienci mogą wysyłać ruch do internetu) ---
+list blokowe  "BLOKOWE"
+    46.45.64.0/18
+
+list infotech  "INFOTECH"
+    188.212.135.0/24
+    5.253.206.0/24
+
+list grs  "GRS"
+    195.62.40.0/23
+    195.66.144.0/23
+
+list nortis  "NORTIS (prefix_trans_nortis z BIRD; '+' = z podsieciami — dla źródła pakietu to to samo)"
+    91.196.108.0/22
+    176.97.48.0/21
+    194.116.166.0/24
+    185.140.100.0/22
+    193.32.36.0/24
+    91.240.106.0/23
+    91.233.136.0/22
+    88.220.168.0/23
+    195.136.104.0/22
+    45.128.108.0/22
+    195.136.104.0/24    # zawiera się w 195.136.104.0/22 (zostawione jak w BIRD)
+    91.239.114.0/23
+    91.239.113.0/24
+    185.139.124.0/22
+    185.16.32.0/22
+    195.136.10.0/24
+    192.166.255.0/24
+    185.228.57.0/24
+    46.245.232.0/24
+    185.144.174.0/23
+
+list nasze  "Wszystkie nasze prefiksy (BLOKOWE, INFOTECH, GRS, NORTIS)"
+    @blokowe
+    @infotech
+    @grs
+    @nortis
+
+list prywatne  "Adresy prywatne infrastruktury (łącza z BNG, zarządzanie)"
+    10.0.0.0/8
+    172.16.0.0/12
+    192.168.0.0/16
+    100.64.0.0/10
+
+# ============================================================ BCP38: ŹRÓDŁA OD KLIENTÓW
+# Ruch wchodzący od klientów (clients->) przechodzi tylko z naszych prefiksów. Wyjątki: infrastruktura na adresach
+# prywatnych (BGP z BNG, monitoring) do adresów prywatnych i do naszych prefiksów (np. loop0). Reszta IPv4 — DROP.
+# IPv6 nie jest tu filtrowane (dst 0.0.0.0/0 = tylko IPv4) — dopisz prefiksy IPv6, zanim zrobisz to samo dla v6.
+# kierunek     akcja   proto  src        sport  dst          dport  "opis reguły" (widać w router-fw show i counters)
+clients->      permit  any    @nasze     any    any          any    "BCP38: nasze prefiksy"
+clients->      permit  any    @prywatne  any    @prywatne    any    "Infrastruktura: prywatne do prywatnych (BGP z BNG)"
+clients->      permit  any    @prywatne  any    @nasze       any    "Infrastruktura: prywatne do naszych adresów (loop0, monitoring)"
+clients->      deny    any    any        any    0.0.0.0/0    any    "BCP38: obce źródła IPv4 od klientów (spoofing)"
+
+# ============================================================ RUCH KLIENTÓW DO INTERNETU
+->internet     permit  tcp    @smtp-ok  any    any   25                 "SMTP: wyjątek dla serwerów poczty klientów"
+->internet     deny    tcp    any       any    any   25                 "SMTP od klientów (spam)"
+->internet     deny    tcp    any       any    any   135,137-139,445    "SMB/NetBIOS od klientów"
+->internet     deny    udp    any       any    any   135,137-139,445    "SMB/NetBIOS od klientów (UDP)"
+
+# ============================================================ RUCH Z INTERNETU
+internet->     deny    any    @bogony   any    any   any                "Anty-spoofing: bogony z internetu"
+internet->     deny    any    @nasze    any    any   any                "Anty-spoofing: nasze adresy jako źródło z zewnątrz"
+internet->     deny    tcp    any       any    any   135,137-139,445    "SMB/NetBIOS z internetu"
+internet->     deny    udp    any       any    any   135,137-139,445    "SMB/NetBIOS z internetu (UDP)"
+internet->     deny    tcp    any       any    any   0                  "Port 0 (TCP)"
+internet->     deny    udp    any       any    any   0                  "Port 0 (UDP)"
+internet->     deny    udp    any       any    any   17,19,1900,11211   "Amplifikatory u klientów (qotd, chargen, SSDP, memcached)"
+internet->     deny    tcp    any       any    any   23,2323            "Telnet z internetu (botnety IoT)"
+#internet->     deny    any    198.51.100.7/32  any  203.0.113.50/32  any   "Atak na klienta X (para src+dst)"
+
+# ============================================================ REGUŁY DLA JEDNEGO INTERFEJSU
+# Zamiast strefy wpisujesz nazwę interfejsu (musi być w linii zone). Reguła działa TYLKO na tym interfejsie.
+# Nie trzeba dopisywać "permit" dla reszty ruchu — wszystko, czego nic nie zablokowało, przechodzi (na końcu
+# każdej listy jest "przepuść resztę"). Kolejność sprawdzania na hu0.200:
+#   blokady doraźne → reguły hu0.200 → reguły strefy internet → przepuść resztę   (wygrywa pierwsza pasująca)
+# Poniżej: 1) NTP blokujemy tylko na Upstream-2 (na EPIX NTP przechodzi),
+#          2) partner z 198.51.100.0/24 może SMB przez Upstream-2, mimo że strefa internet blokuje SMB (port 445).
+#hu0.200->      deny    udp    any       any    any   123    "Blokada NTP (tylko na Upstream-2)"
+#hu0.200->      permit  tcp    198.51.100.0/24  any  any  445  "Wyjątek SMB dla partnera na Upstream-2"
 
 set  counters  on

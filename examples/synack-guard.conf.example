@@ -22,6 +22,8 @@ udp            on        # filtr UDP ze źródłowych portów amplifikacji
 udp-ports      19 53 111 123 137 161 389 1900 3702 5353 11211
 udp-frags      pass      # pass | drop — niepierwsze fragmenty UDP do chronionych prefiksów
 check-isn      on        # numer potwierdzenia SYN-ACK musi być ISN+1
+reply-rst      off       # on = na odrzucany SYN-ACK bez pasującego SYN odpowiadaj RST do nadawcy (tylko enforce)
+reply-rst-pps  10000     # limit wysyłanych RST na sekundę (łącznie); ponad limit — sam drop
 table-v4       4000000   # rozmiary tablic stanów (zmiana tylko przy wyłączonej ochronie)
 table-v6       1000000
 alarm-pps      10000     # %GUARD-4-VIOLATIONS powyżej tylu naruszeń na sekundę

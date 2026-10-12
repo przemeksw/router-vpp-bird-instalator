@@ -10,3 +10,4 @@ Pełny projekt: `docs/superpowers/specs/2026-10-12-synack-guard-design.md`. Plan
 - **Warunek:** R630 widzi oba kierunki połączeń chronionego prefiksu.
 - **Poza zakresem:** ACK i dane TCP poza sesją (pełne śledzenie), nowe SYN do adresów niebędących serwerami (osobne zadanie w `router-fw`), ruch do samego routera.
 - **Nie zweryfikowane na prawdziwym VPP:** cały moduł C (brak VPP na maszynie deweloperskiej) — patrz `docs/synack-guard-lab-checklist.md`.
+- Opcja `reply-rst` (domyślnie off): w enforce odrzucany SYN-ACK bez pasującego SYN jest przerabiany w miejscu na RST (`gc_make_rst`, seq = ACK z SYN-ACK) i wysyłany przez `ip4-lookup`/`ip6-lookup`; nigdy dla złego ISN, RST i UDP. Limit `reply-rst-pps` jako kubełek żetonów na wątek (`gc_rl_take`, limit / liczba workerów). Liczniki: RST sent, RST would be sent (monitor), RST rate limited.

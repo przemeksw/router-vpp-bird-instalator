@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,123 @@ def use_root(root):
 def parse(text):
     conf, errs = fw.parse_conf(text)
     return conf, errs
+
+
+MULTI = """\
+zone hu0.100 internet
+zone hu0.300 clients
+list bogony "Bogony – adresy nieroutowalne"
+    10.0.0.0/8          # sieć prywatna A
+    # komentarz w środku listy
+    192.168.0.0/16      # sieć prywatna C
+list smtp-ok 203.0.113.25/32   # serwery poczty klientów
+internet-> deny any @bogony any any any "Anty-spoofing: bogony z internetu, bardzo długi opis który się nie mieści w 60 znakach"
+->internet permit tcp @smtp-ok any any 25 "SMTP: wyjątek dla serwerów poczty"
+"""
+
+
+class TestReadableFormat(unittest.TestCase):
+    def test_example_file_parses_and_has_bcp38(self):
+        with open(os.path.join(HERE, "..", "examples", "firewall.conf.example")) as f:
+            conf, errs = parse(f.read())
+        self.assertEqual(errs, [])
+        self.assertEqual(len(conf.lists["nasze"]), 25)                  # BLOKOWE + INFOTECH + GRS + NORTIS
+        groups = fw.build_groups(conf)
+        last = [f for f in groups["clients:in"].flat if f.parent != "default"][-1]
+        self.assertEqual((last.action, str(last.dst)), ("deny", "0.0.0.0/0"))   # BCP38: obce źródła IPv4 — DROP
+        self.assertEqual(fw.analyze(conf), [])
+
+    def test_multiline_list_with_notes_and_description(self):
+        conf, errs = parse(MULTI)
+        self.assertEqual(errs, [])
+        self.assertEqual([str(n) for n in conf.lists["bogony"]], ["10.0.0.0/8", "192.168.0.0/16"])
+        self.assertEqual(conf.list_desc["bogony"], "Bogony – adresy nieroutowalne")
+        self.assertEqual(conf.list_desc["smtp-ok"], "serwery poczty klientów")
+        self.assertEqual(conf.notes["10.0.0.0/8"], "sieć prywatna A")
+        self.assertEqual(conf.notes["192.168.0.0/16"], "sieć prywatna C")
+
+    def test_quoted_rule_description(self):
+        conf, errs = parse(MULTI)
+        self.assertEqual(errs, [])
+        self.assertTrue(conf.rules[0].desc.startswith("Anty-spoofing: bogony"))
+        self.assertEqual(conf.rules[1].desc, "SMTP: wyjątek dla serwerów poczty")
+
+    def test_indented_line_outside_list_is_error(self):
+        _c, errs = parse("zone hu0.100 internet\n    10.0.0.0/8\n")
+        self.assertTrue(errs and "linia 2" in errs[0], errs)
+
+    def test_list_ends_at_next_keyword(self):
+        conf, errs = parse("list a\n    10.0.0.0/8\nlist b\n    10.1.0.0/16\n")
+        self.assertEqual(errs, [])
+        self.assertEqual(([str(n) for n in conf.lists["a"]], [str(n) for n in conf.lists["b"]]),
+                         (["10.0.0.0/8"], ["10.1.0.0/16"]))
+
+    def test_empty_multiline_list_is_error(self):
+        _c, errs = parse("list a \"pusta\"\nzone hu0.100 internet\n")
+        self.assertTrue(errs, errs)
+
+    def test_freeze_keeps_line_numbers_and_expands_include(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(d + "/etc/router/fw-lists")
+            with open(d + "/etc/router/fw-lists/x.list", "w") as f:
+                f.write("198.51.100.0/24\n")
+            saved = fw.ROOT
+            fw.ROOT = d
+            try:
+                text = MULTI.replace("    # komentarz w środku listy\n",
+                                     "    include /etc/router/fw-lists/x.list   # z pliku\n")
+                conf, errs = parse(text)
+                self.assertEqual(errs, [])
+                frozen = fw.freeze(text, conf)
+            finally:
+                fw.ROOT = saved
+            self.assertEqual(len(frozen.splitlines()), len(text.splitlines()))
+            self.assertNotIn("include", frozen)
+            conf2, errs2 = parse(frozen)
+            self.assertEqual(errs2, [])
+            self.assertEqual(conf2.lists, conf.lists)
+            self.assertEqual([r.lineno for r in conf2.rules], [r.lineno for r in conf.rules])
+            self.assertEqual(conf2.notes["10.0.0.0/8"], "sieć prywatna A")
+        finally:
+            shutil.rmtree(d)
+
+
+IFRULES = """\
+zone hu0.100 internet
+zone hu0.200 internet
+zone hu0.300 clients
+internet-> deny tcp any any any 445 "SMB z internetu"
+hu0.200-> deny udp any any any 123 "Blokada NTP (tylko na Upstream-2)"
+hu0.200-> permit tcp 198.51.100.0/24 any any 445 "wyjątek SMB dla partnera na Upstream-2"
+"""
+
+
+class TestInterfaceRules(unittest.TestCase):
+    def test_parse_interface_direction(self):
+        conf, errs = parse(IFRULES)
+        self.assertEqual(errs, [])
+        self.assertEqual([r.direction for r in conf.rules],
+                         [("internet", "in"), ("hu0.200", "in"), ("hu0.200", "in")])
+
+    def test_interface_without_zone_is_error(self):
+        _c, errs = parse("zone hu0.100 internet\nhu0.999-> deny tcp any any any 25 x\n")
+        self.assertTrue(any("hu0.999" in e for e in errs), errs)
+
+    def test_name_both_zone_and_interface_is_error(self):
+        _c, errs = parse("zone hu0 hu0\nhu0-> deny tcp any any any 25 x\n")
+        self.assertTrue(any("jednocześnie" in e for e in errs), errs)
+
+    def test_groups_interface_acl_has_own_rules_first_then_zone_rules(self):
+        conf, _e = parse(IFRULES)
+        groups = fw.build_groups(conf, [{"net": "203.0.113.9/32"}])
+        self.assertEqual(groups["internet:in"].ifaces, ["hu0.100"])
+        g = groups["iface=hu0.200:in"]
+        self.assertEqual(g.ifaces, ["hu0.200"])
+        self.assertEqual([f.parent for f in g.flat],
+                         ["block", 5, 5, 6, 4, 4, "default", "default"])
+        self.assertNotIn("iface=hu0.200:out", groups)
+        self.assertLessEqual(len(g.tag), 64)
 
 
 class Base(unittest.TestCase):
@@ -313,6 +431,8 @@ class Cli(Base):
         for name in ("hu0.100", "hu0.200", "hu0.300"):
             self.vpp("create sub-interfaces hu0 %s dot1q %s exact-match" % (name.split(".")[1], name.split(".")[1]))
         self.write_conf(SAMPLE)
+        with open(self.root + "/etc/router/firewall.enabled", "w") as f:   # większość testów: firewall aktywny
+            f.write("test\n")
 
     def write_conf(self, text):
         with open(self.root + "/etc/router/firewall.conf", "w") as f:
@@ -329,7 +449,7 @@ class Cli(Base):
 
     def log_text(self):
         try:
-            with open(self.root + "/var/log/router-monitor/router-monitor.log") as f:
+            with open(self.root + "/var/log/router/alarmy.log") as f:
                 return f.read()
         except OSError:
             return ""
@@ -600,6 +720,23 @@ class TestCounters(Cli):
         self.assertEqual(len(baseline), 1)          # zostały tylko liczniki niezmienionej listy internet:out
         self.assertTrue(list(baseline)[0].startswith("rfw:internet:out:"))
 
+    def test_counters_show_full_description_and_list_entries(self):
+        self.write_conf(MULTI)
+        self.fw("apply", "-y")
+        # internet:in = bogony v4 (10/8, 192.168/16), domyślne v4, v6;  internet:out = smtp v4, domyślne
+        self.stats({"0": [[12000, 1200000], [345, 34500], [1, 1], [0, 0]], "1": [[7, 700], [0, 0], [0, 0]]})
+        rc, out = self.fw("counters")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Anty-spoofing: bogony z internetu, bardzo długi opis", out)
+        self.assertIn("12 345", out)
+        self.assertNotIn("sieć prywatna A", out)
+        rc, out = self.fw("counters", "-v")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("10.0.0.0/8", out)
+        self.assertIn("sieć prywatna A", out)
+        self.assertIn("12 000", out)
+        self.assertIn("sieć prywatna C", out)
+
     def test_counters_when_acl_missing_in_vpp(self):
         self.fw("apply", "-y")
         os.remove(self.root + "/vpp.json")
@@ -631,6 +768,129 @@ class TestCounters(Cli):
             self.assertIn("1 000", buf.getvalue())
         finally:
             fw.STATS_JSON = ""
+
+
+class TestInterfaceRulesApply(Cli):
+    def bound(self):
+        os.environ["FAKEVPP_STATE"] = self.env["FAKEVPP_STATE"]
+        saved, fw.VPPCTL = fw.VPPCTL, self.env["ROUTER_FW_VPPCTL"]
+        try:
+            act = fw.read_vpp()
+        finally:
+            fw.VPPCTL = saved
+        names = {idx: key for key, (idx, _t) in act.acls.items()}
+        return {k: [names.get(i, i) for i in v] for k, v in act.binds.items()}
+
+    def test_apply_binds_interface_acl_instead_of_zone_acl(self):
+        self.write_conf(IFRULES)
+        rc, out = self.fw("apply", "-y")
+        self.assertEqual(rc, 0, out)
+        b = self.bound()
+        self.assertEqual(b[("hu0.100", "in")], ["internet:in"])
+        self.assertEqual(b[("hu0.200", "in")], ["iface=hu0.200:in"])
+        self.assertEqual(self.fw("check")[0], 0)
+        rc, out = self.fw("show")
+        self.assertIn("Blokada NTP (tylko na Upstream-2)", out)
+
+    def test_removing_interface_rules_returns_to_zone_acl(self):
+        self.write_conf(IFRULES)
+        self.fw("apply", "-y")
+        self.write_conf("\n".join(IFRULES.splitlines()[:4]) + "\n")
+        rc, out = self.fw("apply", "-y")
+        self.assertEqual(rc, 0, out)
+        b = self.bound()
+        self.assertEqual(b[("hu0.200", "in")], ["internet:in"])
+        self.assertNotIn("iface=hu0.200:in", self.bound().get(("hu0.100", "in"), []))
+        self.assertNotIn("iface=hu0.200", self.vpp("show acl-plugin acl"))
+
+    def test_block_applies_to_interface_acl_too(self):
+        self.write_conf(IFRULES)
+        self.fw("apply", "-y")
+        self.assertEqual(self.fw("block", "203.0.113.9")[0], 0)
+        acl = self.vpp("show acl-plugin acl")
+        self.assertEqual(acl.count("203.0.113.9"), 2)          # internet:in i iface=hu0.200:in
+
+    def test_counters_header_names_interface(self):
+        self.write_conf(IFRULES)
+        self.fw("apply", "-y")
+        self.stats({})
+        rc, out = self.fw("counters")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("hu0.200->", out)
+        self.assertIn("Blokada NTP (tylko na Upstream-2)", out)
+
+
+class TestEnableDisable(Cli):
+    def setUp(self):
+        super().setUp()
+        os.remove(self.root + "/etc/router/firewall.enabled")      # świeża instalacja: nieaktywny
+
+    def flag(self):
+        return os.path.exists(self.root + "/etc/router/firewall.enabled")
+
+    def test_fresh_install_is_inactive_and_apply_says_so(self):
+        self.assertFalse(self.flag())
+        rc, out = self.fw("apply", "-y")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("router-fw enable", out)                        # podpowiedź: aktywacja na stałe
+        self.assertIn("NIEAKTYWNY", self.fw("show")[1])
+
+    def test_enable_requires_successful_apply(self):
+        rc, out = self.fw("enable")
+        self.assertEqual(rc, 2, out)
+        self.assertFalse(self.flag())
+
+    def test_enable_after_apply(self):
+        self.fw("apply", "-y")
+        rc, out = self.fw("enable")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.flag())
+        self.assertIn("%FW-5-ENABLED", self.log_text())
+        self.assertIn("AKTYWNY NA STAŁE", self.fw("show")[1])
+        self.assertNotIn("router-fw enable", self.fw("apply", "-y")[1])
+
+    def test_enable_refuses_unconfirmed_change(self):
+        self.fw("apply", "-y")
+        with open(self.root + "/var/lib/router/fw.pending.json", "w") as f:
+            f.write("{}")
+        rc, out = self.fw("enable")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("confirm", out)
+
+    def test_block_refused_when_firewall_inactive(self):
+        self.fw("apply", "-y")
+        rc, out = self.fw("block", "198.51.100.7", "2h")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("router-fw enable", out)
+        self.assertNotIn("198.51.100.7", self.vpp("show acl-plugin acl"))
+
+    def test_block_refused_without_internet_zone(self):
+        self.write_conf("zone hu0.300 clients\nclients-> deny tcp any any any 25 x\n")
+        self.fw("apply", "-y")
+        self.fw("enable")
+        rc, out = self.fw("block", "198.51.100.7")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("internet", out)
+
+    def test_block_bad_address_is_clear_error(self):
+        self.fw("apply", "-y")
+        self.fw("enable")
+        rc, out = self.fw("block", "46.45.782", "2h")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("46.45.782", out)
+
+    def test_disable_removes_rules_from_vpp(self):
+        self.fw("apply", "-y")
+        self.fw("enable")
+        self.assertIn("rfw:", self.vpp("show acl-plugin acl"))
+        rc, out = self.fw("disable", "-y")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.flag())
+        self.assertNotIn("rfw:", self.vpp("show acl-plugin acl"))
+        self.assertIn("%FW-5-DISABLED", self.log_text())
+        rc, out = self.fw("check")
+        self.assertEqual(rc, 0, out)                                     # wyłączony firewall to nie rozjazd
+        self.assertIn("nieaktywny", out)
 
 
 class TestReviewFixes(Cli):
@@ -875,7 +1135,7 @@ class TestReviewFixes(Cli):
         self.stats({"0": [[3, 30]] * 6, "1": [[4, 40]] * 6})          # VPP wystartował od zera
         rc, out = self.fw("counters")
         self.assertEqual(rc, 0, out)
-        self.assertNotIn(" -", out)
+        self.assertNotRegex(out, r"\s-\d")          # żadnych ujemnych liczb
 
     def test_expired_block_awaiting_expire_is_not_drift(self):
         self.fw("apply", "-y")

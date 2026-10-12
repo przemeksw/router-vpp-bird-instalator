@@ -303,6 +303,124 @@ test_prefixes_v6 (void)
   gc_pset6_free (&s);
 }
 
+/* niezależne liczenie sumy kontrolnej (RFC 1071) do sprawdzenia pakietów RST */
+static uint16_t
+ref_csum (const uint8_t *a, size_t n, uint32_t sum)
+{
+  for (size_t i = 0; i + 1 < n; i += 2) sum += (uint32_t) (a[i] << 8 | a[i + 1]);
+  if (n & 1) sum += (uint32_t) a[n - 1] << 8;
+  while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+  return (uint16_t) sum;
+}
+
+static int
+tcp_csum_ok (const uint8_t *ip, int v6)
+{
+  uint32_t ps = 0;
+  const uint8_t *t;
+  if (v6)
+    {
+      for (int i = 8; i < 40; i += 2) ps += (uint32_t) (ip[i] << 8 | ip[i + 1]);
+      ps += 20 + 6; t = ip + 40;
+    }
+  else
+    {
+      for (int i = 12; i < 20; i += 2) ps += (uint32_t) (ip[i] << 8 | ip[i + 1]);
+      ps += 20 + 6; t = ip + 20;
+    }
+  return ref_csum (t, 20, ps) == 0xffff;
+}
+
+static void
+test_reply_rst_decision (void)
+{
+  gc_cfg_t c; gc_pkt_t p; uint8_t b[128]; size_t n;
+  default_cfg (&c);
+  CHECK (c.reply_rst == 0 && c.reply_rst_pps == 10000);          /* domyślnie wyłączone */
+  n = mk4_tcp (b, IP (8, 8, 8, 8), IP (203, 0, 113, 5), 80, 40000, SYN | ACK, 7, 1001, 5);
+  gc_classify_v4 (b, (uint32_t) n, &p);
+  CHECK (!gc_want_rst (&p, &c, GC_V_NO_FLOW));
+  c.reply_rst = 1;
+  CHECK (gc_want_rst (&p, &c, GC_V_NO_FLOW));
+  CHECK (!gc_want_rst (&p, &c, GC_V_BAD_ISN));                   /* zły ISN: nigdy RST */
+  CHECK (!gc_want_rst (&p, &c, GC_V_PASS));
+  n = mk4_tcp (b, IP (8, 8, 8, 8), IP (203, 0, 113, 5), 80, 40000, RST | ACK, 7, 1001, 5);
+  gc_classify_v4 (b, (uint32_t) n, &p);
+  CHECK (!gc_want_rst (&p, &c, GC_V_NO_FLOW));                   /* na RST nie odpowiadamy */
+  n = mk4_udp (b, IP (8, 8, 8, 8), IP (203, 0, 113, 5), 53, 40000);
+  gc_classify_v4 (b, (uint32_t) n, &p);
+  CHECK (!gc_want_rst (&p, &c, GC_V_NO_FLOW));                   /* ani na UDP */
+}
+
+static void
+test_rate_limit (void)
+{
+  gc_rl_t rl; memset (&rl, 0, sizeof rl);
+  int got = 0;
+  for (int i = 0; i < 1000; i++) got += gc_rl_take (&rl, 10.0, 100.0);
+  CHECK (got == 100);                                            /* zapas = 1 s limitu */
+  got = 0;
+  for (int i = 0; i < 1000; i++) got += gc_rl_take (&rl, 10.5, 100.0);
+  CHECK (got == 50);                                             /* po 0,5 s dochodzi 50 */
+  got = 0;
+  for (int i = 0; i < 1000; i++) got += gc_rl_take (&rl, 100.0, 100.0);
+  CHECK (got == 100);                                            /* zapas nie rośnie ponad limit */
+  CHECK (gc_rl_take (&rl, 200.0, 0.0) == 0);                     /* limit 0 = nic */
+}
+
+static void
+test_make_rst_v4 (void)
+{
+  uint8_t b[128]; gc_pkt_t p;
+  size_t n = mk4_tcp (b, IP (8, 8, 8, 8), IP (203, 0, 113, 5), 443, 40000, SYN | ACK, 7, 0x12345678, 6);
+  n += 8;                                                        /* opcje IP (ihl=6) i 8 bajtów „opcji TCP” */
+  gc_classify_v4 (b, (uint32_t) n, &p);
+  uint32_t len = gc_make_rst (b, (uint32_t) n, &p);
+  CHECK (len == 40);
+  CHECK (b[0] == 0x45 && gc_be16 (b + 2) == 40 && b[8] == 64 && b[9] == 6);
+  CHECK (gc_be32 (b + 12) == IP (203, 0, 113, 5) && gc_be32 (b + 16) == IP (8, 8, 8, 8));
+  CHECK (ref_csum (b, 20, 0) == 0xffff);                         /* suma nagłówka IPv4 */
+  CHECK (gc_be16 (b + 20) == 40000 && gc_be16 (b + 22) == 443);
+  CHECK (gc_be32 (b + 24) == 0x12345678 && gc_be32 (b + 28) == 0); /* seq = ack z SYN-ACK, bez ACK */
+  CHECK (b[32] == 0x50 && b[33] == RST && gc_be16 (b + 34) == 0);
+  CHECK (tcp_csum_ok (b, 0));
+  CHECK (gc_make_rst (b, 39, &p) == 0);                          /* za krótki bufor */
+}
+
+static void
+test_make_rst_v6 (void)
+{
+  uint8_t b[128]; gc_pkt_t p;
+  size_t n = mk6 (b, 6, 443, 40000, SYN | ACK, 7, 0xdeadbeef);
+  gc_classify_v6 (b, (uint32_t) n, &p);
+  uint32_t len = gc_make_rst (b, (uint32_t) n, &p);
+  CHECK (len == 60);
+  CHECK ((b[0] >> 4) == 6 && gc_be16 (b + 4) == 20 && b[6] == 6 && b[7] == 64);
+  CHECK (b[23] == 2 && b[39] == 1);                              /* adresy zamienione */
+  CHECK (gc_be16 (b + 40) == 40000 && gc_be16 (b + 42) == 443 && gc_be32 (b + 44) == 0xdeadbeef);
+  CHECK (b[53] == RST);
+  CHECK (tcp_csum_ok (b, 1));
+}
+
+static void
+test_event_ring (void)
+{
+  gc_evring_t r; memset (&r, 0, sizeof r);
+  gc_pkt_t p; uint8_t b[128];
+  size_t n = mk4_tcp (b, IP (8, 8, 8, 8), IP (203, 0, 113, 5), 443, 40000, SYN | ACK, 7, 1001, 5);
+  gc_classify_v4 (b, (uint32_t) n, &p);
+  for (int i = 0; i < GC_EV_RING + 10; i++)
+    gc_evring_push (&r, &p, GC_V_NO_FLOW, GC_ACT_DROP, (double) i);
+  CHECK (r.n == GC_EV_RING);                                     /* pełny pierścień, nie rośnie */
+  const gc_ev_t *last = &r.ev[(r.head + GC_EV_RING - 1) % GC_EV_RING];
+  CHECK (last->t == (double) (GC_EV_RING + 9));                  /* najnowszy */
+  CHECK (last->sport == 443 && last->dport == 40000 && last->cls == GC_TCP_SYNACK);
+  CHECK (last->verdict == GC_V_NO_FLOW && last->action == GC_ACT_DROP && !last->is_v6);
+  CHECK (memcmp (last->src, p.src, 16) == 0 && memcmp (last->dst, p.dst, 16) == 0);
+  const gc_ev_t *oldest = &r.ev[r.head];
+  CHECK (oldest->t == 10.0);                                     /* najstarsze nadpisane */
+}
+
 int
 main (void)
 {
@@ -314,6 +432,11 @@ main (void)
   test_ports ();
   test_prefixes_v4 ();
   test_prefixes_v6 ();
+  test_reply_rst_decision ();
+  test_rate_limit ();
+  test_make_rst_v4 ();
+  test_make_rst_v6 ();
+  test_event_ring ();
   printf ("Wynik guard-core: %d OK, %d błędów\n", checks - failures, failures);
   return failures != 0;
 }

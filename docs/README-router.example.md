@@ -8,7 +8,7 @@ Szybki stan routera w każdej chwili:
 ```
 router-check                      # pełna kontrola: usługi, VPP, BIRD, SNMP, RAID, ostatnie alarmy
 systemctl status router.target    # wszystkie usługi routera naraz
-tail -f /var/log/router-monitor/router-monitor.log   # alarmy na żywo
+tail -f /var/log/router/alarmy.log   # alarmy na żywo
 ```
 
 ---
@@ -123,7 +123,7 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo |
 | `/var/lib/router/` | znaczniki czystego wyłączenia (wykrywanie awarii), stan `router-ifaces` (`ifaces.state.json`, `ifaces.last-good.conf`) |
 | `/var/spool/router-notify/` | kolejka alarmów do wysłania e-mailem |
-| `/var/log/router-monitor/` | logi alarmów (60 dni, rotacja dzienna) |
+| `/var/log/router/` | logi alarmów (60 dni, rotacja dzienna) |
 | `/root/router_install_data/` | źródła, paczki .deb, logi instalacji, kopie oryginałów, `MANIFEST.txt` |
 
 Pełna lista każdego zapisanego pliku, usługi i pakietu: `/root/router_install_data/MANIFEST.txt`.
@@ -134,8 +134,8 @@ Pełna lista każdego zapisanego pliku, usługi i pakietu: `/root/router_install
 
 | Co | Gdzie |
 |---|---|
-| Alarmy routera (monitor, awarie usług, RAID, kontrola po starcie) | `/var/log/router-monitor/router-monitor.log` oraz syslog/journal, facility `local0` |
-| Zmiany interfejsów (każde polecenie vppctl z wynikiem) | `/var/log/router-monitor/router-ifaces.log` |
+| Alarmy routera (monitor, awarie usług, RAID, kontrola po starcie) | `/var/log/router/alarmy.log` oraz syslog/journal, facility `local0` |
+| Zmiany interfejsów (każde polecenie vppctl z wynikiem) | `/var/log/router/ifaces.log` |
 | VPP | `/var/log/vpp/vpp.log`, `journalctl -u vpp` |
 | BIRD | syslog (`journalctl -u bird`) |
 | Instalacja | `/root/router_install_data/logs/install.log` + osobny log każdego etapu |
@@ -400,7 +400,7 @@ Wykrywanie rozjazdu: co 5 minut `router-ifaces-check.timer` porównuje VPP z ost
 | `%IFACE-2-CONFIG_ERROR` | przy starcie plik miał błąd — użyto ostatniej poprawnej wersji |
 | `%IFACE-3-APPLY_FAIL`, `%IFACE-2-APPLY_FAIL` | części zmian nie dało się zastosować / VPP nie odpowiadał |
 
-Szczegóły każdej zmiany (polecenie vppctl i odpowiedź VPP): `/var/log/router-monitor/router-ifaces.log`. Historia samego pliku: etckeeper (`git -C /etc log -p router/ifaces.conf`).
+Szczegóły każdej zmiany (polecenie vppctl i odpowiedź VPP): `/var/log/router/ifaces.log`. Historia samego pliku: etckeeper (`git -C /etc log -p router/ifaces.conf`).
 
 Uwagi:
 

@@ -32,6 +32,11 @@ def add_if(st, name, mtu=9000):
 def add_lcp(st, name, host):
     st["lcp"][name] = host
     st["linux"][host] = st["linux"].get(host, "")
+    # jak prawdziwy kernel bez addr_gen_mode=none: Linux nadaje link-local, linux-cp przenosi go do VPP (IPv6 włączone)
+    ll = st.get("ll_default", True)
+    st.setdefault("ll", {})[host] = ll
+    if ll:
+        st["if"][name]["ip6"] = True
     st.setdefault("laddr", {})[host] = list(st["if"][name]["addrs"]) if st.get("lcp_sync", True) else []
 
 
@@ -65,6 +70,25 @@ def vppctl(cmd):
                 out += "%s (%s):\n" % (n, "up" if i["up"] else "dn")
                 for a in i["addrs"]:
                     out += "  L3 %s\n" % a
+        elif t[:2] == ["fake", "ll-default"]:   # tylko testy: netns z addr_gen_mode=1 (nowe interfejsy bez link-local)
+            st["ll_default"] = t[2] == "on"
+        elif cmd == "show ip6 interface":
+            for n, i in sorted(st["if"].items(), key=lambda x: x[1]["idx"]):
+                if i.get("ip6") or any(":" in a for a in i["addrs"]):
+                    out += "%s is admin %s\n  Link-local address(es):\n    fe80::1/64\n" % (n, "up" if i["up"] else "down")
+        elif t[:3] in (["enable", "ip6", "interface"], ["disable", "ip6", "interface"]):
+            if t[3] not in st["if"]:
+                raise ValueError("unknown interface")
+            i = st["if"][t[3]]
+            if t[0] == "disable" and not i.get("ip6") and not any(":" in a for a in i["addrs"]):
+                raise ValueError("Failed")
+            i["ip6"] = t[0] == "enable"
+        elif t[:2] == ["ip6", "nd"]:
+            if t[2] not in st["if"]:
+                raise ValueError("unknown input `%s'" % t[2])
+            if t[3:] != ["ra-suppress"]:
+                raise ValueError("unknown input `%s'" % " ".join(t[3:]))
+            st["if"][t[2]]["ra_suppress"] = True
         elif cmd == "show lcp":
             out = "lcp default netns dataplane\nlcp lcp-auto-subint on\nlcp lcp-sync on\n"
             for k, (n, h) in enumerate(st["lcp"].items()):
@@ -191,6 +215,14 @@ def vppctl(cmd):
                     continue
                 out += "sw_if_index %d:\n  input acl(s): %s\n  output acl(s): %s\n" % (
                     st["if"][n]["idx"], " ".join(map(str, b["input"])), " ".join(map(str, b["output"])))
+        elif t[:3] == ["show", "synack-guard", "events"] or t[:2] == ["fake", "guard-events"]:
+            g = st.setdefault("guard", {"mode": "off", "ifaces": {}, "prefixes": [], "config": {}, "used4": 0,
+                                        "used6": 0, "errors": {}})
+            if t[0] == "fake":
+                g["events"] = json.loads(cmd.split(None, 2)[2])
+            else:
+                n = int(t[4]) if t[3:4] == ["count"] else 30
+                out = "now: 1000.000\n" + "".join("event: %s\n" % e for e in g.get("events", [])[:n])
         elif t[:1] == ["synack-guard"] or cmd == "show synack-guard" or t[:2] == ["fake", "guard-errors"] \
                 or t[:2] == ["fake", "guard-used"]:
             if os.environ.get("FAKEVPP_NO_GUARD") and t[0] != "fake":
@@ -204,9 +236,11 @@ def vppctl(cmd):
             elif cmd == "show synack-guard":
                 c = g["config"]
                 out = "mode: %s\n" % g["mode"]
-                out += "config: ttl %s udp-ttl %s check-isn %s tcp-rst %s udp %s udp-frags %s udp-ports %s\n" % (
+                out += ("config: ttl %s udp-ttl %s check-isn %s tcp-rst %s udp %s udp-frags %s reply-rst %s "
+                        "reply-rst-pps %s udp-ports %s\n") % (
                     c.get("ttl", 60), c.get("udp-ttl", 30), c.get("check-isn", "on"), c.get("tcp-rst", "pass"),
-                    c.get("udp", "on"), c.get("udp-frags", "pass"), c.get("udp-ports", "53"))
+                    c.get("udp", "on"), c.get("udp-frags", "pass"), c.get("reply-rst", "off"),
+                    c.get("reply-rst-pps", 10000), c.get("udp-ports", "53"))
                 for n, d in sorted(g["ifaces"].items()):
                     out += "interface: %s %s\n" % (n, d)
                 for pf in sorted(g["prefixes"]):
@@ -271,7 +305,8 @@ def ipcmd(argv):
                 ip, pl = x.split("/")
                 ai.append({"family": "inet6" if ":" in ip else "inet", "local": ip, "prefixlen": int(pl),
                            "scope": "global"})
-            ai.append({"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"})
+            if st.get("ll", {}).get(h, True):
+                ai.append({"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"})
             out.append({"ifname": h, "addr_info": ai})
         print(json.dumps(out))
         return
@@ -293,6 +328,22 @@ def ipcmd(argv):
                 va.append(a[2])
             if a[1] == "del" and a[2] in va:
                 va.remove(a[2])
+        save(st)
+        return
+    if a[:3] == ["link", "set", "dev"] and a[4:5] == ["addrgenmode"] and a[5] in ("none", "eui64"):
+        if a[3] not in st["linux"]:
+            sys.exit("Cannot find device \"%s\"" % a[3])
+        if a[5] == "eui64":                 # kernel nadaje link-local, linux-cp włącza IPv6 w VPP
+            st.setdefault("ll", {})[a[3]] = True
+            for n, hh in st["lcp"].items():
+                if hh == a[3]:
+                    st["if"][n]["ip6"] = True
+        save(st)
+        return
+    if a[:3] == ["-6", "addr", "flush"] and a[3] == "dev" and a[5:] == ["scope", "link"]:
+        if a[4] not in st["linux"]:
+            sys.exit("Cannot find device \"%s\"" % a[4])
+        st.setdefault("ll", {})[a[4]] = False
         save(st)
         return
     if a[:3] == ["link", "set", "dev"] and a[4] == "alias":

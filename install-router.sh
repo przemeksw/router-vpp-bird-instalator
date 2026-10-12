@@ -50,7 +50,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.3.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.4.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -77,6 +77,22 @@ SMTP_PASS=""                   # hasło SMTP (trafi tylko do /etc/router/notify.
 SMTP_FROM=""                   # nadawca, np. router-lodz2@firma.pl
 MAIL_MAX_SEV=5                 # wysyłaj poziomy 1..N (1 = krytyczne ... 5 = zakończenia zdarzeń)
 MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"  # co wysyłać (router-notify categories)
+LOG_KEEP_DAYS=20               # logi w /var/log/router: rotacja codziennie, tyle dni wstecz
+# --- system: czas, DNS, ochrona CPU routera (iptables; etap 25) ---
+TIMEZONE="Europe/Warsaw"
+NTP_SERVERS="tempus1.gum.gov.pl tempus2.gum.gov.pl"   # GUM (194.146.251.100, .101); chrony, port zarządzający
+DNS_SERVERS="46.45.78.2 46.45.114.2 8.8.8.8"          # /etc/resolv.conf (także w netns dataplane)
+# Zaufane sieci: pełny dostęp do routera (SSH, SNMP, wszystko). Reszta świata: SSH i SNMP odrzucane.
+# Dotyczy portu zarządzającego (eth2) i adresów w VPP (netns dataplane: interfejsy, loop0). Format "prefiks|opis".
+TRUSTED_NETS=("10.0.0.0/8|LOCAL" "172.16.0.0/12|LOCAL" "192.168.0.0/16|LOCAL" "46.45.64.0/18|ALL BLOKOWE")
+TRUSTED_NETS6=()               # to samo dla IPv6, np. ("2001:db8::/32|ALL BLOKOWE"); puste = SSH/SNMP po IPv6 tylko z ::1
+PROTECT_PORTS="22,161"         # porty TCP i UDP odrzucane spoza zaufanych sieci
+ICMP_ECHO_PER_SRC=10           # ping do routera (kernel): najwyżej N/s z jednego adresu (zapas 2N), nadmiar odrzucany
+ICMP_ECHO_TOTAL=500            # ping do routera (kernel): łącznie N/s ze wszystkich adresów
+NEIGH_MAX=65536                # ARP / ND: najwięcej sąsiadów (osobno IPv4 i IPv6) — VPP i Linux
+NEIGH_AGE=14400                # VPP: po tylu s bez ARP/ND od sąsiada — zapytanie (3 próby), brak odpowiedzi = usunięcie.
+                               # 14400 s (4 h, jak Cisco): najmniej zapytań (IX /21 ≈ 0,1/s). Nowy MAC sąsiada router zna
+                               # od razu z GARP albo z jego ARP (BGP), więc dłuższy czas nie opóźnia sesji ani ruchu.
 MAIL_SEND_CLEAR=yes            # yes = wysyłaj też zakończenia zdarzeń (np. LOAD_NORMAL z czasem trwania)
 # --- iDRAC: odczyt ustawień BIOS do audytu (Redfish); puste = audyt wnioskuje z Linuksa ---
 IDRAC_HOST=""                  # adres iDRAC, np. 192.168.80.110
@@ -98,7 +114,7 @@ MAIN_LOG=$LOG_DIR/install.log
 MANIFEST=$DATA_DIR/MANIFEST.txt
 MAN_DB=$STATE_DIR/manifest.tsv
 ENV_FILE=$DATA_DIR/router-install.env
-TOTAL_STAGES=23
+TOTAL_STAGES=25
 
 MODE=install
 ASSUME_YES=0
@@ -290,7 +306,7 @@ BDF="$bdf"
 FWDIR="$fdir"
 MLXUP="\$FWDIR/mlxup"
 URLS=(${MLXUP_URLS[*]})
-LOG=/var/log/router-monitor/router-monitor.log
+LOG=/var/log/router/alarmy.log
 ONLINE=""; CHECK=0
 for a in "\$@"; do case \$a in --online) ONLINE=--online ;; --check) CHECK=1 ;; *) echo "nieznana opcja: \$a"; exit 2 ;; esac; done
 [[ \$EUID -eq 0 ]] || { echo "Uruchom jako root."; exit 1; }
@@ -339,8 +355,8 @@ else
   msg="%SYS-2-SERVICE_FAIL: $unit zakończył się nieoczekiwanie (result=$result code=$code status=$status) — automatyczny restart"
 fi
 logger -t router-alert -p local0.crit "$msg"
-mkdir -p /var/log/router-monitor
-printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router-monitor/router-monitor.log
+mkdir -p /var/log/router
+printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log
 /opt/router/bin/router-notify queue "$msg" >/dev/null 2>&1 || true
 EOF
 }
@@ -381,9 +397,9 @@ LASTGOOD = ROOT + "/var/lib/router/ifaces.last-good.conf"
 STATE = ROOT + "/var/lib/router/ifaces.state.json"
 SNMP_YAML = ROOT + "/etc/router/snmp-ifaces.yaml"
 ENVF = ROOT + "/etc/router/router.env"
-LOGDIR = ROOT + "/var/log/router-monitor"
-LOG = LOGDIR + "/router-ifaces.log"
-MONLOG = LOGDIR + "/router-monitor.log"
+LOGDIR = ROOT + "/var/log/router"
+LOG = LOGDIR + "/ifaces.log"
+MONLOG = LOGDIR + "/alarmy.log"
 LOCK = ROOT + "/run/router-ifaces.lock"
 NOTIFY = ROOT + "/opt/router/bin/router-notify"
 NETNS = "dataplane"
@@ -574,6 +590,10 @@ def parse_conf(text, phys=None):
                 elif n2 != e.name and a.network.overlaps(a2.network):
                     errs.append("podsieci nakładają się: %s (%s) i %s (%s) — VPP tego nie przyjmie"
                                 % (a, e.name, a2, n2))
+                elif a.network.overlaps(a2.network) and a.network.prefixlen != a2.network.prefixlen:
+                    # VPP: kilka adresów z jednej podsieci na interfejsie tylko przy tej samej masce
+                    errs.append("%s: %s i %s są w tej samej podsieci, ale mają różne maski — VPP tego nie przyjmie "
+                                "(użyj tej samej maski albo rozłącznych podsieci)" % (e.name, a2, a))
             seen.append((e.name, a))
     return ents, errs, warns
 
@@ -600,6 +620,8 @@ class Actual:
         self.lcp = {}      # nazwa VPP -> nazwa w Linuksie (netns dataplane)
         self.alias = {}    # nazwa w Linuksie -> ifalias
         self.laddrs = {}   # nazwa w Linuksie -> set(ip_interface) (adresy globalne)
+        self.ip6 = set()   # interfejsy VPP z włączonym IPv6 (show ip6 interface)
+        self.lll = set()   # interfejsy w Linuksie z adresem link-local IPv6
 
 
 def cli(cmd, timeout=15):
@@ -651,14 +673,21 @@ def read_vpp(with_alias=False):
                 st.lcp[t[2]] = t[4]
     except VppError:
         pass
+    try:
+        for line in cli("show ip6 interface").splitlines():
+            m = re.match(r"^(\S+) is admin (up|down)", line)
+            if m:
+                st.ip6.add(m.group(1))
+    except VppError:
+        pass
     if with_alias:
-        st.alias, st.laddrs = read_linux()
+        st.alias, st.laddrs, st.lll = read_linux()
     return st
 
 
 def read_linux():
     """Opisy i adresy interfejsów linux-cp w netns dataplane (to, co widzi BIRD)."""
-    alias, addrs = {}, {}
+    alias, addrs, lll = {}, {}, set()
     try:
         r = subprocess.run([IPCMD, "-n", NETNS, "-j", "link", "show"], capture_output=True, text=True, timeout=10)
         alias = {x["ifname"]: x.get("ifalias", "") for x in json.loads(r.stdout or "[]")}
@@ -666,6 +695,8 @@ def read_linux():
         for x in json.loads(r.stdout or "[]"):
             s = addrs.setdefault(x["ifname"], set())
             for a in x.get("addr_info", []):
+                if a.get("family") == "inet6" and a.get("scope") == "link":
+                    lll.add(x["ifname"])
                 if a.get("family") in ("inet", "inet6") and a.get("scope") == "global":
                     try:
                         s.add(ipaddress.ip_interface("%s/%s" % (a["local"], a["prefixlen"])))
@@ -673,7 +704,7 @@ def read_linux():
                         pass
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
-    return alias, addrs
+    return alias, addrs, lll
 
 
 def wait_vpp(phys_needed, timeout):
@@ -767,6 +798,9 @@ def plan(desired, act, managed, aliases=True):
             have = set() if new else act.addrs.get(e.name, set())
             for a in sorted(e.addrs - have, key=addr_key):
                 cmds.append(Cmd("+", "vpp", "set interface ip address %s %s" % (e.name, a)))
+            if any(a.version == 6 for a in e.addrs - have):
+                # VPP domyślnie nie wysyła RA; jawnie, żeby router nigdy nie adresował innych urządzeń w sieci
+                cmds.append(Cmd("+", "vpp", "ip6 nd %s ra-suppress" % e.name, "bez ogłoszeń RA"))
     # 5. Linux (netns dataplane): adresy i opisy — tylko dla istniejących par linux-cp.
     #    Adresy synchronizuje lcp-sync; tu tylko kontrola i dopięcie, gdy synchronizacja zawiodła
     #    (dopiero gdy VPP ma już właściwe adresy, żeby nie dublować pracy lcp-sync).
@@ -789,6 +823,26 @@ def plan(desired, act, managed, aliases=True):
                                     "brak adresu w Linuksie (BIRD go nie widzi)"))
             if act.alias.get(host, "") != e.desc:
                 cmds.append(Cmd("~", "ip", ["-n", NETNS, "link", "set", "dev", host, "alias", e.desc], "opis"))
+    # 6. IPv6 tylko tam, gdzie w pliku jest adres IPv6. Gdzie nie ma: Linux bez link-local (inaczej linux-cp
+    #    włącza IPv6 w VPP), a VPP z wyłączonym IPv6 — interfejs nie odpowiada na ND i nie bierze udziału w IPv6.
+    for e in ents:
+        if e.name not in act.ifaces:
+            continue
+        host = act.lcp.get(e.name)
+        if any(a.version == 6 for a in e.addrs):
+            # Linux potrzebuje link-local, żeby rozwiązywać sąsiadów IPv6 (ND) — inaczej BIRD nie zestawi sesji v6
+            if aliases and host and host in act.alias and host not in act.lll:
+                cmds.append(Cmd("+", "ip", ["-n", NETNS, "link", "set", "dev", host, "addrgenmode", "eui64"],
+                                "link-local IPv6 w Linuksie (ND, BGP po IPv6)"))
+            continue
+        if aliases and host and host in act.lll:
+            cmds.append(Cmd("-", "ip", ["-n", NETNS, "link", "set", "dev", host, "addrgenmode", "none"],
+                            "IPv6 wyłączone: brak adresu IPv6 w ifaces.conf"))
+            cmds.append(Cmd("-", "ip", ["-n", NETNS, "-6", "addr", "flush", "dev", host, "scope", "link"]))
+        # gdy w tym przebiegu znika ostatni adres IPv6, VPP może sam wyłączyć IPv6 — sprawdzi to następny przebieg
+        dropping_v6 = any(a.version == 6 for a in act.addrs.get(e.name, set()))
+        if e.name in act.ip6 and not dropping_v6:
+            cmds.append(Cmd("-", "vpp", "disable ip6 interface %s" % e.name, "IPv6 wyłączone: brak adresu IPv6 w ifaces.conf"))
     return cmds
 
 
@@ -1285,8 +1339,8 @@ name=$(basename "$md")
 state=$(grep -A1 "^$name " /proc/mdstat 2>/dev/null | grep -o '\[[U_]*\]' | tail -n1)
 msg="%MD-$sev-$(echo "$ev" | tr '[:lower:]' '[:upper:]'): $md ${dev:+dysk $dev }${state:+stan $state}"
 logger -t mdadm-alert -p "$prio" "$msg"
-mkdir -p /var/log/router-monitor
-printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router-monitor/router-monitor.log
+mkdir -p /var/log/router
+printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log
 [ "$sev" -le 5 ] && /opt/router/bin/router-notify queue "$msg" >/dev/null 2>&1
 exit 0
 EOF
@@ -1300,8 +1354,8 @@ t=$(echo "${SMARTD_FAILTYPE:-ALERT}" | tr '[:lower:]' '[:upper:]')
 sev=2; [ "$t" = "EMAILTEST" ] && sev=6
 msg="%SMART-$sev-$t: ${SMARTD_DEVICE:-?} ${SMARTD_MESSAGE:-}"
 logger -t smartd-alert -p local0.crit "$msg"
-mkdir -p /var/log/router-monitor
-printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router-monitor/router-monitor.log
+mkdir -p /var/log/router
+printf '%s %s\n' "$(date '+%F %T')" "$msg" >>/var/log/router/alarmy.log
 [ "$sev" -le 5 ] && /opt/router/bin/router-notify queue "$msg" >/dev/null 2>&1
 exit 0
 EOF
@@ -1325,7 +1379,7 @@ prog_router_monitor() {
 # Po ustąpieniu zdarzenia: *_NORMAL z czasem trwania i wartością szczytową.
 #
 # Logi: syslog/journal (tag router-monitor, facility local0)
-#       oraz /var/log/router-monitor/router-monitor.log
+#       oraz /var/log/router/alarmy.log
 # Bieżący stan: /run/router-monitor/state.json
 # Progi: /etc/router/router-monitor.conf
 # E-mail: zgłoszenia, eskalacje i zakończenia zdarzeń trafiają do kolejki router-notify
@@ -1357,7 +1411,7 @@ CFG = {
     "MD_EVERY": 10,         # s, kontrola /proc/mdstat
     "HANG_SECONDS": 30,     # s bez heartbeat VPP => %VPP-1-HANG
     "HANG_RESTART": 1,      # 1 = po HANG zrestartuj VPP
-    "LOGFILE": "/var/log/router-monitor/router-monitor.log",
+    "LOGFILE": "/var/log/router/alarmy.log",
     "STATEFILE": "/run/router-monitor/state.json",
     "ENVFILE": "/etc/router/router.env",
 }
@@ -1508,6 +1562,18 @@ def parse_mdstat(text):
 
 HW_IF = re.compile(r"^(\S+)\s+\d+\s+(up|down)\b")
 HW_X = re.compile(r"^\s+([A-Za-z0-9_\[\]]*(?:discard|out_of_buffer)[A-Za-z0-9_\[\]]*)\s+(\d+)\s*$")
+XS_PATH = re.compile(r"^/interfaces/([^/.]+)/((?!tx_)[A-Za-z0-9_\[\]]*(?:discard|out_of_buffer)[A-Za-z0-9_\[\]]*)$")
+
+
+def stats_xstats(stats, paths):
+    """Liczniki *discard*/*out_of_buffer* kart z segmentu statystyk (/interfaces/<port>/<xstat>) — bez vppctl.
+    VPP (dpdk-process) odświeża je sam co ok. 10 s; odczyt nie zatrzymuje workerów (bez bariery)."""
+    res = {}
+    for p in paths:
+        m = XS_PATH.match(p)
+        if m:
+            res[m.group(1)] = res.get(m.group(1), 0) + int(stats[p].sum())
+    return res
 
 
 def parse_hw_xstats(text):
@@ -1601,7 +1667,7 @@ def main():
     last_restart = 0.0
     hk_prev = read_proc_stat()
     hk_over = 0
-    xs_prev, xs_t = None, 0.0
+    xs_prev, xs_t, xs_paths = None, 0.0, None
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -1616,6 +1682,7 @@ def main():
                 stats = VPPStats(socketname="/run/vpp/stats.sock", timeout=2)
                 stats.connect()
                 prev = None
+                xs_paths = None
             hb = stats["/sys/heartbeat"]
             names = list(stats["/if/names"])
             vec = stats["/sys/vector_rate_per_worker"]
@@ -1709,9 +1776,14 @@ def main():
         # ---------------------------------------------------------- liczniki sprzętowe karty
         if CFG["XSTATS_EVERY"] > 0 and t0 - xs_t >= CFG["XSTATS_EVERY"] and not a_down.active:
             try:
-                out = subprocess.run(["vppctl", "show", "hardware-interfaces"], capture_output=True,
-                                     text=True, timeout=5).stdout
-                xs = parse_hw_xstats(out)
+                if stats is not None and xs_paths is None:
+                    xs_paths = [p for p in stats.ls(["^/interfaces/"]) if XS_PATH.match(p)]
+                if stats is not None and xs_paths:
+                    xs = stats_xstats(stats, xs_paths)
+                else:   # starszy VPP bez xstats w statystykach: vppctl (polecenie w barierze — rzadko)
+                    out = subprocess.run(["vppctl", "show", "hardware-interfaces"], capture_output=True,
+                                         text=True, timeout=5).stdout
+                    xs = parse_hw_xstats(out)
                 if xs_prev is not None:
                     dt = t0 - xs_t
                     rates = {k: max(0, v - xs_prev.get(k, v)) / dt for k, v in xs.items()}
@@ -1721,8 +1793,8 @@ def main():
                                   "karta odrzuca pakiety sprzętowo: %s (limit karty/PCIe lub przepełnienie)"
                                   % ", ".join("%s %s pkt/s" % (k, fmt_num(v)) for k, v in rates.items() if v > 0))
                 xs_prev, xs_t = xs, t0
-            except (OSError, subprocess.SubprocessError):
-                xs_t = t0
+            except Exception:      # noqa: BLE001 — restart VPP w trakcie: nazwy liczników odczytamy od nowa
+                xs_t, xs_paths = t0, None
 
         # ---------------------------------------------------------- rdzenie systemowe
         hk_now = read_proc_stat()
@@ -1823,7 +1895,7 @@ from email.utils import formatdate, make_msgid
 
 CONF = "/etc/router/notify.conf"
 SPOOL = "/var/spool/router-notify"
-LOGFILE = "/var/log/router-monitor/router-monitor.log"
+LOGFILE = "/var/log/router/alarmy.log"
 CFG = {
     "ALERT_EMAILS": "", "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls",
     "SMTP_USER": "", "SMTP_PASS": "", "SMTP_FROM": "",
@@ -1972,7 +2044,7 @@ def body_for(events, extra=""):
         lines += ["", extra]
     lines += ["",
               "Stan routera:    router-check",
-              "Alarmy na żywo:  tail -f /var/log/router-monitor/router-monitor.log",
+              "Alarmy na żywo:  tail -f /var/log/router/alarmy.log",
               "Opis komunikatów: /opt/router/README.md (rozdział 5)"]
     return "\n".join(lines) + "\n"
 
@@ -2087,12 +2159,12 @@ prog_router_bootcheck() {
 #   * wykrywa, że poprzedni start nie zakończył się normalnym wyłączeniem
 #     (kernel panic, watchdog, zanik zasilania) i czy zachował się zapis paniki (pstore),
 #   * czeka do 3 minut, aż usługi routera wstaną, sprawdza porty VPP i BIRD,
-#   * wynik: /var/log/router-monitor/router-monitor.log, syslog (local0) i e-mail.
+#   * wynik: /var/log/router/alarmy.log, syslog (local0) i e-mail.
 # Przy zamykaniu systemu (ExecStop) wołany z --shutdown: zapisuje znacznik czystego wyłączenia.
 STATE=/var/lib/router
-LOG=/var/log/router-monitor/router-monitor.log
+LOG=/var/log/router/alarmy.log
 UNITS="netns-dataplane vpp router-ifaces @@BIRDUNIT@@ snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify"
-mkdir -p "$STATE" /var/log/router-monitor
+mkdir -p "$STATE" /var/log/router
 report() {
   logger -t router-bootcheck -p "$1" "$2"
   printf '%s %s\n' "$(date '+%F %T')" "$2" >>"$LOG"
@@ -2147,8 +2219,10 @@ prog_router_fw() {
   router-fw confirm                    potwierdź zmianę z "apply --confirm"
   router-fw block IP [czas]            blokada doraźna (czas: 30m, 2h, 1d; bez czasu = bezterminowo)
   router-fw unblock IP                 zdejmij blokadę;  router-fw blocks = lista blokad
-  router-fw counters [-w]              liczniki trafień reguł (pakiety, bajty, pkt/s);  counters clear = zerowanie
-  router-fw boot                       (systemd) po starcie VPP odtwórz reguły
+  router-fw counters [-w] [-v]         liczniki trafień reguł z opisami (-v: także każdy adres z list);  counters clear = zerowanie
+  router-fw enable                     aktywuj na stałe: reguły wracają po każdym restarcie (po apply + confirm)
+  router-fw disable [-y]               dezaktywuj: zdejmij reguły z VPP, po restarcie firewall nie wraca
+  router-fw boot                       (systemd) po starcie VPP odtwórz reguły — tylko gdy aktywowany (enable)
   router-fw expire                     (systemd, timer) zdejmij wygasłe blokady
 
 Plik firewall.conf jest jedynym źródłem prawdy dla stref i reguł. Reguły działają tylko na ruch
@@ -2165,6 +2239,7 @@ import re
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 
 ROOT = os.environ.get("ROUTER_FW_ROOT", "")      # tylko do testów
@@ -2175,9 +2250,10 @@ REJECTED = ROOT + "/var/lib/router/fw.rejected.conf"
 STATE = ROOT + "/var/lib/router/fw.state.json"
 BLOCKS = ROOT + "/var/lib/router/fw-blocks.json"
 PENDING = ROOT + "/var/lib/router/fw.pending.json"
-LOGDIR = ROOT + "/var/log/router-monitor"
-LOG = LOGDIR + "/router-fw.log"
-MONLOG = LOGDIR + "/router-monitor.log"
+ENABLED = ROOT + "/etc/router/firewall.enabled"   # jest = firewall aktywny na stałe (router-fw.service: ConditionPathExists)
+LOGDIR = ROOT + "/var/log/router"
+LOG = LOGDIR + "/firewall.log"
+MONLOG = LOGDIR + "/alarmy.log"
 LOCK = ROOT + "/run/router-fw.lock"
 NOTIFY = ROOT + "/opt/router/bin/router-notify"
 SELF = "/opt/router/bin/router-fw"
@@ -2250,7 +2326,7 @@ IDENT = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 IFNAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 PROTOS = {"any": None, "tcp": 6, "udp": 17, "icmp": 1, "icmp6": 58}
 ANY = {4: ipaddress.ip_network("0.0.0.0/0"), 6: ipaddress.ip_network("::/0")}
-DIRECTION_RE = re.compile(r"^(?:([A-Za-z0-9_-]+)->|->([A-Za-z0-9_-]+))$")
+DIRECTION_RE = re.compile(r"^(?:([A-Za-z0-9_.-]+)->|->([A-Za-z0-9_.-]+))$")   # strefa albo interfejs
 
 
 class Rule:
@@ -2266,6 +2342,9 @@ class Conf:
         self.lists = {}                  # nazwa -> [ip_network]
         self.rules = []                  # [Rule] w kolejności z pliku
         self.settings = {"counters": "on"}
+        self.list_desc = {}              # nazwa listy -> opis
+        self.notes = {}                  # "adres/maska" -> komentarz z linii listy
+        self.list_lines = {}             # nr linii listy -> adresy z tej linii (include rozwinięty; dla freeze)
 
 
 def parse_ports(tok):
@@ -2326,22 +2405,64 @@ def parse_rule(t, comment):
         raise ValueError("za mało kolumn (kierunek akcja proto src sport dst dport [opis]): %s" % " ".join(t))
     m = DIRECTION_RE.match(t[0])
     if not m:
-        raise ValueError("zły kierunek '%s' (np. internet-> albo ->internet)" % t[0])
+        raise ValueError("zły kierunek '%s' (np. internet-> albo ->internet; interfejs: hu0.200->)" % t[0])
     direction = (m.group(1), "in") if m.group(1) else (m.group(2), "out")
     if t[1] not in ("permit", "deny"):
         raise ValueError("akcja musi być permit albo deny, jest '%s'" % t[1])
     if t[2] not in PROTOS:
         raise ValueError("nieznany protokół '%s' (tcp, udp, icmp, icmp6, any)" % t[2])
-    return direction, t[1], PROTOS[t[2]], t[3], t[4], t[5], t[6], (t[7] if len(t) == 8 else comment.strip())
+    desc = t[7].strip() if len(t) == 8 else comment.strip()
+    if len(desc) >= 2 and desc[0] == desc[-1] == '"':
+        desc = desc[1:-1].strip()
+    return direction, t[1], PROTOS[t[2]], t[3], t[4], t[5], t[6], desc
+
+
+LIST_HEAD = re.compile(r'^list\s+(\S+)(?:\s+"([^"]*)")?(.*)$')
+
+
+def list_items(conf, name, items, no, note):
+    """Adresy z jednej linii listy (nagłówek albo wcięta linia) -> dopisuje do listy, zapamiętuje komentarze."""
+    k, nets = 0, []
+    while k < len(items):
+        if items[k] == "include":
+            if k + 1 >= len(items):
+                raise ValueError("include wymaga ścieżki")
+            nets.extend(read_list_file(items[k + 1]))
+            k += 2
+        else:
+            got = parse_addrs(items[k], conf.lists)
+            nets.extend(got)
+            if note and not items[k].startswith("@"):
+                for n in got:
+                    conf.notes.setdefault(str(n), note)
+            k += 1
+    conf.lists[name].extend(nets)
+    conf.list_lines[no] = nets
 
 
 def parse_conf(text):
-    """Zwraca (Conf, błędy). Błąd w pliku = nic nie zostanie zastosowane."""
+    """Zwraca (Conf, błędy). Błąd w pliku = nic nie zostanie zastosowane.
+
+    Lista może mieć dalszy ciąg w kolejnych WCIĘTYCH liniach (jeden lub kilka adresów na linię, komentarz
+    po # opisuje adresy z tej linii). Lista kończy się na pierwszej niewciętej linii z poleceniem."""
     conf, errs = Conf(), []
+    cur = None                                     # nazwa listy, do której należą wcięte linie
     for no, raw in enumerate(text.splitlines(), 1):
         parts = re.split(r"\s#", raw.strip(), maxsplit=1)
-        body, comment = parts[0].strip(), (parts[1] if len(parts) > 1 else "")
+        body, comment = parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
         if not body or body.startswith("#"):
+            continue
+        try:
+            if raw[:1] in (" ", "\t"):
+                if cur is None:
+                    raise ValueError("wcięta linia poza listą (dalszy ciąg listy musi być zaraz pod 'list NAZWA')")
+                list_items(conf, cur, body.split(), no, comment)
+                continue
+            if cur is not None and not conf.lists[cur]:
+                errs.append("lista '%s' jest pusta" % cur)
+            cur = None
+        except ValueError as ex:
+            errs.append("linia %d: %s" % (no, ex))
             continue
         t = body.split(None, 7)
         try:
@@ -2355,19 +2476,17 @@ def parse_conf(text):
                     raise ValueError("interfejs %s ma już strefę %s" % (t[1], conf.zones[t[1]]))
                 conf.zones[t[1]] = t[2]
             elif kw == "list":
-                if len(t) < 3 or not IDENT.match(t[1]):
-                    raise ValueError("składnia: list NAZWA adres... | include /ścieżka")
-                items, k, nets = body.split()[2:], 0, []
-                while k < len(items):
-                    if items[k] == "include":
-                        if k + 1 >= len(items):
-                            raise ValueError("include wymaga ścieżki")
-                        nets.extend(read_list_file(items[k + 1]))
-                        k += 2
-                    else:
-                        nets.extend(parse_addrs(items[k], conf.lists))
-                        k += 1
-                conf.lists[t[1]] = nets
+                m = LIST_HEAD.match(body)
+                if not m or not IDENT.match(m.group(1)):
+                    raise ValueError('składnia: list NAZWA ["opis"] [adres... | include /ścieżka], '
+                                     'dalsze adresy w wciętych liniach')
+                name, desc, rest = m.group(1), m.group(2), m.group(3).split()
+                if name in conf.lists:
+                    raise ValueError("lista '%s' jest już zdefiniowana" % name)
+                conf.lists[name] = []
+                conf.list_desc[name] = (desc if desc is not None else comment).strip()
+                list_items(conf, name, rest, no, "" if desc is None else comment)
+                cur = name
             elif kw == "set":
                 if len(t) != 3 or t[1] != "counters" or t[2] not in ("on", "off"):
                     raise ValueError("znane ustawienie: set counters on|off")
@@ -2383,10 +2502,15 @@ def parse_conf(text):
                 conf.rules.append(r)
         except ValueError as ex:
             errs.append("linia %d: %s" % (no, ex))
+    if cur is not None and not conf.lists[cur]:
+        errs.append("lista '%s' jest pusta" % cur)
     zones = set(conf.zones.values())
+    for name in sorted(zones & set(conf.zones)):
+        errs.append("'%s' jest jednocześnie nazwą strefy i interfejsu — zmień nazwę strefy" % name)
     for r in conf.rules:
-        if r.direction[0] not in zones:
-            errs.append("linia %d: strefa '%s' nie ma żadnego interfejsu (zone ...)" % (r.lineno, r.direction[0]))
+        if r.direction[0] not in zones and r.direction[0] not in conf.zones:
+            errs.append("linia %d: '%s' to ani strefa, ani interfejs z linii zone (reguła dla interfejsu wymaga, "
+                        "żeby interfejs był w jakiejś strefie)" % (r.lineno, r.direction[0]))
     return conf, errs
 
 # --------------------------------------------------------------------------- reguła -> reguły ACL VPP
@@ -2425,10 +2549,12 @@ def flatten(rule):
 
 # --------------------------------------------------------------------------- kompilacja reguł do ACL VPP
 class Group:
-    """Jedna lista ACL w VPP: strefa + kierunek (in = wejście na interfejsach strefy, out = wyjście)."""
-    def __init__(self, zone, direction, ifaces, flat):
-        self.zone, self.dir, self.ifaces, self.flat = zone, direction, ifaces, flat
-        self.key = "%s:%s" % (zone, direction)
+    """Jedna lista ACL w VPP: strefa + kierunek (in = wejście na interfejsach strefy, out = wyjście).
+    Interfejs z własnymi regułami dostaje osobną listę (klucz iface=NAZWA:kier): jego reguły, potem reguły strefy."""
+    def __init__(self, zone, direction, ifaces, flat, iface=None):
+        self.zone, self.dir, self.ifaces, self.flat, self.iface = zone, direction, ifaces, flat, iface
+        self.name = iface or zone
+        self.key = "%s:%s" % ("iface=" + iface if iface else zone, direction)
         self.texts = [f.text() for f in flat]
         self.sha = hashlib.sha256("\n".join(self.texts).encode()).hexdigest()[:8]
         self.tag = "%s:%s:%s" % (TAG_PREFIX, self.key, self.sha)     # sha w tagu = wykrywanie zmiany treści
@@ -2439,25 +2565,39 @@ class Group:
 
 
 def build_groups(conf, blocks=()):
-    """Conf + blokady doraźne -> {klucz: Group}. Blokady wchodzą na początek listy internet:in."""
+    """Conf + blokady doraźne -> {klucz: Group}. Blokady wchodzą na początek list internet:in (także list
+    interfejsów strefy internet). Interfejs z własnymi regułami w danym kierunku dostaje jedną listę:
+    blokady, reguły interfejsu, reguły strefy, domyślne — na interfejsie jest zawsze dokładnie jedna nasza ACL."""
     groups = {}
+    default = [Flat("permit", ANY[4], ANY[4], None, None, None, "default"),
+               Flat("permit", ANY[6], ANY[6], None, None, None, "default")]
+
+    def rules_for(name, d):
+        out = []
+        for r in conf.rules:
+            if r.direction == (name, d):
+                out.extend(flatten(r))
+        return out
+
     for zone in sorted(set(conf.zones.values())):
         for d in ("in", "out"):
-            flat = []
+            head = []
             if zone == "internet" and d == "in":
                 for b in blocks:
                     net = ipaddress.ip_network(b["net"])
-                    flat.append(Flat("deny", net, ANY[net.version], None, None, None, "block"))
-            for r in conf.rules:
-                if r.direction == (zone, d):
-                    flat.extend(flatten(r))
-            if not flat:
-                continue
-            flat.append(Flat("permit", ANY[4], ANY[4], None, None, None, "default"))
-            flat.append(Flat("permit", ANY[6], ANY[6], None, None, None, "default"))
-            ifaces = sorted(i for i, z in conf.zones.items() if z == zone)
-            g = Group(zone, d, ifaces, flat)
-            groups[g.key] = g
+                    head.append(Flat("deny", net, ANY[net.version], None, None, None, "block"))
+            zrules = rules_for(zone, d)
+            plain = []
+            for ifn in sorted(i for i, z in conf.zones.items() if z == zone):
+                own = rules_for(ifn, d)
+                if own:
+                    g = Group(zone, d, [ifn], head + own + zrules + default, iface=ifn)
+                    groups[g.key] = g
+                else:
+                    plain.append(ifn)
+            if plain and (head or zrules):
+                g = Group(zone, d, plain, head + zrules + default)
+                groups[g.key] = g
     return groups
 
 
@@ -2744,12 +2884,19 @@ def freeze(text, conf):
     """Treść pliku z rozwiniętymi listami (include): to zapisujemy jako last-good, żeby cofnięcie, boot i check
     nie zależały od plików list, które operator mógł już zmienić. Numery linii zostają bez zmian."""
     out = []
-    for raw in text.splitlines():
-        t = raw.split()
-        if len(t) >= 3 and t[0] == "list" and t[1] in conf.lists:
-            out.append("list %s %s" % (t[1], " ".join(str(n) for n in conf.lists[t[1]])))
-        else:
+    for no, raw in enumerate(text.splitlines(), 1):
+        if no not in conf.list_lines:
             out.append(raw)
+            continue
+        parts = re.split(r"\s#", raw.strip(), maxsplit=1)
+        note = ("   # " + parts[1].strip()) if len(parts) > 1 else ""
+        nets = " ".join(str(n) for n in conf.list_lines[no])
+        if raw[:1] in (" ", "\t"):
+            out.append(("    " + nets + note) if nets else "    #" + note)
+        else:
+            m = LIST_HEAD.match(parts[0].strip())
+            head = "list %s" % m.group(1) + (' "%s"' % m.group(2) if m.group(2) is not None else "")
+            out.append(head + (" " + nets if nets else "") + note)
     return "\n".join(out) + "\n"
 
 
@@ -2890,6 +3037,9 @@ def do_apply(args, boot=False, source=None, lenient=False):
             event(5, "DRIFT_END", "VPP znów zgodny z firewall.conf")
         state["drift"] = ""
         print(color("Zastosowano: %s. VPP zgodny z %s." % (pl(len(done), "zmiana", "zmiany", "zmian"), path), "32"))
+    if not boot and not os.path.exists(ENABLED):
+        print(color("Firewall NIE jest aktywowany na stałe — po restarcie VPP reguł nie będzie. Gdy wszystko działa: "
+                    "router-fw enable", "33"))
     save_json(STATE, state)
     del fd
     return 0
@@ -2964,6 +3114,10 @@ def cmd_check(args):
     except VppError as ex:
         print(color("VPP nie odpowiada: %s" % ex, "31"))
         return 3
+    if not os.path.exists(ENABLED) and not act.acls and not act.extra:
+        if not quiet:
+            print("Firewall nieaktywny (router-fw enable) — w VPP brak jego reguł, to nie jest rozjazd.")
+        return rc
     steps = plan(build_groups(applied, load_blocks(include_expired=True)), act)
     if steps:
         print(color("Rozjazd: VPP różni się od ostatnio zastosowanej konfiguracji:", "31"))
@@ -2997,18 +3151,32 @@ def cmd_show(args):
     except VppError:
         act = None
     groups = build_groups(conf, load_blocks())
+    if os.path.exists(ENABLED):
+        print(color("Firewall: AKTYWNY NA STAŁE (reguły wracają po każdym restarcie; wyłączenie: router-fw disable)", "32"))
+    else:
+        print(color("Firewall: NIEAKTYWNY na stałe — po restarcie VPP reguł nie będzie (aktywacja: router-fw enable)", "33"))
     print(color("Strefy:", "1"))
     for z in sorted(set(conf.zones.values())):
-        print("  %-12s %s" % (z, " ".join(sorted(i for i, zz in conf.zones.items() if zz == z))))
+        own = {r.direction[0] for r in conf.rules}
+        print("  %-12s %s" % (z, " ".join(i + ("  (+ własne reguły)" if i in own else "")
+                                          for i in sorted(i for i, zz in conf.zones.items() if zz == z))))
+    if conf.lists:
+        print(color("\nListy adresów:", "1"))
+        for name, nets in conf.lists.items():
+            print("  @%-14s %4d adr.  %s" % (name, len(nets), conf.list_desc.get(name, "")))
     print(color("\nListy ACL:", "1"))
     for key, g in sorted(groups.items()):
         cur = act.acls.get(key) if act else None
         state = ("ACL %d w VPP" % cur[0] if cur else "brak w VPP") if act else "VPP nie odpowiada"
         bound = [i for i in g.ifaces if act and cur and cur[0] in act.binds.get((i, g.dir), [])]
-        print("  %-14s %3d reguł  %-16s przypięta do: %s" % (key, len(g.flat), state, " ".join(bound) or "—"))
+        print("  %-20s %3d reguł  %-16s przypięta do: %s" % (key, len(g.flat), state, " ".join(bound) or "—"))
     print(color("\nReguły:", "1"))
     for r in conf.rules:
-        print("  %4d  %s%s" % (r.lineno, r.raw, ("   # " + r.desc) if r.desc else ""))
+        if r.desc:
+            print("  %4d  %s" % (r.lineno, r.desc))
+            print(color("        %s" % r.raw, "2"))
+        else:
+            print("  %4d  %s" % (r.lineno, r.raw))
     blocks = load_blocks()
     if blocks:
         print(color("\nBlokady doraźne: %d (router-fw blocks)" % len(blocks), "1"))
@@ -3102,6 +3270,60 @@ def cmd_rollback(args):
     return rc
 
 
+# --------------------------------------------------------------------------- aktywacja na stałe
+@command("enable")
+def cmd_enable(args):
+    """Aktywuje firewall na stałe: router-fw.service odtwarza reguły po każdym starcie VPP, działają timery."""
+    if os.path.exists(PENDING):
+        print(color("Zmiana z 'apply --confirm' czeka na potwierdzenie — najpierw: router-fw confirm.", "33"))
+        return 1
+    conf, errs, _t = get_desired(LASTGOOD)
+    if conf is None:
+        print(color("Firewall nie był jeszcze poprawnie zastosowany. Najpierw: router-fw check, router-fw diff, "
+                    "router-fw apply --confirm 120, router-fw confirm — potem router-fw enable.", "31"))
+        return 2
+    os.makedirs(os.path.dirname(ENABLED), exist_ok=True)
+    with open(ENABLED, "w") as f:
+        f.write("# router-fw enable %s — firewall aktywny na stałe (usuń: router-fw disable)\n"
+                % time.strftime("%Y-%m-%d %H:%M:%S"))
+    if SYSTEMD:
+        run_quiet(["systemctl", "start", "router-fw.service", "router-fw-check.timer", "router-fw-expire.timer"])
+    event(5, "ENABLED", "firewall aktywowany na stałe (reguły wracają po restarcie VPP)")
+    print(color("Firewall aktywny na stałe: reguły z ostatniego apply wracają po każdym restarcie VPP i serwera.", "32"))
+    return 0
+
+
+@command("disable")
+def cmd_disable(args):
+    """Dezaktywuje firewall: zdejmuje nasze ACL z VPP; po restarcie reguły nie wracają. Plik zostaje."""
+    if sys.stdin.isatty() and not args.yes:
+        try:
+            ans = input("Zdjąć wszystkie reguły firewalla z VPP i wyłączyć go na stałe? [t/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("t", "tak", "y", "yes"):
+            print("Przerwano — nic nie zmieniono.")
+            return 1
+    fd = lock()
+    try:
+        act = read_vpp()
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return 3
+    done, failed, err = run_steps(plan({}, act))
+    if failed is not None:
+        print(color("Nie udało się zdjąć reguł: %s (%s)" % (err, failed.human()), "31"))
+        event(3, "APPLY_FAIL", "disable: nie udało się zdjąć reguł (%s): %s" % (failed.human(), err[:120]))
+        return 4
+    if os.path.exists(ENABLED):
+        os.remove(ENABLED)
+    if SYSTEMD:
+        run_quiet(["systemctl", "stop", "router-fw.service"])
+    del fd
+    event(5, "DISABLED", "firewall wyłączony: zdjęto %s z VPP; po restarcie nie wraca" % pl(len(done), "krok", "kroki", "kroków"))
+    print(color("Firewall wyłączony: reguły zdjęte z VPP, po restarcie nie wrócą. Plik firewall.conf został bez zmian.", "32"))
+    return 0
+
 # --------------------------------------------------------------------------- blokady doraźne
 def parse_duration(s):
     m = re.fullmatch(r"(\d+)([smhd]?)", s)
@@ -3157,7 +3379,16 @@ def cmd_block(args):
         net = ipaddress.ip_network(args.rest[0], strict=False)
         secs = parse_duration(args.rest[1]) if len(args.rest) == 2 else 0
     except ValueError as ex:
-        print(color(str(ex), "31"))
+        print(color("Zły adres lub czas: %s" % ex, "31"))
+        return 2
+    if not os.path.exists(ENABLED):
+        print(color("Firewall nie jest aktywny — blokada nie przetrwałaby restartu i nie wygasłaby sama. "
+                    "Najpierw: router-fw apply, router-fw enable.", "31"))
+        return 2
+    conf, _errs, _t = get_desired(LASTGOOD)
+    if conf is not None and "internet" not in conf.zones.values():
+        print(color("Blokady doraźne działają na wejściu strefy \"internet\", a w firewall.conf jej nie ma "
+                    "(dodaj: zone <uplink> internet).", "31"))
         return 2
     entry = {"net": str(net), "added": int(time.time()), "expires": int(time.time()) + secs if secs else 0,
              "by": os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"}
@@ -3237,6 +3468,13 @@ def dir_label(zone, d):
     return "%s->" % zone if d == "in" else "->%s" % zone
 
 
+def group_title(g):
+    if g.iface:
+        return "%s  (%s na %s; reguły interfejsu + strefy %s)" % (
+            dir_label(g.iface, g.dir), "wejście" if g.dir == "in" else "wyjście", g.iface, g.zone)
+    return "%s  (%s: %s)" % (dir_label(g.zone, g.dir), "wejście" if g.dir == "in" else "wyjście", " ".join(g.ifaces))
+
+
 def fmt_num(n):
     return "{:,}".format(int(n)).replace(",", " ")
 
@@ -3259,8 +3497,22 @@ def raw_counters(groups, act):
     return out
 
 
+def flat_label(f, conf):
+    """Krótki opis jednej reguły ACL (adres z listy + komentarz) do widoku counters -v."""
+    parts = []
+    for name, net in (("src", f.src), ("dst", f.dst)):
+        if net.prefixlen:
+            note = conf.notes.get(str(net), "")
+            parts.append("%s %s%s" % (name, net, ("  " + note) if note else ""))
+    for name, pr in (("sport", f.sport), ("dport", f.dport)):
+        if pr is not None:
+            parts.append("%s %s" % (name, str(pr[0]) if pr[0] == pr[1] else "%d-%d" % pr))
+    return ", ".join(parts) or ("any IPv%d" % f.src.version)
+
+
 def counter_rows(raw, conf, state):
-    """Zlicza liczniki ACL do wierszy 'jedna reguła z pliku = jeden wiersz', odejmując punkt odniesienia."""
+    """Zlicza liczniki ACL do wierszy 'jedna reguła z pliku = jeden wiersz', odejmując punkt odniesienia.
+    Każdy wiersz ma też 'items': liczniki poszczególnych reguł ACL (adresy z list) do widoku -v."""
     by_line = {r.lineno: r for r in conf.rules}
     snap = []
     for key in sorted(raw):
@@ -3270,37 +3522,48 @@ def counter_rows(raw, conf, state):
         for f, (p, b), (bp, bb) in zip(g.flat, vals, base):
             if p < bp or b < bb:
                 bp, bb = 0, 0          # VPP wyzerował liczniki (restart, zmiana ACL) — punkt odniesienia jest nieaktualny
-            label = f.parent if isinstance(f.parent, str) else str(f.parent)
+            item = {"label": flat_label(f, conf), "pkts": p - bp, "bytes": b - bb}
             if rows and rows[-1]["parent"] == f.parent:
                 rows[-1]["pkts"] += p - bp
                 rows[-1]["bytes"] += b - bb
+                rows[-1]["items"].append(item)
                 continue
             if isinstance(f.parent, int):
                 r = by_line.get(f.parent)
-                text = (r.raw.split(None, 1)[1] if r else "?") + (("   # " + r.desc) if r and r.desc else "")
+                label = "linia %d" % f.parent
+                text = r.raw if r else "?"
+                desc = (r.desc if r and r.desc else text)
+            elif f.parent == "block":
+                label, text, desc = "blokada", "deny src %s" % f.src, "Blokada doraźna (router-fw block)"
             else:
-                label = "blokada" if f.parent == "block" else "domyślna"
-                text = "deny src %s" % f.src if f.parent == "block" else "permit any"
-            rows.append({"parent": f.parent, "label": label, "text": text, "pkts": p - bp, "bytes": b - bb})
+                label, text, desc = "domyślna", "permit any", "Domyślnie: przepuść resztę"
+            rows.append({"parent": f.parent, "label": label, "text": text, "desc": desc,
+                         "pkts": p - bp, "bytes": b - bb, "items": [item]})
         snap.append({"group": g, "index": idx, "rows": rows})
     return snap
 
 
-def print_counters(snap, prev=None, dt=1.0):
+def print_counters(snap, prev=None, dt=1.0, verbose=False):
     old = {s["group"].key: s["rows"] for s in (prev or [])}
     for s in snap:
         g = s["group"]
-        print(color("%s  (%s: %s)  %s" % (dir_label(g.zone, g.dir), "wejście" if g.dir == "in" else "wyjście",
-                                          " ".join(g.ifaces), "ACL %d" % s["index"] if s["index"] is not None
-                                          else "brak w VPP"), "1"))
-        print("  %-9s %-60s %18s %12s %10s" % ("reguła", "opis", "pakiety", "bajty", "pkt/s"))
+        print(color("%s  %s" % (group_title(g), "ACL %d" % s["index"] if s["index"] is not None
+                                else "brak w VPP"), "1"))
+        print("  %-52s %16s %11s %9s" % ("opis", "pakiety", "bajty", "pkt/s"))
         for i, r in enumerate(s["rows"]):
             rate = ""
             prows = old.get(g.key)
             if prows and i < len(prows) and prows[i]["parent"] == r["parent"] and dt > 0:
                 rate = fmt_num(max(0, r["pkts"] - prows[i]["pkts"]) / dt)
-            print("  %-9s %-60s %18s %12s %10s" % (r["label"], r["text"][:60], fmt_num(r["pkts"]),
-                                                   fmt_bytes(r["bytes"]), rate))
+            lines = textwrap.wrap(r["desc"], 52) or [""]     # długi opis: zawijany w kolejne linie, nie ucinany
+            print("  %-52s %16s %11s %9s" % (lines[0], fmt_num(r["pkts"]), fmt_bytes(r["bytes"]), rate))
+            for ln in lines[1:]:
+                print("  %s" % ln)
+            print(color("      %s: %s" % (r["label"], r["text"]), "2"))
+            if verbose and len(r["items"]) > 1 and r["parent"] != "default":
+                for it in r["items"]:
+                    print("        %-46s %16s %11s" % (it["label"][:46], fmt_num(it["pkts"]), fmt_bytes(it["bytes"])))
+        print()
 
 
 def counters_snapshot():
@@ -3339,7 +3602,7 @@ def cmd_counters(args):
             print("Liczniki wyzerowane (punkt odniesienia po stronie router-fw).")
             return 0
         if args.rest:
-            print("użycie: router-fw counters [-w] | router-fw counters clear")
+            print("użycie: router-fw counters [-w] [-v] | router-fw counters clear")
             return 2
         prev, t0 = counter_rows(raw_counters(groups, act), conf, state), time.time()
         while True:
@@ -3348,7 +3611,7 @@ def cmd_counters(args):
             dt = time.time() - t0
             if args.watch and TTY:
                 sys.stdout.write("\033[H\033[J")
-            print_counters(snap, prev, dt)
+            print_counters(snap, prev, dt, verbose=args.verbose)
             if not args.watch:
                 return 0
             prev, t0 = snap, time.time()
@@ -3373,6 +3636,7 @@ def main():
     ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
     ap.add_argument("--confirm", type=int, default=0, metavar="SEK", help="apply: cofnij zmianę po SEK s bez 'confirm'")
     ap.add_argument("-w", "--watch", action="store_true", help="counters: odświeżanie co 1 s")
+    ap.add_argument("-v", "--verbose", action="store_true", help="counters: liczniki każdego adresu z list")
     ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
     ap.add_argument("--timeout", type=int, default=180, help="boot: ile sekund czekać na VPP")
     args = ap.parse_args()
@@ -3420,9 +3684,9 @@ import time
 ROOT = os.environ.get("ROUTER_GUARD_ROOT", "")      # tylko do testów
 CONF = ROOT + "/etc/router/synack-guard.conf"
 STATE = ROOT + "/var/lib/router/guard.state.json"
-LOGDIR = ROOT + "/var/log/router-monitor"
-LOG = LOGDIR + "/router-guard.log"
-MONLOG = LOGDIR + "/router-monitor.log"
+LOGDIR = ROOT + "/var/log/router"
+LOG = LOGDIR + "/guard.log"
+MONLOG = LOGDIR + "/alarmy.log"
 LOCK = ROOT + "/run/router-guard.lock"
 NOTIFY = ROOT + "/opt/router/bin/router-notify"
 SELF = "/opt/router/bin/router-guard"
@@ -3541,6 +3805,7 @@ class Conf:
         self.in_if, self.out_if, self.groups = [], [], {}
         self.ttl, self.udp_ttl, self.warmup, self.max_on, self.alarm_pps = 60, 30, 60, 6 * 3600, 10000
         self.tcp_rst, self.udp, self.udp_frags, self.check_isn = "pass", "on", "pass", "on"
+        self.reply_rst, self.reply_rst_pps = "off", 10000
         self.udp_ports = list(DEFAULT_PORTS)
         self.table_v4, self.table_v6 = 4000000, 1000000
         self.default_mode = "monitor"
@@ -3560,10 +3825,10 @@ def parse_conf(text):
     """Zwraca (Conf, błędy). Błąd = ochrona nie zostanie włączona."""
     c, errs = Conf(), []
     ints = {"ttl": "ttl", "udp-ttl": "udp_ttl", "warmup": "warmup", "alarm-pps": "alarm_pps",
-            "table-v4": "table_v4", "table-v6": "table_v6"}
+            "table-v4": "table_v4", "table-v6": "table_v6", "reply-rst-pps": "reply_rst_pps"}
     choices = {"tcp-rst": ("tcp_rst", ("pass", "handshake")), "udp": ("udp", ("on", "off")),
                "udp-frags": ("udp_frags", ("pass", "drop")), "check-isn": ("check_isn", ("on", "off")),
-               "default-mode": ("default_mode", ("monitor", "enforce"))}
+               "default-mode": ("default_mode", ("monitor", "enforce")), "reply-rst": ("reply_rst", ("on", "off"))}
     for no, raw in enumerate(text.splitlines(), 1):
         body = re.split(r"\s#", raw.strip(), maxsplit=1)[0].strip()
         if not body or body.startswith("#"):
@@ -3701,7 +3966,24 @@ def read_vpp():
 
 
 def read_errors():
-    """Liczniki węzłów synack-guard z 'show errors': {powód: suma po węzłach}."""
+    """Liczniki węzłów synack-guard: {powód: suma po węzłach i wątkach}. Najpierw z segmentu statystyk
+    (/err/synack-guard-*/<powód> — bez vppctl, nie zatrzymuje workerów), awaryjnie z 'show errors' (bariera)."""
+    if not ROOT:                                  # testy (ROUTER_GUARD_ROOT) używają symulatora vppctl
+        try:
+            from vpp_papi.vpp_stats import VPPStats
+            stats = VPPStats(socketname="/run/vpp/stats.sock", timeout=2)
+            stats.connect()
+            try:
+                tot = {}
+                for p in stats.ls(["^/err/synack-guard-"]):
+                    reason = p.split("/", 3)[3]
+                    tot[reason] = tot.get(reason, 0) + int(stats[p].sum())
+                if tot:
+                    return tot
+            finally:
+                stats.disconnect()
+        except Exception:      # noqa: BLE001 — brak vpp_papi / segmentu: niżej vppctl
+            pass
     tot = {}
     for line in cli("show errors").splitlines():
         m = re.match(r"^\s*(\d+)\s+(synack-guard-\S+)\s+(.+?)\s+(error|warn|info|debug)\s*$", line)
@@ -3716,7 +3998,10 @@ def counters_summary(tot):
             "violations": sum(v for k, v in tot.items() if k.startswith("Violation")),
             "dropped": tot.get("Dropped", 0),
             "recorded": tot.get("SYN recorded", 0) + tot.get("UDP recorded", 0),
-            "insert_failed": tot.get("Insert failed", 0)}
+            "insert_failed": tot.get("Insert failed", 0),
+            "rst_sent": tot.get("RST sent", 0),
+            "rst_would": tot.get("RST would be sent", 0),
+            "rst_limited": tot.get("RST rate limited", 0)}
 
 
 def wait_vpp(timeout):
@@ -3732,9 +4017,10 @@ def wait_vpp(timeout):
 
 
 def config_cmd(conf, with_tables):
-    s = ("synack-guard config ttl %d udp-ttl %d check-isn %s tcp-rst %s udp %s udp-frags %s udp-ports %s"
-         % (conf.ttl, conf.udp_ttl, conf.check_isn, conf.tcp_rst, conf.udp, conf.udp_frags,
-            ",".join(str(p) for p in conf.udp_ports)))
+    s = ("synack-guard config ttl %d udp-ttl %d check-isn %s tcp-rst %s udp %s udp-frags %s reply-rst %s "
+         "reply-rst-pps %d udp-ports %s"
+         % (conf.ttl, conf.udp_ttl, conf.check_isn, conf.tcp_rst, conf.udp, conf.udp_frags, conf.reply_rst,
+            conf.reply_rst_pps, ",".join(str(p) for p in conf.udp_ports)))
     if with_tables:
         s += " table-v4 %d table-v6 %d" % (conf.table_v4, conf.table_v6)
     return s
@@ -4014,7 +4300,9 @@ def cmd_status(args):
     dt = max(1, now() - snap.get("ts", now())) if snap else 0
     for key, label in (("checked", "sprawdzone odpowiedzi"), ("passed", "przepuszczone (jest wpis)"),
                        ("violations", "naruszenia (brak wpisu / zły ISN)"), ("dropped", "odrzucone (enforce)"),
-                       ("recorded", "zapisane wpisy (SYN, UDP)"), ("insert_failed", "błędy zapisu do tablicy")):
+                       ("recorded", "zapisane wpisy (SYN, UDP)"), ("insert_failed", "błędy zapisu do tablicy"),
+                       ("rst_sent", "RST wysłane (reply-rst)"), ("rst_would", "RST do wysłania (monitor)"),
+                       ("rst_limited", "RST pominięte (limit reply-rst-pps)")):
         rate = ""
         if snap and dt and key in snap.get("vals", {}):
             rate = "   ~%s/s" % fmt_num(max(0, cur[key] - snap["vals"][key]) / dt)
@@ -4172,6 +4460,530 @@ if __name__ == "__main__":
 ROUTER_GUARD_PY
 }
 
+# router-top: podgląd na żywo (obciążenie VPP, interfejsy, liczniki ACL, guard) — tylko odczyt
+prog_router_top() {
+  cat <<'ROUTER_TOP_PY'
+#!/usr/bin/env python3
+"""router-top — podgląd routera na żywo (odświeżanie co sekundę)
+
+  router-top [N]          start na karcie N (domyślnie 1)
+  karty:     1 VPP (obciążenie workerów, ruch łącznie)   2 interfejsy (porty i VLAN-y: Gb/s, pkt/s)
+             3 firewall (liczniki ACL)   4 guard (naruszenia na żywo)
+  klawisze:  1-4 karta   ↑ ↓ PgUp PgDn Home End przewijanie (także j k)   p pauza   q wyjście
+  router-top --once N     jeden odczyt ekranu N jako zwykły tekst (skrypty, diagnostyka)
+
+Tylko odczyt — niczego nie zmienia w VPP. Liczniki interfejsów i ACL są dokładne; lista zdarzeń guard to
+próbka (przy ataku wtyczka zapisuje najwyżej kilkaset zdarzeń/s na wątek), dokładne są liczniki nad listą.
+
+Bezpieczne w czasie ataku: liczniki (interfejsy, ACL, guard) są czytane z segmentu statystyk VPP (pamięć
+współdzielona, bez udziału VPP). Polecenia vppctl, które zatrzymują wątki robocze (bariera), router-top wywołuje
+rzadko: mapa list ACL co FW_REFRESH s; polecenia guarda (show synack-guard, events) działają bez bariery.
+"""
+import argparse
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import signal
+import sys
+import time
+
+ROOT = os.environ.get("ROUTER_TOP_ROOT", "")                        # tylko do testów
+IFACES_CONF = ROOT + "/etc/router/ifaces.conf"
+ENV_FILE = ROOT + "/etc/router/router.env"
+MONITOR_CONF = ROOT + "/etc/router/router-monitor.conf"
+FW_PATH = os.environ.get("ROUTER_TOP_FW", "/opt/router/bin/router-fw")
+GUARD_PATH = os.environ.get("ROUTER_TOP_GUARD", "/opt/router/bin/router-guard")
+STATS_JSON = os.environ.get("ROUTER_TOP_STATS_JSON", "")              # tylko testy: liczniki z pliku zamiast z VPP
+ERR_JSON = os.environ.get("ROUTER_TOP_ERR_JSON", "")                  # tylko testy: liczniki węzłów guard z pliku
+FW_REFRESH = 15.0         # s — odświeżenie mapy list ACL (vppctl w barierze); liczniki co sekundę ze statystyk
+GUARD_STATE_REFRESH = 5.0  # s — tryb i zapełnienie tablic (show synack-guard, bez bariery)
+INTERVAL = float(os.environ.get("ROUTER_TOP_INTERVAL", "1"))
+EVENTS_SHOWN = 30
+EVENTS_READ = 200                                                    # do zestawienia najczęstszych źródeł i celów
+
+
+# --------------------------------------------------------------------------- formatowanie
+def fmt_bps(bits):
+    for unit, div in (("Gb/s", 1e9), ("Mb/s", 1e6), ("kb/s", 1e3)):
+        if bits >= div:
+            return "%.2f %s" % (bits / div, unit)
+    return "%d b/s" % bits
+
+
+def fmt_pps(p):
+    if p >= 1e6:
+        return "%.2f M" % (p / 1e6)
+    if p >= 1e3:
+        return "%.1f k" % (p / 1e3)
+    return "%d" % p
+
+
+def fmt_num(n):
+    return "{:,}".format(int(n)).replace(",", " ")
+
+
+def natkey(s):
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)]
+
+
+def load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# --------------------------------------------------------------------------- karty 1 i 2: VPP, interfejsy
+def read_descs():
+    """Opisy z ifaces.conf: {nazwa VPP: opis}."""
+    out = {}
+    try:
+        with open(IFACES_CONF) as f:
+            for raw in f:
+                t = raw.split("#", 1)[0].split(None, 4)
+                if len(t) >= 4:
+                    name = t[0] if t[1] == "-" else "%s.%s" % (t[0], t[1])
+                    out[name] = t[4].strip() if len(t) == 5 else ""
+    except OSError:
+        pass
+    return out
+
+
+class IfStats:
+    """Liczniki interfejsów z segmentu statystyk VPP: {nazwa: (rx pkt, rx B, tx pkt, tx B, zgubione)}."""
+    def __init__(self):
+        self.stats = None
+
+    def read(self):
+        if STATS_JSON:
+            with open(STATS_JSON) as f:
+                d = json.load(f)
+            return {n: (v if n == "__workers__" else tuple(v)) for n, v in d.items()}
+        if self.stats is None:
+            from vpp_papi.vpp_stats import VPPStats
+            self.stats = VPPStats(socketname="/run/vpp/stats.sock", timeout=2)
+            self.stats.connect()
+        try:
+            s = self.stats
+            names = list(s["/if/names"])
+            rx, tx, miss, nobuf = s["/if/rx"], s["/if/tx"], s["/if/rx-miss"], s["/if/rx-no-buf"]
+            out = {n: (rx[:, i].sum_packets(), rx[:, i].sum_octets(), tx[:, i].sum_packets(),
+                       tx[:, i].sum_octets(), miss[:, i].sum() + nobuf[:, i].sum())
+                   for i, n in enumerate(names) if n}
+            vec, loops = s["/sys/vector_rate_per_worker"], s["/sys/loops_per_worker"]
+            vrow = list(vec[0]) if len(vec) and isinstance(vec[0], (list, tuple)) else list(vec)
+            lrow = list(loops[0]) if len(loops) and isinstance(loops[0], (list, tuple)) else list(loops)
+            out["__workers__"] = [[float(v), float(lrow[i]) if i < len(lrow) else 0.0] for i, v in enumerate(vrow)]
+            return out
+        except Exception:
+            self.stats = None                    # VPP zrestartował — połącz ponownie przy następnym odczycie
+            raise
+
+
+def read_kv(path, key, default=""):
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return default
+
+
+def bar(frac, width=24):
+    n = int(round(max(0.0, min(1.0, frac)) * width))
+    return "█" * n + "░" * (width - n)
+
+
+def screen_load(workers):
+    """Obciążenie VPP (odpowiednik QFP): średni rozmiar wektora każdego workera — 1 = luz, 256 = nasycenie."""
+    if not workers:
+        return []
+    warn = float(read_kv(MONITOR_CONF, "VEC_WARN", "64") or 64)
+    crit = float(read_kv(MONITOR_CONF, "VEC_CRIT", "160") or 160)
+    cores = [c for c in read_kv(ENV_FILE, "INST_WORKERS").split(",") if c]
+    rows = [(i, w) for i, w in enumerate(workers) if i > 0] or [(0, workers[0])]   # 0 = wątek główny
+    lines = [("  OBCIĄŻENIE VPP (wektor: 1 = luz, %d = alarm, %d = krytyczne, 256 = nasycenie)" % (warn, crit), "head")]
+    for i, (vecr, loops) in rows:
+        state, style = ("NASYCENIE", "miss") if vecr >= crit else ("WYSOKIE", "warn") if vecr >= warn else \
+            ("praca", "hit") if vecr >= 4 else ("luz", "dim")
+        core = cores[i - 1] if 0 < i <= len(cores) else "?"
+        name = "worker %d (rdzeń %s)" % (i, core) if i else "wątek główny"
+        lines.append(("  %-22s %s %6.1f  %-10s %10s pętli/s" % (name, bar(vecr / 256.0), vecr, state, fmt_pps(loops)),
+                      style))
+    peak = max(w[0] for _i, w in rows)
+    lines.append(("  najwyżej: %.1f   średnio: %.1f   (rośnie z ruchem; trwale > %d = workery nie nadążają, patrz zgub./s)"
+                  % (peak, sum(w[0] for _i, w in rows) / len(rows), warn), "dim"))
+    lines.append(("", ""))
+    return lines
+
+
+def if_rows(cur, prev, dt):
+    """[(nazwa, [rx pkt/s, rx B/s, tx pkt/s, tx B/s, zgub./s])] port, potem jego VLAN-y; suma portów fizycznych."""
+    names = [n for n in cur if not n.startswith(("local", "tap", "tun", "__")) and n]
+    phys = sorted({n.split(".")[0] for n in names}, key=natkey)
+    rows, tot = [], [0.0] * 5
+    for p in phys:
+        for n in [p] + sorted((x for x in names if x.startswith(p + ".")), key=natkey):
+            if n not in cur:
+                continue
+            c, o = cur[n], prev.get(n, cur[n])
+            r = [max(0, (c[k] - o[k])) / dt for k in range(5)]
+            rows.append((n, r))
+            if "." not in n and not n.startswith("loop"):
+                tot = [a + b for a, b in zip(tot, r)]
+    return rows, tot
+
+
+def screen_vpp(cur, prev, dt):
+    lines = screen_load(cur.get("__workers__"))
+    if not lines:
+        lines = [("  Brak danych o workerach VPP.", "dim"), ("", "")]
+    rows, tot = if_rows(cur, prev, dt)
+    nphys = sum(1 for n, _r in rows if "." not in n and not n.startswith("loop"))
+    nvlan = sum(1 for n, _r in rows if "." in n)
+    lines.append(("  RUCH ŁĄCZNIE (porty fizyczne: %d, VLAN-y: %d)" % (nphys, nvlan), "head"))
+    lines.append(("  RX  %13s  %10s pkt/s" % (fmt_bps(tot[1] * 8), fmt_pps(tot[0])), "bold"))
+    lines.append(("  TX  %13s  %10s pkt/s" % (fmt_bps(tot[3] * 8), fmt_pps(tot[2])), "bold"))
+    lines.append(("  zgubione przez kartę: %s pkt/s" % (fmt_pps(tot[4]) if tot[4] else "0"), "miss" if tot[4] else "hit"))
+    lines.append(("", ""))
+    lines.append(("  Szczegóły portów i VLAN-ów: karta 2.", "dim"))
+    return lines
+
+
+def screen_ifaces(cur, prev, dt):
+    descs = read_descs()
+    lines = [("  %-16s %-26s %13s %10s %13s %10s %10s" % ("interfejs", "opis", "RX", "RX pkt/s", "TX", "TX pkt/s",
+                                                             "zgub./s"), "head")]
+    rows, tot = if_rows(cur, prev, dt)
+    for n, r in rows:
+        label = n if "." not in n else " └ " + n
+        style = "miss" if r[4] > 0 else ("" if "." in n else "bold")
+        lines.append(("  %-16s %-26s %13s %10s %13s %10s %10s" % (
+            label, descs.get(n, "")[:26], fmt_bps(r[1] * 8), fmt_pps(r[0]), fmt_bps(r[3] * 8), fmt_pps(r[2]),
+            fmt_pps(r[4]) if r[4] else "-"), style))
+    lines.append(("", ""))
+    lines.append(("  %-43s %13s %10s %13s %10s %10s" % ("RAZEM (porty fizyczne)", fmt_bps(tot[1] * 8), fmt_pps(tot[0]),
+                                                         fmt_bps(tot[3] * 8), fmt_pps(tot[2]),
+                                                         fmt_pps(tot[4]) if tot[4] else "-"), "bold"))
+    lines.append(("  VLAN-y są wliczone w port fizyczny. „zgub./s” = pakiety zgubione przez kartę (VPP nie nadąża).",
+                  "dim"))
+    return lines
+
+
+# --------------------------------------------------------------------------- karta 3: firewall
+class FwView:
+    def __init__(self):
+        self.fw, self.ctx, self.ctx_t = None, None, 0.0
+
+    def sample(self):
+        if self.fw is None:
+            self.fw = load_module("router_fw", FW_PATH)
+        fw = self.fw
+        # mapa list ACL (vppctl show acl-plugin ... — w barierze) tylko co FW_REFRESH s; liczniki zawsze świeże
+        if self.ctx is None or time.time() - self.ctx_t >= FW_REFRESH:
+            ctx, err = fw.counters_snapshot()
+            if ctx is None:
+                self.ctx = None
+                return {"error": err}
+            self.ctx, self.ctx_t = ctx, time.time()
+        ctx = self.ctx
+        conf, groups, act = ctx
+        if conf.settings.get("counters") == "off":
+            return {"error": "liczniki wyłączone w firewall.conf (set counters off)"}
+        groups = {k: g for k, g in groups.items() if k not in act.acls or act.acls[k][1] == g.tag}
+        rows = fw.counter_rows(fw.raw_counters(groups, act), conf, fw.load_json(fw.STATE, {}))
+        return {"rows": rows, "enabled": os.path.exists(fw.ENABLED), "title": fw.group_title}
+
+
+def screen_fw(cur, prev, dt):
+    if "error" in cur:
+        return [("  " + cur["error"], "miss")]
+    lines = []
+    if not cur["enabled"]:
+        lines.append(("  Firewall NIEAKTYWNY na stałe (router-fw enable) — reguły znikną po restarcie VPP.", "miss"))
+    old = {s["group"].key: s["rows"] for s in prev.get("rows", [])}
+    for s in cur["rows"]:
+        g = s["group"]
+        lines.append(("%s  %s" % (cur["title"](g), "ACL %d" % s["index"] if s["index"] is not None else "brak w VPP"),
+                      "bold"))
+        lines.append(("  %-52s %16s %10s %13s" % ("opis", "pakiety", "pkt/s", "przepustowość"), "head"))
+        prows = old.get(g.key, [])
+        for i, r in enumerate(s["rows"]):
+            pp = prows[i] if i < len(prows) and prows[i]["parent"] == r["parent"] else r
+            pps, bps = max(0, r["pkts"] - pp["pkts"]) / dt, max(0, r["bytes"] - pp["bytes"]) * 8 / dt
+            style = "deny" if pps and r["text"].split(" ")[1:2] == ["deny"] else ("hit" if pps else "")
+            lines.append(("  %-52s %16s %10s %13s" % (r["desc"][:52], fmt_num(r["pkts"]), fmt_pps(pps), fmt_bps(bps)),
+                          style))
+        lines.append(("", ""))
+    return lines
+
+
+# --------------------------------------------------------------------------- ekran 3: guard
+VERDICT = {"no-flow": "brak SYN", "bad-isn": "zły ISN", "udp-frag": "fragment UDP", "pass": "ok", "ignore": "-"}
+ACTION = {"passed": ("PRZESZEDŁ (monitor)", "warn"), "dropped": ("ODRZUCONY", "deny"),
+          "dropped+rst": ("ODRZUCONY + RST", "rst")}
+
+
+class GuardTable:
+    """Tryb i zapełnienie tablic z 'show synack-guard' (polecenie bez bariery)."""
+    def __init__(self, out):
+        self.mode, self.used4, self.size4, self.used6, self.size6 = "off", 0, 0, 0, 0
+        for line in out.splitlines():
+            m = re.match(r"^(mode|table-v4|table-v6):\s*(\S+)", line.strip())
+            if not m:
+                continue
+            if m.group(1) == "mode":
+                self.mode = m.group(2)
+            else:
+                u, _, z = m.group(2).partition("/")
+                setattr(self, "used4" if m.group(1) == "table-v4" else "used6", int(u or 0))
+                setattr(self, "size4" if m.group(1) == "table-v4" else "size6", int(z or 0))
+
+
+class GuardView:
+    def __init__(self):
+        self.gd, self.stats, self.paths, self.table, self.table_t = None, None, None, None, 0.0
+
+    def errors(self):
+        """Liczniki węzłów synack-guard z segmentu statystyk (/err/synack-guard-*/<powód>), bez vppctl."""
+        if ERR_JSON:
+            with open(ERR_JSON) as f:
+                return json.load(f)
+        if self.stats is None:
+            from vpp_papi.vpp_stats import VPPStats
+            self.stats = VPPStats(socketname="/run/vpp/stats.sock", timeout=2)
+            self.stats.connect()
+            self.paths = self.stats.ls(["^/err/synack-guard-"])
+        tot = {}
+        try:
+            for p in self.paths:
+                v = self.stats[p]
+                try:
+                    n = int(v.sum())
+                except AttributeError:
+                    n = int(sum(v)) if hasattr(v, "__iter__") else int(v)
+                reason = p.split("/", 3)[3]
+                tot[reason] = tot.get(reason, 0) + n
+        except Exception:
+            self.stats = None
+            raise
+        return tot
+
+    def sample(self):
+        if self.gd is None:
+            self.gd = load_module("router_guard", GUARD_PATH)
+        gd = self.gd
+        st = gd.load_state()
+        try:
+            if self.table is None or time.time() - self.table_t >= GUARD_STATE_REFRESH:
+                self.table, self.table_t = GuardTable(gd.cli("show synack-guard")), time.time()
+            v = self.table
+            tot = self.errors()
+            raw = gd.cli("show synack-guard events count %d" % EVENTS_READ)
+        except Exception as ex:                  # noqa: BLE001 — brak VPP albo wtyczki
+            self.table = None
+            return {"error": "VPP / wtyczka synack_guard niedostępna: %s" % ex}
+        now, events = None, []
+        for line in raw.splitlines():
+            t = line.split()
+            if t[:1] == ["now:"] and len(t) == 2:
+                now = float(t[1])
+            elif t[:1] == ["event:"] and len(t) == 9:
+                events.append({"t": float(t[1]), "src": t[2], "sport": t[3], "dst": t[4], "dport": t[5],
+                               "cls": t[6], "verdict": t[7], "action": t[8]})
+        return {"state": st, "vpp": v, "sum": gd.counters_summary(tot), "tot": tot, "now": now, "events": events,
+                "fmt_left": gd.fmt_left}
+
+
+def top(events, key, n=5):
+    cnt = {}
+    for e in events:
+        cnt[e[key]] = cnt.get(e[key], 0) + 1
+    return sorted(cnt.items(), key=lambda x: -x[1])[:n]
+
+
+def screen_guard(cur, prev, dt):
+    if "error" in cur:
+        return [("  " + cur["error"], "miss")]
+    st, v, s = cur["state"], cur["vpp"], cur["sum"]
+    ps = prev.get("sum", s)
+    lines = []
+    if st["active"]:
+        lines.append(("  Ochrona WŁĄCZONA — tryb %s   prefiksy: %s   wyłączy się za: %s" % (
+            st["mode"].upper(), ", ".join(p["net"] for p in st["prefixes"]), cur["fmt_left"](st["expires"])), "bold"))
+    else:
+        lines.append(("  Ochrona wyłączona (router-guard on <prefiks>) — poniżej ostatnie zapisane zdarzenia.", "dim"))
+    lines.append(("  tablica stanów IPv4: %s / %s   IPv6: %s / %s" % (fmt_num(v.used4), fmt_num(v.size4),
+                                                                      fmt_num(v.used6), fmt_num(v.size6)), ""))
+    lines.append(("", ""))
+    lines.append(("  %-34s %16s %12s" % ("liczniki (dokładne)", "razem", "na sekundę"), "head"))
+    for key, label, style in (("checked", "sprawdzone odpowiedzi", ""), ("passed", "przepuszczone (był SYN)", "hit"),
+                              ("violations", "naruszenia (odpowiedź bez pytania)", "warn"),
+                              ("dropped", "ODRZUCONE", "deny"), ("rst_sent", "RST wysłane", "rst"),
+                              ("rst_would", "RST do wysłania (monitor)", ""), ("rst_limited", "RST pominięte (limit)", ""),
+                              ("recorded", "zapisane SYN/UDP klientów", "dim")):
+        rate = max(0, s[key] - ps.get(key, s[key])) / dt
+        lines.append(("  %-34s %16s %12s" % (label, fmt_num(s[key]), fmt_pps(rate)), style if rate else ""))
+    ev = cur["events"]
+    lines.append(("", ""))
+    if ev:
+        srcs = ", ".join("%s (%d)" % kv for kv in top(ev, "src"))
+        dsts = ", ".join("%s (%d)" % kv for kv in top(ev, "dst"))
+        lines.append(("  najczęstsze źródła: " + srcs, "warn"))
+        lines.append(("  atakowane adresy:   " + dsts, "warn"))
+        lines.append(("", ""))
+    lines.append(("  %-8s %-41s %-41s %-8s %-12s %s" % ("ile temu", "źródło", "cel", "typ", "powód", "decyzja"), "head"))
+    if not ev:
+        lines.append(("  (brak naruszeń)", "dim"))
+    for e in ev[:EVENTS_SHOWN]:
+        age = "%.1fs" % max(0.0, cur["now"] - e["t"]) if cur["now"] is not None else "?"
+        act, style = ACTION.get(e["action"], (e["action"], ""))
+        lines.append(("  %-8s %-41s %-41s %-8s %-12s %s" % (
+            age, "%s:%s" % (e["src"], e["sport"]), "%s:%s" % (e["dst"], e["dport"]), e["cls"],
+            "brak zapytania" if e["verdict"] == "no-flow" and e["cls"] == "udp" else VERDICT.get(e["verdict"], e["verdict"]),
+            act), style))
+    lines.append(("", ""))
+    lines.append(("  Lista to próbka ostatnich naruszeń (przy ataku wtyczka zapisuje najwyżej kilkaset/s na wątek); "
+                  "dokładne są liczniki.", "dim"))
+    return lines
+
+
+# --------------------------------------------------------------------------- pętla
+SCREENS = {1: ("VPP", IfStats, screen_vpp), 2: ("Interfejsy", IfStats, screen_ifaces),
+           3: ("Firewall (ACL)", FwView, screen_fw), 4: ("Guard", GuardView, screen_guard)}
+
+
+class App:
+    def __init__(self):
+        self.src = {k: v[1]() for k, v in SCREENS.items()}
+        self.prev, self.prev_t = {}, {}
+
+    def sample(self, n):
+        src = self.src[n]
+        return src.read() if isinstance(src, IfStats) else src.sample()
+
+    def lines(self, n):
+        t = time.time()
+        try:
+            cur = self.sample(n)
+        except Exception as ex:                  # noqa: BLE001
+            return [("  Nie można odczytać danych: %s: %s" % (type(ex).__name__, ex), "miss")]
+        prev = self.prev.get(n, cur)
+        dt = max(1e-3, t - self.prev_t.get(n, t - INTERVAL))
+        out = SCREENS[n][2](cur, prev if prev is not cur else cur, dt)
+        self.prev[n], self.prev_t[n] = cur, t
+        return out
+
+
+def header(n, paused):
+    tabs = "   ".join(("[%d %s]" if k == n else " %d %s ") % (k, v[0]) for k, v in SCREENS.items())
+    return "router-top  %s  %s   p pauza  q wyjście%s" % (time.strftime("%H:%M:%S"), tabs, "   PAUZA" if paused else "")
+
+
+def sticky(lines):
+    """Liczba wierszy nagłówka tabeli, które zostają na górze przy przewijaniu (pierwsze wiersze w stylu head)."""
+    n = 0
+    while n < len(lines) and lines[n][1] == "head" and n < 2:
+        n += 1
+    return n
+
+
+def visible(lines, offset, height):
+    """Wiersze do pokazania przy przewinięciu o offset na ekranie o height wierszach treści; (wiersze, offset, stopka)."""
+    k = sticky(lines)
+    body = lines[k:]
+    room = max(1, height - k - 1)                    # 1 wiersz na stopkę
+    if len(body) <= height - k:
+        return lines, 0, ""
+    offset = max(0, min(offset, len(body) - room))
+    shown = lines[:k] + body[offset:offset + room]
+    foot = "  ↑↓ PgUp PgDn Home End — wiersze %d–%d z %d" % (offset + 1, min(offset + room, len(body)), len(body))
+    return shown, offset, foot
+
+
+def run_curses(stdscr, start):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    pal = {"head": (curses.COLOR_CYAN, curses.A_BOLD), "bold": (-1, curses.A_BOLD), "miss": (curses.COLOR_RED, curses.A_BOLD),
+           "deny": (curses.COLOR_RED, 0), "rst": (curses.COLOR_MAGENTA, 0), "warn": (curses.COLOR_YELLOW, 0),
+           "hit": (curses.COLOR_GREEN, 0), "dim": (-1, curses.A_DIM), "": (-1, 0)}
+    attr = {}
+    for i, (k, (fg, a)) in enumerate(pal.items(), 1):
+        curses.init_pair(i, fg, -1)
+        attr[k] = curses.color_pair(i) | a
+    app, n, paused, lines, last = App(), start, False, [], 0.0
+    offset = {k: 0 for k in SCREENS}                    # przewinięcie każdej karty osobno
+    stdscr.timeout(100)
+    stdscr.keypad(True)
+    while True:
+        if not paused and time.time() - last >= INTERVAL:
+            lines, last = app.lines(n), time.time()
+        h, w = stdscr.getmaxyx()
+        height = h - 2                                   # wiersz 0: nagłówek, wiersz 1: pusty
+        shown, offset[n], foot = visible(lines, offset[n], height)
+        stdscr.erase()
+        stdscr.addnstr(0, 0, header(n, paused).ljust(w), w - 1, curses.A_REVERSE)
+        for y, (text, style) in enumerate(shown[:height], 2):
+            stdscr.addnstr(y, 0, text, w - 1, attr.get(style, 0))
+        if foot:
+            stdscr.addnstr(h - 1, 0, foot.ljust(w), w - 1, curses.A_REVERSE)
+        stdscr.refresh()
+        k = stdscr.getch()
+        page = max(1, height - 3)
+        if k in (ord("q"), ord("Q"), 27):
+            return
+        elif k in (ord("p"), ord("P"), ord(" ")):
+            paused = not paused
+        elif k in (curses.KEY_DOWN, ord("j")):
+            offset[n] += 1
+        elif k in (curses.KEY_UP, ord("k")):
+            offset[n] = max(0, offset[n] - 1)
+        elif k == curses.KEY_NPAGE:
+            offset[n] += page
+        elif k == curses.KEY_PPAGE:
+            offset[n] = max(0, offset[n] - page)
+        elif k == curses.KEY_HOME:
+            offset[n] = 0
+        elif k == curses.KEY_END:
+            offset[n] = 10 ** 9                          # visible() przytnie do końca listy
+        elif ord("1") <= k <= ord("0") + len(SCREENS) and int(chr(k)) != n:
+            n, last = int(chr(k)), 0.0
+            app.lines(n)                                 # punkt odniesienia dla szybkości
+            time.sleep(min(INTERVAL, 0.5))
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    ap = argparse.ArgumentParser(prog="router-top", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("screen", nargs="?", type=int, choices=sorted(SCREENS), default=1, help="ekran startowy")
+    ap.add_argument("--once", type=int, choices=sorted(SCREENS), metavar="N", help="jeden odczyt ekranu N jako tekst")
+    args = ap.parse_args()
+    if args.once:
+        app = App()
+        app.lines(args.once)
+        time.sleep(INTERVAL)
+        print(header(args.once, False))
+        for text, _style in app.lines(args.once):
+            print(text)
+        return 0
+    if not sys.stdout.isatty():
+        sys.exit("router-top potrzebuje terminala (do skryptów: router-top --once N)")
+    curses.wrapper(run_curses, args.screen)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ROUTER_TOP_PY
+}
+
 prog_router_check() { printf '#!/bin/sh\nexec /opt/router/install-router.sh --check "$@"\n'; }
 
 # wersja skryptu zapisana na routerze (/etc/router/version): write_version install|upgrade
@@ -4218,7 +5030,8 @@ do_check() {
 
   printf '\n%s== Usługi ==%s\n' "$c_hdr" "$c_off"
   local u
-  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd; do
+  [[ -e /etc/router/firewall.enabled ]] || say "router-fw: firewall nieaktywny (aktywacja: router-fw enable) — usługa celowo nie działa"
+  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd; do
     if systemctl is-active --quiet "$u"; then ok "$u: active"; else warn "$u: $(systemctl is-active "$u" 2>/dev/null || true)"; fi
   done
 
@@ -4226,7 +5039,10 @@ do_check() {
   vppctl show version || true
   vppctl show threads || true
   vppctl show interface || true
-  vppctl show plugins 2>/dev/null | grep -E 'linux_cp|linux_nl|sflow|dpdk' || true
+  vppctl show plugins 2>/dev/null | grep -E 'linux_cp|linux_nl|sflow|dpdk|synack_guard' || true
+  if grep -q '^nf_conntrack ' /proc/modules; then warn "conntrack załadowany w kernelu (powinien być wyłączony — po restarcie zniknie)"
+  else ok "conntrack wyłączony"; fi
+  guard_plugin_log
   vppctl show sflow || true
 
   printf '\n%s== Interfejsy (/etc/router/ifaces.conf) ==%s\n' "$c_hdr" "$c_off"
@@ -4256,8 +5072,8 @@ do_check() {
   cat /proc/mdstat 2>/dev/null || true
 
   printf '\n%s== router-monitor (ostatnie zdarzenia) ==%s\n' "$c_hdr" "$c_off"
-  tail -n 15 /var/log/router-monitor/router-monitor.log 2>/dev/null || warn "brak logu router-monitor"
-  printf '\n  ostatnia kontrola po starcie: %s\n' "$(grep -h 'BOOT_' /var/log/router-monitor/router-monitor.log 2>/dev/null | tail -n1)"
+  tail -n 15 /var/log/router/alarmy.log 2>/dev/null || warn "brak logu router-monitor"
+  printf '\n  ostatnia kontrola po starcie: %s\n' "$(grep -h 'BOOT_' /var/log/router/alarmy.log 2>/dev/null | tail -n1)"
   printf '\n%s== Historia /etc (etckeeper) ==%s\n' "$c_hdr" "$c_off"
   git -C /etc log --oneline -n 5 2>/dev/null || true
   printf '\n%s== Odporność ==%s\n' "$c_hdr" "$c_off"
@@ -4275,26 +5091,451 @@ if [[ $MODE == check ]]; then do_check; exit 0; fi
 # (router.env, ifaces.conf, notify.conf, bird.conf, startup.conf...). Sesje BGP się nie przerywają.
 # =============================================================================
 # nazwa | plik docelowy | tryb | funkcja generująca treść | usługa do restartu po zmianie
+# Instrukcja obsługi produkcyjnej: /etc/router/INSTRUKCJA.md (etap 20; aktualizuje ją też upgrade_script)
+router_manual() {
+  cat <<'ROUTER_MANUAL_MD'
+# Router BGP (VPP + BIRD) — instrukcja obsługi produkcyjnej
+
+Ten plik instaluje `install-router.sh` (aktualizuje go też `install-router upgrade_script`).
+Opisuje, **jak pracować z routerem na co dzień**: co gdzie zmieniać, w jakiej kolejności i co robić przy awarii lub ataku.
+Pełna dokumentacja techniczna (architektura, wszystkie pliki, parametry tej instalacji): `/opt/router/README.md`.
+
+---
+
+## 0. Pięć zasad, które chronią przed wpadką
+
+1. **Każda zmiana idzie przez plik w `/etc/router/` i polecenie routera — nigdy przez ręczne `vppctl`.**
+   Pliki są jedynym źródłem prawdy. Co dodasz ręcznie w VPP, zniknie przy następnym `apply`, a timery kontrolne zgłoszą to jako rozjazd (`DRIFT`).
+2. **Zawsze w tej kolejności: `check` → `diff` → `apply`.** `diff` pokazuje dokładnie, co się zmieni, i niczego nie rusza.
+3. **Firewall zmieniaj z siatką bezpieczeństwa:** `router-fw apply --confirm 120`. Jeśli zmiana odetnie Ci dostęp albo coś zepsuje, sama się cofnie po 120 s.
+4. **Jeden błąd w pliku = nic nie jest zmieniane.** Po restarcie, gdy plik ma błąd, router użyje ostatniej poprawnej wersji i wyśle alarm `CONFIG_ERROR`.
+5. **Historia `/etc` jest w gicie (etckeeper).** Każdą zmianę da się podejrzeć i cofnąć: `git -C /etc log -p router/firewall.conf`.
+
+SSH (port zarządzający eth2) działa poza VPP — żadna zmiana interfejsów, firewalla ani guarda nie odetnie dostępu do serwera.
+
+---
+
+## 1. Gdzie co jest
+
+| Co zmieniasz | Plik | Polecenie |
+|---|---|---|
+| Interfejsy: porty, VLAN-y, adresy, loopbacki, opisy | `/etc/router/ifaces.conf` | `router-ifaces` |
+| Firewall ruchu przechodzącego | `/etc/router/firewall.conf` (+ `/etc/router/fw-lists/`) | `router-fw` |
+| Ochrona przed odbiciami SYN-ACK / UDP | `/etc/router/synack-guard.conf` | `router-guard` |
+| Progi alarmów obciążenia | `/etc/router/router-monitor.conf` | `systemctl restart router-monitor` |
+| E-maile z alarmami (SMTP, odbiorcy, co wysyłać) | `/etc/router/notify.conf` | `router-notify` |
+| Sesje BGP | `/etc/bird/bird.conf`, `/etc/bird/conf.d/` | `birdc` |
+| Parametry instalacji (porty, rdzenie, community SNMP) | `/etc/router/router.env` | tylko do odczytu |
+
+| Logi (`/var/log/router/`, rotacja codziennie, 20 dni) | Zawartość |
+|---|---|
+| `alarmy.log` | **wszystkie alarmy i zdarzenia** — od tego zaczynaj; z niego idą e-maile |
+| `firewall.log`, `guard.log`, `ifaces.log` | każde polecenie wysłane do VPP i odpowiedź VPP (szczegóły zmian) |
+| `vpp.log`, `bird.log` | komunikaty VPP i BIRD |
+
+Na żywo: `tail -f /var/log/router/alarmy.log`
+
+---
+
+## 2. Codzienna kontrola (2 minuty)
+
+```
+router-top                            # NA ŻYWO: 1 obciążenie VPP, 2 porty/VLAN-y, 3 firewall, 4 guard (q = wyjście)
+router-check                          # pełna kontrola: usługi, VPP, BGP, interfejsy, firewall, logi
+tail -n 30 /var/log/router/alarmy.log # co się działo
+birdc show protocols                  # sesje BGP: wszystkie "Established"?
+router-ifaces                         # interfejsy: stan up/down, adresy, opisy
+router-fw counters                    # ile trafień mają reguły firewalla
+```
+
+Na co patrzeć w `alarmy.log`:
+
+| Komunikat | Co znaczy | Co zrobić |
+|---|---|---|
+| `%VPP-4-LOAD_HIGH`, `%VPP-2-LOAD_CRITICAL` | workery VPP są obciążone (duży ruch / atak) | sprawdź ruch (sFlow), rozdział 7 |
+| `%VPP-2-RX_MISS`, `%VPP-3-NIC_DISCARD` | **gubione pakiety** — VPP lub karta nie nadąża | rozdział 7; jeśli stale — za mało workerów |
+| `%VPP-4-PUNT_HIGH` | dużo ruchu do samego routera (atak na control plane) | sprawdź źródła; netfilter w netns dataplane |
+| `%VPP-1-HANG`, `%VPP-2-DOWN` | VPP nie odpowiada / leży | rozdział 9 |
+| `%SYS-2-SERVICE_FAIL`, `%SYS-1-SERVICE_DOWN` | usługa padła (VPP, BIRD…) | `journalctl -u <usługa> -b` |
+| `%SYS-4-CPU_HIGH` | przeciążony rdzeń systemowy (BIRD, SNMP) | `top`; duża zmiana tras BGP? |
+| `%MD-…`, `%SMART-…` | dysk / RAID | wymiana dysku |
+| `%IFACE-4-DRIFT`, `%FW-4-DRIFT`, `%GUARD-4-DRIFT` | VPP różni się od pliku (ktoś zmienił ręcznie) | `router-ifaces diff` / `router-fw diff`, potem `apply` |
+| `%…-2-CONFIG_ERROR` | plik ma błąd; działa ostatnia poprawna wersja | `… check`, popraw plik |
+| `%SYS-5-BOOT_OK` / `%SYS-2-BOOT_PROBLEM` | wynik kontroli po starcie serwera | przy PROBLEM: `router-check` |
+
+Zdarzenia kończą się komunikatem `…_NORMAL` / `…_END` z czasem trwania i szczytem.
+
+---
+
+## 3. Interfejsy (`router-ifaces`, plik `ifaces.conf`)
+
+Format: jedna linia = jeden interfejs.
+```
+# interfejs  vlan  ipv4                ipv6                   opis
+hu0          -     -                   -                      Port 100G: trunk VLAN do switcha
+hu0          100   192.0.2.2/30        2001:db8:100::2/64     Transit: EPIX AS62081
+hu0          200   198.51.100.2/30     -                      Transit: Upstream-2 10G
+loop0        -     203.0.113.1/32      2001:db8::1/128        Loopback: router-id, BGP, SNMP
+```
+Kilka adresów na jednym VLAN-ie: po przecinku, bez spacji (`192.0.2.2/30,203.0.113.65/27`); z tej samej podsieci tylko z tą samą maską. `-` = brak. Opis trafia do SNMP (LibreNMS) — zaczynaj od `Transit:`, `Peering:`, `Core:`, `Cust:`.
+
+**Procedura zmiany (np. nowy VLAN do klienta):**
+```
+nano /etc/router/ifaces.conf           # dopisz linię
+router-ifaces diff                     # sprawdź, co się zmieni
+router-ifaces apply                    # zastosuj (pyta t/N)
+router-ifaces                          # sprawdź stan
+```
+- Nowa linia → VLAN/loopback jest tworzony, podnoszony, dostaje adresy; BIRD od razu widzi interfejs.
+- **Usunięcie adresu zrywa sesje BGP, które z niego korzystają** — `diff` to pokazuje. Rób to w oknie serwisowym.
+- Usunięta linia → VLAN jest kasowany (tylko taki, który utworzył `router-ifaces`).
+- MTU jest zawsze 1500 i nie ustawia się go w pliku.
+- **IPv6 tylko tam, gdzie wpiszesz adres IPv6** — z `-` w kolumnie ipv6 interfejs ma IPv6 całkowicie wyłączone (VPP i Linux). Router nigdy nie wysyła RA (nie adresuje innych urządzeń) i nie przyjmuje cudzych RA.
+- Szczegóły każdej zmiany: `/var/log/router/ifaces.log`.
+
+Interfejs, który ma być filtrowany przez firewall lub guard, musi też być wpisany w `firewall.conf` (`zone`) / `synack-guard.conf` (`in-if`, `out-if`).
+
+---
+
+## 4. Firewall ruchu przechodzącego (`router-fw`, plik `firewall.conf`)
+
+Filtruje **tylko ruch przechodzący przez router** (ACL w VPP, bezstanowo). Ruchu do samego routera (BGP, SNMP, ICMP) nie dotyczy.
+
+### Zasada działania
+- **Czarna lista:** na końcu każdej listy reguł jest zawsze „przepuść resztę”. Wpisujesz, co blokować (`deny`); `permit` tylko jako wyjątek **nad** blokadą.
+- **Pierwsza pasująca reguła wygrywa.**
+- Interfejs bez żadnych reguł nie ma filtra.
+
+### Składnia
+```
+zone  hu0.100  internet                    # strefa = nazwa grupy interfejsów
+zone  hu0.200  internet
+zone  hu0.300  clients
+
+list bogony  "Bogony – adresy nieroutowalne"   # lista: nagłówek z opisem...
+    10.0.0.0/8          # sieć prywatna         # ...adresy we WCIĘTYCH liniach, komentarz = opis adresu
+    192.168.0.0/16      # sieć prywatna
+    include /etc/router/fw-lists/bogony-extra.list
+
+# kierunek    akcja   proto  src      sport  dst  dport  "opis (widać w statystykach)"
+internet->    deny    any    @bogony  any    any  any    "Anty-spoofing: bogony z internetu"
+internet->    deny    tcp    any      any    any  445    "SMB z internetu"
+->internet    deny    tcp    any      any    any  25     "SMTP od klientów (spam)"
+hu0.200->     deny    udp    any      any    any  123    "Blokada NTP (tylko na Upstream-2)"
+```
+- `internet->` = ruch **wchodzący** z interfejsów strefy; `->internet` = **wychodzący** do strefy.
+- `hu0.200->` = tylko ten interfejs (musi być w jakiejś strefie). Kolejność na nim: blokady doraźne → reguły interfejsu → reguły strefy → przepuść resztę.
+- proto: `tcp udp icmp icmp6 any`; port: `any | 25 | 25,587 | 1024-65535`; adres: `any | prefiks | @lista | a,b`.
+
+### Procedura zmiany
+```
+nano /etc/router/firewall.conf
+router-fw check                  # składnia + ostrzeżenia (reguły zacienione, deny na BGP/BFD)
+router-fw diff                   # co się zmieni w VPP
+router-fw apply --confirm 120    # zastosuj; cofnie się samo po 120 s...
+router-fw counters               # ...sprawdź, czy ruch płynie, czy reguły łapią to, co trzeba
+router-fw confirm                # ...i potwierdź — zmiana zostaje
+router-fw enable                 # tylko za pierwszym razem: aktywacja na stałe (reguły wracają po restarcie)
+```
+**Po instalacji firewall jest nieaktywny** — dopasuj `firewall.conf` (strefy = Twoje interfejsy), przejdź powyższe kroki i dopiero `router-fw enable`. Do tego czasu reguły znikają przy restarcie VPP. Stan: pierwsza linia `router-fw show`. Wyłączenie: `router-fw disable` (zdejmuje reguły z VPP).
+Jeśli nie wpiszesz `confirm`, po 120 s wraca poprzednia wersja (`%FW-4-ROLLBACK`), a odrzucony plik zostaje w `/var/lib/router/fw.rejected.conf`.
+
+### Blokady doraźne (np. atakujący adres)
+```
+router-fw block 198.51.100.7 2h  # blokada źródła w strefie "internet" na 2 h (30m, 2h, 1d; bez czasu = na stałe)
+router-fw blocks                 # lista blokad
+router-fw unblock 198.51.100.7
+```
+Blokady nie wymagają edycji pliku i wygasają same:
+- blokada trafia do `/var/lib/router/fw-blocks.json` (nie do `firewall.conf`) razem z **godziną wygaśnięcia** — czas nie jest odliczany, tylko porównywany z zegarem, więc restart niczego nie przesuwa,
+- po restarcie VPP lub serwera blokada wraca, jeśli jej czas jeszcze nie minął; jeśli minął — nie wraca,
+- co minutę `router-fw-expire.timer` zdejmuje wygasłe blokady z VPP (`%FW-5-BLOCK_EXPIRED` w `alarmy.log`),
+- blokady działają na wejściu strefy `internet` (uplinki) i wymagają aktywnego firewalla (`router-fw enable`) — bez tego `block` odmówi, bo blokada nie przetrwałaby restartu ani nie wygasłaby sama.
+
+### Statystyki
+```
+router-fw counters               # trafienia każdej reguły z opisem: pakiety, bajty, pkt/s
+router-fw counters -w            # odświeżanie co sekundę
+router-fw counters -v            # + który adres z @listy był trafiany
+router-fw counters clear         # zerowanie (punkt odniesienia)
+router-fw show                   # strefy, listy, reguły, stan w VPP
+```
+VPP zeruje liczniki listy przy każdej zmianie jej treści (`apply`).
+
+---
+
+## 5. Ochrona przed odbiciami (`router-guard`, plik `synack-guard.conf`)
+
+Włączana **na żądanie** podczas ataku odbitego (SYN-ACK reflection, amplifikacja UDP: DNS, NTP, memcached…). Odrzuca tylko „odpowiedzi bez pytania” do wskazanych prefiksów: SYN-ACK bez wcześniejszego SYN od klienta i UDP z portów amplifikacji bez wcześniejszego zapytania. Normalny ruch (nowe połączenia, dane, VPN, gry) jest nietknięty.
+
+### Przygotowanie (raz, zanim przyjdzie atak)
+```
+in-if    hu0.100 hu0.200          # uplinki — skąd przychodzą odbicia
+out-if   hu0.300                  # strona klientów — skąd wychodzą SYN
+group web      203.0.113.0/24     # grupy prefiksów do szybkiego włączania
+group hosting  198.51.100.0/24  2001:db8:100::/48
+```
+`router-guard check` → „składnia OK”.
+
+### Tryby — co robią
+| Tryb | Normalny ruch | Odpowiedź bez pytania (atak) |
+|---|---|---|
+| **off** | przechodzi | — filtr nie działa, zero kosztu |
+| **monitor** | przechodzi | **przechodzi**, ale jest liczona („naruszenia”) i widoczna w `router-top 4` |
+| **enforce** | przechodzi | **odrzucona** w VPP — nie dociera do klienta (z `reply-rst on`: dodatkowo RST do serwera, który ją wysłał) |
+
+`router-guard enforce` przełącza od razu; `on … --enforce` daje najpierw 60 s monitora (rozgrzewka), potem enforce sam. Pełny opis każdego polecenia, ustawienia i automatycznych zachowań: `/opt/router/README.md`, rozdział 10b.
+
+### W czasie ataku
+```
+router-guard on 203.0.113.0/24            # 1. monitor: tylko liczy, nic nie blokuje
+router-guard status                       # 2. po 30–60 s: rosną "naruszenia"? → to odbicia
+router-guard enforce                      # 3. odrzucaj
+tail -f /var/log/router/alarmy.log        # 4. obserwuj
+router-guard off                          # 5. po ataku (albo off <prefiks>)
+```
+Szybciej, jednym poleceniem (60 s monitora, potem enforce, wyłączenie po 2 h):
+```
+router-guard on web --enforce --for 2h
+```
+
+Na żywo: `router-top 4` — liczniki z szybkością, najczęstsze źródła i atakowane adresy, ostatnie 30 naruszeń (źródło:port → cel:port, decyzja: ODRZUCONY / ODRZUCONY + RST / PRZESZEDŁ w monitorze). Lista to próbka, liczniki są dokładne.
+
+### Jak czytać `router-guard status`
+| Wiersz | Znaczenie |
+|---|---|
+| sprawdzone / przepuszczone | odpowiedzi do chronionych adresów / prawidłowe (był SYN od klienta) |
+| naruszenia | odpowiedzi bez pytania — to jest atak |
+| odrzucone (enforce) | ile faktycznie zablokowano |
+| tablica IPv4 / IPv6 | zapełnienie pamięci połączeń; przy 90% alarm i powrót do monitora |
+| RST wysłane / do wysłania / pominięte | opcja `reply-rst` (niżej) |
+
+### Uwaga
+- **Naruszenia przy normalnym ruchu (bez ataku) ≠ 0?** Część ruchu klienta omija ten router (asymetria). **Nie włączaj enforce** — zablokujesz prawdziwe połączenia.
+- Rozgrzewka 60 s (`warmup`) jest potrzebna — tablica uczy się bieżących połączeń klientów.
+- Ochrona sama się wyłącza po `--for` albo `max-on` (domyślnie 6 h). Przeżywa restart VPP (wraca w monitorze, po rozgrzewce enforce).
+- `reply-rst on` (w pliku, domyślnie off): na odrzucony SYN-ACK router odsyła RST, więc serwery-reflektory przestają powtarzać pakiety. Limit `reply-rst-pps` (10 000/s). Skalę sprawdź najpierw w monitorze (wiersz „RST do wysłania”).
+- Atak większy niż przepustowość łączy do upstreamów → guard nie pomoże; potrzebny RTBH / Flowspec u operatora.
+
+---
+
+## 5a. Ochrona CPU routera (iptables), czas, DNS
+
+Dwa komplety reguł, wczytywane przy każdym starcie:
+
+| Gdzie | Plik | Po edycji |
+|---|---|---|
+| port zarządzający (eth2, SSH) | `/etc/iptables/rules.v4`, `rules.v6` | `netfilter-persistent reload` |
+| adresy w VPP (interfejsy, **loop0**, SNMP, BGP) | `/etc/iptables/dataplane.rules.v4`, `dataplane.rules.v6` | `systemctl restart router-dataplane-fw` |
+
+Polityka: zaufane sieci (10/8, 172.16/12, 192.168/16 — LOCAL; 46.45.64.0/18 — ALL BLOKOWE) mają pełny dostęp; LibreNMS zawsze ma SNMP; ping do routera najwyżej 10/s z adresu i 500/s łącznie; **SSH i SNMP (22, 161) z reszty świata — DROP**; reszta (BGP, BFD) przechodzi.
+
+```
+iptables -t raw -L PREROUTING -nv                        # eth2: reguły i liczniki trafień
+ip netns exec dataplane iptables -t raw -L PREROUTING -nv  # adresy VPP: reguły i liczniki
+```
+Reguły są w tabeli **raw** (łańcuch `PREROUTING`): pakiet jest odrzucany zaraz po wejściu, przed trasowaniem — najtaniej dla CPU przy zalewaniu. **Conntrack jest wyłączony** (`/etc/modprobe.d/router-no-conntrack.conf`): ruch tranzytowy obsługuje VPP, więc kernel nie musi śledzić połączeń. Reguły ze stanem (`-m state`, `-m conntrack`, NAT) nie zadziałają — to celowe.
+
+**Nowa zaufana sieć:** dopisz linię `-A PREROUTING -s <prefiks> -m comment --comment "opis" -j ACCEPT` nad regułami `DROP` w obu plikach, przeładuj oba. Żeby miała też SNMP: dopisz `rocommunity <community> <prefiks>` w `/etc/snmp/snmpd.conf` (blok „zaufane sieci”) i `systemctl restart snmpd-dataplane`.
+
+**Uwaga — nie odetnij się:** przed `netfilter-persistent reload` upewnij się, że adres, z którego jesteś po SSH, jest w zaufanych sieciach.
+
+**Ping i mtr na adresy w VPP obsługuje VPP, nie kernel** — limity iptables chronią kernel (eth2 i ruch przekazany przez VPP do Linuksa), ale nie ping obsłużony w VPP.
+
+Czas: `timedatectl` (strefa Europe/Warsaw), `chronyc sources` (serwery GUM tempus1/tempus2). DNS: `/etc/resolv.conf`.
+
+ARP/ND: VPP do 65 536 sąsiadów (osobno IPv4 i IPv6), wpis bez ARP/ND od sąsiada przez 4 h jest sprawdzany (brak odpowiedzi = usunięcie), przy zapełnieniu najstarszy ustępuje nowemu. `vppctl show ip neighbor-config`.
+
+---
+
+## 6. Alarmy i e-maile (`router-monitor`, `router-notify`)
+
+### router-monitor — alarmy obciążenia
+Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-monitor.conf`:
+
+| Próg | Domyślnie | Alarm |
+|---|---|---|
+| `VEC_WARN` / `VEC_CRIT` | 64 / 160 | obciążenie workera (wektor 1 = luz, 256 = pełne nasycenie) |
+| `RXMISS_PPS` | 1 | gubione pakiety na karcie |
+| `NIC_DISCARD_PPS` | 1 | odrzucenia sprzętowe karty |
+| `PUNT_PPS` | 20000 | ruch do samego routera |
+| `HK_CPU_PCT` / `HK_CPU_SECONDS` | 90 / 5 | przeciążony rdzeń systemowy |
+| `HANG_SECONDS` / `HANG_RESTART` | 30 / 1 | VPP nie odpowiada → po 30 s restart VPP |
+
+Po zmianie: `systemctl restart router-monitor`. Bieżący stan: `/run/router-monitor/state.json`.
+
+### router-notify — e-maile
+Plik `/etc/router/notify.conf` (tylko root; zawiera hasło SMTP, nie trafia do gita):
+```
+ALERT_EMAILS="noc@firma.pl, dyzurny@firma.pl"
+SMTP_HOST=smtp.firma.pl   SMTP_PORT=587   SMTP_SECURITY=starttls   SMTP_USER=...   SMTP_PASS="..."
+MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"
+MAIL_SEND_CLEAR=yes        # także maile o zakończeniu zdarzenia
+MAIL_MAX_SEV=5             # poziomy 1..5 (1 = najpoważniejsze)
+MAIL_MIN_INTERVAL=60       # zdarzenia z 60 s idą jednym mailem
+MAIL_MAX_PER_HOUR=30
+```
+```
+router-notify test         # wyślij mail testowy teraz (sprawdzenie SMTP)
+router-notify categories   # kategorie i co jest wysyłane
+```
+Zmiany działają w 5 s, bez restartu. Mail idzie portem zarządzającym — działa także, gdy VPP leży. Przy błędzie SMTP alarmy czekają w kolejce `/var/spool/router-notify/` (`%SYS-3-MAIL_FAIL` w logu).
+
+Tylko poważne rzeczy, bez zakończeń: `MAIL_SEND="CRASH SERVICES RAID DISKS VPP_DROPS"`, `MAIL_SEND_CLEAR=no`.
+
+---
+
+## 7. Atak DDoS — co robić, krok po kroku
+
+1. **Podgląd na żywo:** `router-top` — karta **1** pokaże obciążenie workerów VPP, karta **2** — który port/VLAN dostaje ruch (Gb/s, pkt/s, zgubione pakiety), karta **4** — czy to odbicia (naruszenia, najczęstsze źródła i atakowane adresy), karta **3** — co łapią reguły firewalla.
+   **Rozpoznanie.** Alarmy `%VPP-4-LOAD_HIGH`, `%VPP-2-RX_MISS`, `%VPP-4-PUNT_HIGH` w `alarmy.log` / e-mail. W sFlow (kolektor) albo LibreNMS ustal **cel** (adres klienta) i **typ** ruchu (protokół, port źródłowy).
+2. **Odbicia (SYN-ACK, UDP z portów 53/123/161/389/1900/11211…) do klienta** → `router-guard` (rozdział 5).
+3. **Kilka konkretnych źródeł** → `router-fw block <adres> 1h`.
+4. **Konkretny protokół/port** → reguła `deny` w `firewall.conf` + `apply --confirm 120`.
+5. **Atak na sam router** (`PUNT_HIGH`) → to zadanie netfiltera w netns `dataplane`, nie router-fw.
+6. **Łącza do upstreamów zapchane** (ruch większy niż ich przepustowość) → nic na routerze nie pomoże: RTBH / Flowspec u operatora.
+7. **Po ataku:** `router-guard off`, przejrzyj `router-fw blocks`, sprawdź `alarmy.log` (zdarzenia `_NORMAL` z czasem trwania i szczytem).
+
+---
+
+## 8. BGP (BIRD)
+
+```
+birdc show protocols                 # sesje
+birdc show protocols all <nazwa>     # szczegóły sesji
+birdc show route count               # liczba tras
+birdc configure check                # kontrola składni po edycji /etc/bird/
+birdc configure                      # wczytanie zmian bez restartu (sesje zostają)
+```
+BIRD działa w netns `dataplane` i startuje dopiero po odtworzeniu interfejsów i firewalla. Restart VPP restartuje też BIRD (sesje wstają od nowa). Logi: `/var/log/router/bird.log`.
+
+---
+
+## 9. Awarie
+
+| Objaw | Co zrobić |
+|---|---|
+| Ruch nie płynie, BGP leży | `router-check`; `systemctl status vpp`; `journalctl -u vpp -b`; `/var/log/router/vpp.log` |
+| VPP sam się restartuje (`%SYS-2-SERVICE_FAIL`) | po 5 s wstaje sam (max 5× / 10 min); interfejsy, firewall, guard i BIRD wracają automatycznie |
+| VPP nie wstaje | `journalctl -u vpp -b`; `grep Huge /proc/meminfo`; `lsmod \| grep mlx5`; `vpp -c /etc/vpp/startup.conf` pokaże błąd |
+| `%…-4-DRIFT` | ktoś zmienił VPP ręcznie: `router-ifaces diff` / `router-fw diff` → `apply` przywraca stan z pliku |
+| Zła zmiana w pliku | `git -C /etc log -p router/<plik>`; przywrócenie: `git -C /etc checkout <commit> -- router/<plik>`, potem `apply` |
+| Zmiana firewalla odcięła ruch | jeśli była z `--confirm`, cofnie się sama; inaczej: popraw plik i `router-fw apply`, albo przywróć z gita |
+| Restart serwera | wszystko wstaje samo (`router.target`); sprawdź `grep BOOT_ /var/log/router/alarmy.log \| tail -1` |
+| Brak e-maili | `router-notify test`; `ls /var/spool/router-notify/`; `grep MAIL_FAIL /var/log/router/alarmy.log` |
+
+**Restart VPP zawsze oznacza krótką przerwę w ruchu i ponowne zestawienie sesji BGP.** Restartuj świadomie: `systemctl restart vpp`.
+
+---
+
+## 10. Aktualizacja programów routera
+
+Nowy `install-router.sh` wgraj na router, potem:
+```
+./install-router.sh --version                  # wersja nowa i zainstalowana
+./install-router.sh upgrade_script --dry-run   # co się zmieni (diff), bez zapisywania
+./install-router.sh upgrade_script             # podmień tylko zmienione programy
+```
+Podmienia tylko programy w `/opt/router/bin`, `router-check`, tę instrukcję i kopię skryptu. **Konfiguracja, VPP i BIRD zostają nietknięte — sesje BGP się nie przerywają.** Kopia starych wersji: katalog `backup/upgrade-<data>/` w katalogu danych instalacji.
+
+Zmiany wymagające ponownego uruchomienia etapu instalatora (np. nowa wersja VPP, nowa wtyczka): `./install-router.sh --from <nr>` — w oknie serwisowym (restart VPP).
+
+---
+
+## 11. Ściąga
+
+```
+router-check                              # pełna kontrola
+router-top [1-4]                          # na żywo: VPP / interfejsy / firewall / guard  (↑↓ przewijanie, q wyjście)
+tail -f /var/log/router/alarmy.log        # alarmy na żywo
+
+router-ifaces | diff | apply | check      # interfejsy (ifaces.conf)
+router-fw check | diff | apply --confirm 120 | confirm | enable | disable
+router-fw block IP 1h | unblock IP | blocks
+router-fw counters [-w] [-v] | show
+router-guard on <prefiks|grupa> [--enforce] [--for 2h] | status | enforce | monitor | off
+router-notify test | categories
+birdc show protocols | configure check | configure
+
+systemctl status router.target            # wszystkie usługi routera
+git -C /etc log -p router/                # historia zmian konfiguracji
+iptables -t raw -L PREROUTING -nv         # ochrona CPU: eth2
+ip netns exec dataplane iptables -t raw -L PREROUTING -nv   # ochrona CPU: adresy VPP, loop0
+chronyc sources                           # synchronizacja czasu
+```
+ROUTER_MANUAL_MD
+}
+
 UPGRADE_PROGRAMS=(
   "router-monitor|/opt/router/bin/router-monitor|755|prog_router_monitor|router-monitor.service"
   "router-notify|/opt/router/bin/router-notify|755|prog_router_notify|router-notify.service"
   "router-ifaces|/opt/router/bin/router-ifaces|755|prog_router_ifaces|"
   "router-fw|/opt/router/bin/router-fw|755|prog_router_fw|"
   "router-guard|/opt/router/bin/router-guard|755|prog_router_guard|"
+  "router-top|/opt/router/bin/router-top|755|prog_router_top|"
   "router-alert|/opt/router/bin/router-alert|755|prog_router_alert|"
   "router-bootcheck|/opt/router/bin/router-bootcheck|755|prog_router_bootcheck|"
   "mdadm-alert|/opt/router/bin/mdadm-alert|755|prog_mdadm_alert|"
   "smartd-alert|/opt/router/bin/smartd-alert|755|prog_smartd_alert|"
   "router-fw-update|/opt/router/bin/router-fw-update|755|prog_router_fw_update|"
   "router-check|/usr/local/sbin/router-check|755|prog_router_check|"
+  "INSTRUKCJA.md|/etc/router/INSTRUKCJA.md|644|router_manual|"
 )
 
 upgrade_syntax_ok() {   # upgrade_syntax_ok <plik> — składnia wg shebangu
+  [[ $1 == *.md ]] && { [[ -s $1 ]]; return; }   # dokumentacja: wystarczy, że nie jest pusta
   case $(head -n1 "$1") in
     *python*) python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$1" ;;
     *bash*)   bash -n "$1" ;;
     *)        sh -n "$1" ;;
   esac
+}
+
+# Jeden katalog logów routera: /var/log/router. Przeniesienie ze starego /var/log/router-monitor (wersje < 1.4.0).
+migrate_logdir() {
+  local old=/var/log/router-monitor new=/var/log/router f base dst
+  mkdir -p "$new"
+  chmod 750 "$new"
+  chgrp adm "$new" 2>/dev/null || true
+  [[ -d $old && ! -L $old ]] || return 0
+  shopt -s nullglob
+  for f in "$old"/*; do
+    base=${f##*/}
+    base=${base/#router-monitor.log/alarmy.log}
+    base=${base/#router-fw.log/firewall.log}
+    base=${base/#router-guard.log/guard.log}
+    base=${base/#router-ifaces.log/ifaces.log}
+    dst=$new/$base
+    if [[ -e $dst && $base == *.log ]]; then
+      cat "$f" "$dst" >"$dst.migr" && mv -f "$dst.migr" "$dst" && rm -f "$f"   # starsze wpisy na początek
+    elif [[ -e $dst ]]; then
+      mv -f "$f" "$dst.stary"
+    else
+      mv -f "$f" "$dst"
+    fi
+  done
+  shopt -u nullglob
+  rmdir "$old" 2>/dev/null || warn "w $old zostały pliki — przejrzyj i usuń ręcznie"
+  ok "logi przeniesione z $old do $new"
+}
+
+router_logrotate() {
+  put_file /etc/logrotate.d/router "rotacja /var/log/router (codziennie, ${LOG_KEEP_DAYS:-20} dni)" <<EOF
+/var/log/router/*.log {
+  daily
+  rotate ${LOG_KEEP_DAYS:-20}
+  compress
+  delaycompress
+  missingok
+  notifempty
+  create 0640 root adm
+  sharedscripts
+  postrotate
+    [ -x /usr/lib/rsyslog/rsyslog-rotate ] && /usr/lib/rsyslog/rsyslog-rotate || true
+  endscript
+}
+EOF
+  rm -f /etc/logrotate.d/router-monitor
 }
 
 do_upgrade() {
@@ -4367,9 +5608,12 @@ do_upgrade() {
   done
   ln -sfn /opt/router/bin/router-ifaces /usr/local/sbin/router-ifaces
   ln -sfn /opt/router/bin/router-notify /usr/local/sbin/router-notify
+  [[ -e /opt/router/bin/router-top ]] && ln -sfn /opt/router/bin/router-top /usr/local/sbin/router-top
   ln -sfn /opt/router/bin/router-fw-update /usr/local/sbin/router-fw-update
   ln -sfn /opt/router/install-router.sh /usr/local/sbin/install-router
   ok "podmieniono: ${changed[*]}   (poprzednie wersje: $bdir)"
+  migrate_logdir
+  router_logrotate
 
   # 4. restart tylko usług, których program się zmienił (nigdy VPP ani BIRD)
   for unit in "${restart[@]}"; do
@@ -4387,8 +5631,8 @@ do_upgrade() {
   write_version upgrade
   local msg="%SYS-5-SCRIPTS_UPGRADED: programy routera zaktualizowane ${old_ver:-?} → $SCRIPT_VERSION (zmienione: ${changed[*]})"
   logger -t install-router -p local0.notice "$msg" || true
-  mkdir -p /var/log/router-monitor
-  printf '%s %s\n' "$(now)" "$msg" >>/var/log/router-monitor/router-monitor.log
+  mkdir -p /var/log/router
+  printf '%s %s\n' "$(now)" "$msg" >>/var/log/router/alarmy.log
   if [[ -d /etc/.git ]] && command -v etckeeper >/dev/null; then
     etckeeper commit "install-router.sh: upgrade_script ${old_ver:-?} → $SCRIPT_VERSION (${changed[*]})" >/dev/null 2>&1 || true
   fi
@@ -4890,7 +6134,8 @@ st_packages() {
   apt-get update
   local pk=(sudo git ca-certificates curl wget gnupg build-essential pkg-config python3 python3-yaml
             ethtool numactl pciutils rdma-core ibverbs-utils irqbalance snmpd snmp tcpdump iproute2
-            libpcap-dev uuid-dev etckeeper jq mdadm smartmontools systemd-coredump ipmitool)
+            libpcap-dev uuid-dev etckeeper jq mdadm smartmontools systemd-coredump ipmitool
+            mtr-tiny nmap screen)
   say "instaluję: ${pk[*]}"
   apt-get install "${APT_OPTS[@]}" "${pk[@]}"
   man_add pkg "${pk[*]}" "paczki Debiana (apt)"
@@ -4950,15 +6195,7 @@ kernel.shmmax = $((HUGEPAGES_2M * 2 * 1024 * 1024))
 net.core.rmem_max = 134217728
 net.core.wmem_max = 134217728
 EOF
-  put_file /etc/sysctl.d/82-router-neigh.conf "duże tablice ARP/ND (LAN IX); stosowane też w netns dataplane" <<'EOF'
-# install-router.sh: duże tablice ARP/ND (LAN IX, wielu sąsiadów)
-net.ipv4.neigh.default.gc_thresh1 = 4096
-net.ipv4.neigh.default.gc_thresh2 = 8192
-net.ipv4.neigh.default.gc_thresh3 = 16384
-net.ipv6.neigh.default.gc_thresh1 = 4096
-net.ipv6.neigh.default.gc_thresh2 = 8192
-net.ipv6.neigh.default.gc_thresh3 = 16384
-EOF
+  neigh_sysctl | put_file /etc/sysctl.d/82-router-neigh.conf "duże tablice ARP/ND (LAN IX); stosowane też w netns dataplane"
   say "sysctl --system"
   sysctl --system >/dev/null
   ok "hugepages teraz: $(awk '/HugePages_Total/{print $2}' /proc/meminfo) × 2 MB (pełna pula po restarcie)"
@@ -5109,6 +6346,7 @@ EOF
     echo "sflow polling-interval 20"
     echo "sflow header-bytes 128"
     for i in "${IFNAMES[@]}"; do echo "sflow enable-disable $i"; done
+    neigh_vpp_cmds
   } | put_file /etc/vpp/bootstrap.vpp "polecenia VPP wykonywane po starcie (MTU $PORT_MTU, porty up, sFlow)"
   put_file /etc/systemd/system/vpp.service.d/10-dataplane.conf "VPP startuje po netns dataplane" <<'EOF'
 [Unit]
@@ -5289,6 +6527,8 @@ typedef struct
   uint8_t check_isn;      /* ack == ISN + 1 */
   uint8_t udp_enabled;    /* filtr UDP z portów amplifikacji */
   uint8_t udp_frags_drop; /* niepierwsze fragmenty UDP do chronionych prefiksów */
+  uint8_t reply_rst;      /* odpowiadaj RST na SYN-ACK bez wpisu (tylko enforce) */
+  uint32_t reply_rst_pps; /* limit wysyłanych RST na sekundę (łącznie, dzielony na wątki) */
   uint32_t ttl, udp_ttl;  /* sekundy */
   uint8_t udp_ports[8192]; /* mapa bitowa portów amplifikacji */
 } gc_cfg_t;
@@ -5320,6 +6560,7 @@ gc_cfg_init (gc_cfg_t *c)
   c->udp_enabled = 1;
   c->ttl = 60;
   c->udp_ttl = 30;
+  c->reply_rst_pps = 10000;
   for (size_t i = 0; i < sizeof def / sizeof def[0]; i++)
     gc_port_set (c, def[i]);
 }
@@ -5409,6 +6650,163 @@ static inline int
 gc_should_drop (const gc_cfg_t *c, gc_verdict_t v)
 {
   return c->enforce && (v == GC_V_NO_FLOW || v == GC_V_BAD_ISN || v == GC_V_FRAG_DROP);
+}
+
+/* ------------------------------------------------------------------------------------------- odpowiedź RST */
+/* RST tylko na SYN-ACK bez pasującego SYN. Nigdy na zły ISN (RST z numerem wybranym przez atakującego mógłby
+   zerwać cudze połączenie), na RST ani na UDP. */
+static inline int
+gc_want_rst (const gc_pkt_t *p, const gc_cfg_t *c, gc_verdict_t v)
+{
+  return c->reply_rst && p->cls == GC_TCP_SYNACK && v == GC_V_NO_FLOW;
+}
+
+/* Kubełek żetonów: `rate` na sekundę, zapas = 1 s. Jeden na wątek (bez blokad). */
+typedef struct
+{
+  double tokens;
+  double last;
+} gc_rl_t;
+
+static inline int
+gc_rl_take (gc_rl_t *r, double now, double rate)
+{
+  if (rate <= 0)
+    return 0;
+  if (now > r->last)
+    {
+      r->tokens += (now - r->last) * rate;
+      r->last = now;
+    }
+  if (r->tokens > rate)
+    r->tokens = rate;
+  if (r->tokens < 1)
+    return 0;
+  r->tokens -= 1;
+  return 1;
+}
+
+static inline void
+gc_put16 (uint8_t *b, uint16_t v)
+{
+  b[0] = (uint8_t) (v >> 8);
+  b[1] = (uint8_t) v;
+}
+
+static inline void
+gc_put32 (uint8_t *b, uint32_t v)
+{
+  b[0] = (uint8_t) (v >> 24);
+  b[1] = (uint8_t) (v >> 16);
+  b[2] = (uint8_t) (v >> 8);
+  b[3] = (uint8_t) v;
+}
+
+static inline uint32_t
+gc_csum_add (uint32_t sum, const uint8_t *a, uint32_t n)
+{
+  for (uint32_t i = 0; i + 1 < n; i += 2)
+    sum += (uint32_t) (a[i] << 8 | a[i + 1]);
+  return sum;
+}
+
+static inline uint16_t
+gc_csum_fold (uint32_t sum)
+{
+  while (sum >> 16)
+    sum = (sum & 0xffff) + (sum >> 16);
+  return (uint16_t) ~sum;
+}
+
+/* Zamienia w miejscu pakiet SYN-ACK (od serwera do klienta) w RST od klienta do serwera (RFC 9293: seq = ACK
+   z SYN-ACK, bez flagi ACK). Pisze nowy nagłówek IP bez opcji i TCP bez opcji, z sumami kontrolnymi.
+   Zwraca nową długość (40 / 60) albo 0, gdy bufor jest za krótki. */
+static inline uint32_t
+gc_make_rst (uint8_t *ip, uint32_t len, const gc_pkt_t *p)
+{
+  uint32_t hl = p->is_v6 ? 40 : 20;
+  if (len < hl + 20)
+    return 0;
+  uint8_t src[16], dst[16];
+  memcpy (src, p->dst, 16); /* nadawca RST = chroniony adres (cel SYN-ACK) */
+  memcpy (dst, p->src, 16);
+  memset (ip, 0, hl + 20);
+  uint32_t ps;
+  if (p->is_v6)
+    {
+      ip[0] = 0x60;
+      gc_put16 (ip + 4, 20);
+      ip[6] = 6;
+      ip[7] = 64;
+      memcpy (ip + 8, src, 16);
+      memcpy (ip + 24, dst, 16);
+      ps = gc_csum_add (0, ip + 8, 32);
+    }
+  else
+    {
+      ip[0] = 0x45;
+      gc_put16 (ip + 2, 40);
+      ip[6] = 0x40; /* DF */
+      ip[8] = 64;
+      ip[9] = 6;
+      memcpy (ip + 12, src, 4);
+      memcpy (ip + 16, dst, 4);
+      gc_put16 (ip + 10, gc_csum_fold (gc_csum_add (0, ip, 20)));
+      ps = gc_csum_add (0, ip + 12, 8);
+    }
+  uint8_t *t = ip + hl;
+  gc_put16 (t, p->dport);
+  gc_put16 (t + 2, p->sport);
+  gc_put32 (t + 4, p->ack);
+  t[12] = 0x50;
+  t[13] = GC_TCP_FLAG_RST;
+  gc_put16 (t + 16, gc_csum_fold (gc_csum_add (ps + 20 + 6, t, 20)));
+  return hl + 20;
+}
+
+/* ------------------------------------------------------------------------------------------- dziennik zdarzeń */
+/* Pierścień ostatnich naruszeń (jeden na wątek, bez blokad) do podglądu na żywo (router-top, "show synack-guard
+   events"). Zapis jest ograniczany limitem — przy ataku to próbka, dokładne są liczniki węzłów. */
+#define GC_EV_RING 256
+
+typedef enum
+{
+  GC_ACT_PASS = 0, /* monitor: naruszenie tylko policzone, pakiet przeszedł */
+  GC_ACT_DROP = 1, /* enforce: odrzucony */
+  GC_ACT_RST = 2,  /* enforce: odrzucony i wysłano RST */
+} gc_action_t;
+
+typedef struct
+{
+  double t;
+  uint8_t src[16], dst[16];
+  uint16_t sport, dport;
+  uint8_t is_v6, cls, verdict, action;
+} gc_ev_t;
+
+typedef struct
+{
+  uint32_t head; /* następny zapis */
+  uint32_t n;    /* liczba ważnych wpisów (do GC_EV_RING) */
+  gc_ev_t ev[GC_EV_RING];
+} gc_evring_t;
+
+static inline void
+gc_evring_push (gc_evring_t *r, const gc_pkt_t *p, gc_verdict_t v, gc_action_t a, double t)
+{
+  gc_ev_t *e = &r->ev[r->head];
+  e->t = t;
+  memcpy (e->src, p->src, 16);
+  memcpy (e->dst, p->dst, 16);
+  e->sport = p->sport;
+  e->dport = p->dport;
+  e->is_v6 = p->is_v6;
+  e->cls = (uint8_t) p->cls;
+  e->verdict = (uint8_t) v;
+  e->action = (uint8_t) a;
+  r->head = (r->head + 1) % GC_EV_RING;
+  if (r->n < GC_EV_RING)
+    r->n++;
 }
 
 /* ------------------------------------------------------------------------------------------- klucze tablicy stanów */
@@ -5701,10 +7099,13 @@ GUARD_CORE_H
  * Węzły na łuku ip4-unicast / ip6-unicast, włączane tylko na wskazanych interfejsach:
  *   synack-guard-out-ip{4,6}  (strona klientów): zapisuje SYN i UDP do portów amplifikacji do wspólnej tablicy stanów,
  *   synack-guard-in-ip{4,6}   (uplinki): sprawdza SYN-ACK / RST / UDP z portów amplifikacji względem tablicy.
+ * Opcja reply-rst (enforce): odrzucany SYN-ACK bez wpisu jest przerabiany w miejscu na RST do nadawcy i wysyłany
+ * przez ip4-lookup / ip6-lookup (ten sam VRF), z limitem reply-rst-pps dzielonym na wątki.
  * Logika decyzji jest w synack_guard_core.h (testowana na hoście). Sterowanie: vppctl (patrz "synack-guard ...").
  *
- * UWAGA: ten plik nie był kompilowany na maszynie deweloperskiej (brak VPP). Wymaga weryfikacji na buildzie
- * VPP 26.06 (patrz docs/synack-guard-lab-checklist.md); miejsca zależne od wersji API są oznaczone "WERSJA:".
+ * UWAGA: ten plik nie był kompilowany na maszynie deweloperskiej (brak VPP). Wszystkie użyte funkcje i makra VPP
+ * sprawdzono ręcznie ze źródłami tagu v26.06 (nazwy i sygnatury); kompilację potwierdź w labie
+ * (docs/synack-guard-lab-checklist.md). Miejsca zależne od wersji API są oznaczone "WERSJA:".
  */
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
@@ -5758,10 +7159,24 @@ typedef struct
 
 typedef struct
 {
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
+  gc_rl_t rl;     /* limit RST tego wątku */
+  gc_rl_t evrl;   /* limit zapisu zdarzeń do dziennika */
+  gc_evring_t ev; /* ostatnie naruszenia (show synack-guard events, router-top) */
+} sg_per_thread_t;
+
+#define SG_EV_PPS_PT 200 /* zdarzeń/s na wątek do dziennika — przy ataku próbka, dokładne są liczniki */
+
+typedef struct
+{
   sg_mode_t mode;
+  sg_per_thread_t *per_thread; /* [thread_index] */
+  f64 rst_rate_pt;             /* limit RST na sekundę na jeden wątek */
   gc_cfg_t cfg;
   u8 tables_ready;
   u32 table_v4, table_v6; /* docelowa liczba wpisów */
+  u64 used4, used6;       /* liczba wpisów, liczona w tle co SG_COUNT_EVERY s (show nie przechodzi po tablicy) */
+  f64 used_at;            /* kiedy policzono */
   clib_bihash_16_8_t flows4;
   clib_bihash_48_8_t flows6;
   gc_pset4_t *pset4; /* wskaźniki podmieniane w barierze */
@@ -5783,7 +7198,10 @@ static sg_main_t sg_main;
   _ (VIOL_BAD_ISN, "Violation bad isn")                                                                       \
   _ (VIOL_UDP_FRAG, "Violation udp fragment")                                                                 \
   _ (DROPPED, "Dropped")                                                                                      \
-  _ (INSERT_FAILED, "Insert failed")
+  _ (INSERT_FAILED, "Insert failed")                                                                          \
+  _ (RST_SENT, "RST sent")                                                                                    \
+  _ (RST_WOULD, "RST would be sent")                                                                          \
+  _ (RST_LIMITED, "RST rate limited")
 
 typedef enum
 {
@@ -5802,6 +7220,8 @@ static char *sg_error_strings[] = {
 typedef enum
 {
   SG_NEXT_DROP,
+  SG_NEXT_IP4_LOOKUP,
+  SG_NEXT_IP6_LOOKUP,
   SG_N_NEXT,
 } sg_next_t;
 
@@ -5850,9 +7270,10 @@ sg_tables_free (sg_main_t *sm)
 }
 
 /* ------------------------------------------------------------------------------------------- prefiksy */
-static void
+static int
 sg_rebuild_prefixes (vlib_main_t *vm)
 {
+  int rv = -1;
   sg_main_t *sm = &sg_main;
   u32 n4 = 0, n6 = 0;
   sg_prefix_t *p;
@@ -5879,6 +7300,14 @@ sg_rebuild_prefixes (vlib_main_t *vm)
     }
   gc_pset4_t *new4 = sg_zalloc (sizeof (*new4));
   gc_pset6_t *new6 = sg_zalloc (sizeof (*new6));
+  if (!new4 || !new6 || (n4 && (!a4 || !l4)) || (n6 && (!h6 || !l6 || !ln6)))
+    {
+      if (new4)
+        clib_mem_free (new4);
+      if (new6)
+        clib_mem_free (new6);
+      goto done;
+    }
   if (gc_pset4_build (new4, a4, l4, n4) || gc_pset6_build (new6, h6, l6, ln6, n6))
     {
       clib_warning ("synack-guard: nie udało się zbudować zbiorów prefiksów (za dużo różnych długości?)");
@@ -5904,6 +7333,7 @@ sg_rebuild_prefixes (vlib_main_t *vm)
       gc_pset6_free (old6);
       clib_mem_free (old6);
     }
+  rv = 0;
 done:
   if (a4)
     clib_mem_free (a4);
@@ -5915,6 +7345,7 @@ done:
     clib_mem_free (l6);
   if (ln6)
     clib_mem_free (ln6);
+  return rv;
 }
 
 /* ------------------------------------------------------------------------------------------- węzły */
@@ -5933,6 +7364,7 @@ sg_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
   gc_key6_t keys6[VLIB_FRAME_SIZE];
   u32 n = n_left, i;
   u32 c_syn = 0, c_udp = 0, c_checked = 0, c_pass = 0, c_nf = 0, c_isn = 0, c_frag = 0, c_drop = 0, c_fail = 0;
+  u32 c_rst = 0, c_rst_would = 0, c_rst_lim = 0;
 
   vlib_get_buffers (vm, from, bufs, n);
 
@@ -6043,6 +7475,8 @@ sg_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
   /* przejście 2 (tylko uplinki): wyszukanie wpisów i werdykt */
   if (!is_out)
     {
+      sg_per_thread_t *pt = vec_elt_at_index (sm->per_thread, vm->thread_index);
+      f64 now_f = vlib_time_now (vm);
       for (i = 0; i < n; i++)
         {
           if (!need[i])
@@ -6089,12 +7523,40 @@ sg_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
             default:
               break;
             }
+          gc_action_t act = GC_ACT_PASS;
+          int rst = gc_want_rst (&pk[i], cfg, v);
+          if (rst && !cfg->enforce)
+            c_rst_would++; /* monitor: tylko licznik, pakiet przechodzi */
           if (gc_should_drop (cfg, v))
             {
+              vlib_buffer_t *b0 = bufs[i];
               nexts[i] = SG_NEXT_DROP;
-              bufs[i]->error = node->errors[SG_ERROR_DROPPED];
+              b0->error = node->errors[SG_ERROR_DROPPED];
               c_drop++;
+              act = GC_ACT_DROP;
+              /* RST: nie dla SYN-ACK w wielu buforach (to nie odbicie) i w granicach limitu */
+              if (rst && !(b0->flags & VLIB_BUFFER_NEXT_PRESENT))
+                {
+                  if (!gc_rl_take (&pt->rl, now_f, sm->rst_rate_pt))
+                    c_rst_lim++;
+                  else
+                    {
+                      u32 len = gc_make_rst (vlib_buffer_get_current (b0), b0->current_length, &pk[i]);
+                      if (len)
+                        {
+                          b0->current_length = len;
+                          b0->flags &= ~VLIB_BUFFER_TOTAL_LENGTH_VALID;
+                          vnet_buffer_offload_flags_clear (b0, vnet_buffer (b0)->oflags); /* sumy z gc_make_rst */
+                          vnet_buffer (b0)->sw_if_index[VLIB_TX] = ~0; /* FIB interfejsu wejściowego */
+                          nexts[i] = is_ip6 ? SG_NEXT_IP6_LOOKUP : SG_NEXT_IP4_LOOKUP;
+                          c_rst++;
+                          act = GC_ACT_RST;
+                        }
+                    }
+                }
             }
+          if (v != GC_V_PASS && v != GC_V_IGNORE && gc_rl_take (&pt->evrl, now_f, SG_EV_PPS_PT))
+            gc_evring_push (&pt->ev, &pk[i], v, act, now_f);
         }
     }
 
@@ -6105,7 +7567,7 @@ sg_node_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
     vlib_node_increment_counter (vm, node->node_index, SG_ERROR_##sym, cnt);
   _inc (SYN_RECORDED, c_syn) _inc (UDP_RECORDED, c_udp) _inc (CHECKED, c_checked) _inc (PASSED, c_pass)
   _inc (VIOL_NO_FLOW, c_nf) _inc (VIOL_BAD_ISN, c_isn) _inc (VIOL_UDP_FRAG, c_frag) _inc (DROPPED, c_drop)
-  _inc (INSERT_FAILED, c_fail)
+  _inc (INSERT_FAILED, c_fail) _inc (RST_SENT, c_rst) _inc (RST_WOULD, c_rst_would) _inc (RST_LIMITED, c_rst_lim)
 #undef _inc
   return n;
 }
@@ -6138,7 +7600,9 @@ VLIB_NODE_FN (sg_out_ip6_node) (vlib_main_t *vm, vlib_node_runtime_t *node, vlib
     .n_errors = SG_N_ERROR,                                                                                   \
     .error_strings = sg_error_strings,                                                                        \
     .n_next_nodes = SG_N_NEXT,                                                                                \
-    .next_nodes = { [SG_NEXT_DROP] = "error-drop" },                                                          \
+    .next_nodes = { [SG_NEXT_DROP] = "error-drop",                                                            \
+                    [SG_NEXT_IP4_LOOKUP] = "ip4-lookup",                                                      \
+                    [SG_NEXT_IP6_LOOKUP] = "ip6-lookup" },                                                    \
   }
 
 SG_REGISTER_NODE (sg_in_ip4_node, "synack-guard-in-ip4");
@@ -6262,19 +7726,36 @@ sg_prefix_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
       if (p->is_v6 == is_v6 && p->len == len && !memcmp (&p->addr, &addr, sizeof addr))
         idx = p - sm->prefixes;
     }
+  sg_prefix_t np = { .addr = addr, .len = len, .is_v6 = is_v6 };
   if (del)
     {
       if (idx < 0)
         return clib_error_return (0, "prefix not found");
+      np = sm->prefixes[idx];
       vec_del1 (sm->prefixes, idx);
     }
   else if (idx < 0)
+    vec_add1 (sm->prefixes, np);
+  else
+    return 0;
+  if (sg_rebuild_prefixes (vm))
     {
-      sg_prefix_t np = { .addr = addr, .len = len, .is_v6 = is_v6 };
-      vec_add1 (sm->prefixes, np);
+      /* wycofaj zmianę listy, żeby "show synack-guard" zgadzało się z tym, co filtruje dataplane */
+      if (del)
+        vec_add1 (sm->prefixes, np);
+      else
+        vec_del1 (sm->prefixes, vec_len (sm->prefixes) - 1);
+      return clib_error_return (0, "cannot build prefix sets (too many distinct prefix lengths?)");
     }
-  sg_rebuild_prefixes (vm);
   return 0;
+}
+
+/* limit RST dzielony równo na wątki przetwarzające pakiety (workery albo sam wątek główny) */
+static void
+sg_rst_limit_update (sg_main_t *sm)
+{
+  vec_validate_aligned (sm->per_thread, vlib_get_n_threads () - 1, CLIB_CACHE_LINE_BYTES);
+  sm->rst_rate_pt = (f64) sm->cfg.reply_rst_pps / clib_max (1, vlib_num_workers ());
 }
 
 static clib_error_t *
@@ -6295,6 +7776,7 @@ sg_mode_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t
   vlib_worker_thread_barrier_sync (vm);
   sm->mode = mode;
   sm->cfg.enforce = mode == SG_MODE_ENFORCE;
+  sg_rst_limit_update (sm);
   vlib_worker_thread_barrier_release (vm);
   return 0;
 }
@@ -6330,6 +7812,10 @@ sg_config_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
               unformat (input, ",");
             }
         }
+      else if (unformat (input, "reply-rst-pps %u", &x))
+        nc.reply_rst_pps = x;
+      else if (unformat (input, "reply-rst %s", &word))
+        nc.reply_rst = !strcmp ((char *) word, "on");
       else if (unformat (input, "udp %s", &word))
         nc.udp_enabled = !strcmp ((char *) word, "on");
       else if (unformat (input, "table-v4 %u", &x))
@@ -6354,6 +7840,7 @@ sg_config_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
   vlib_worker_thread_barrier_sync (vm);
   sm->cfg = nc;
   sm->cfg.enforce = sm->mode == SG_MODE_ENFORCE;
+  sg_rst_limit_update (sm);
   vlib_worker_thread_barrier_release (vm);
   if (tables_changed && (v4 != sm->table_v4 || v6 != sm->table_v6))
     {
@@ -6362,6 +7849,20 @@ sg_config_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
       sm->table_v6 = v6;
     }
   return 0;
+}
+
+static int
+sg_count_cb4 (clib_bihash_kv_16_8_t *kv, void *arg)
+{
+  (*(u64 *) arg)++;
+  return BIHASH_WALK_CONTINUE;
+}
+
+static int
+sg_count_cb6 (clib_bihash_kv_48_8_t *kv, void *arg)
+{
+  (*(u64 *) arg)++;
+  return BIHASH_WALK_CONTINUE;
 }
 
 static clib_error_t *
@@ -6375,9 +7876,12 @@ sg_show_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t
   for (u32 p = 0; p < 65536; p++)
     if (gc_port_test (c, p))
       ports = format (ports, "%s%u", vec_len (ports) ? "," : "", p);
-  vlib_cli_output (vm, "config: ttl %u udp-ttl %u check-isn %s tcp-rst %s udp %s udp-frags %s udp-ports %v", c->ttl,
-                   c->udp_ttl, c->check_isn ? "on" : "off", c->rst_handshake ? "handshake" : "pass",
-                   c->udp_enabled ? "on" : "off", c->udp_frags_drop ? "drop" : "pass", ports);
+  vlib_cli_output (vm,
+                   "config: ttl %u udp-ttl %u check-isn %s tcp-rst %s udp %s udp-frags %s reply-rst %s "
+                   "reply-rst-pps %u udp-ports %v",
+                   c->ttl, c->udp_ttl, c->check_isn ? "on" : "off", c->rst_handshake ? "handshake" : "pass",
+                   c->udp_enabled ? "on" : "off", c->udp_frags_drop ? "drop" : "pass", c->reply_rst ? "on" : "off",
+                   c->reply_rst_pps, ports);
   vec_free (ports);
   sg_if_t *e;
   vec_foreach (e, sm->ifs)
@@ -6391,14 +7895,63 @@ sg_show_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t
       else
         vlib_cli_output (vm, "prefix: %U/%u", format_ip4_address, &p->addr.ip4, p->len);
     }
-  /* WERSJA: clib_bihash_elts_* przechodzi po koszykach (koszt rzędu ms) — używane tylko przy "show". */
-  vlib_cli_output (vm, "table-v4: %llu/%u", sm->tables_ready ? (u64) clib_bihash_elts_16_8 (&sm->flows4) : 0,
-                   sm->table_v4);
-  vlib_cli_output (vm, "table-v6: %llu/%u", sm->tables_ready ? (u64) clib_bihash_elts_48_8 (&sm->flows6) : 0,
-                   sm->table_v6);
+  /* liczby wpisów z procesu w tle (sg_count_process) — "show" nic nie liczy, więc jest tani i bez bariery */
+  vlib_cli_output (vm, "table-v4: %llu/%u", sm->tables_ready ? sm->used4 : 0, sm->table_v4);
+  vlib_cli_output (vm, "table-v6: %llu/%u", sm->tables_ready ? sm->used6 : 0, sm->table_v6);
   return 0;
 }
 
+static int
+sg_ev_cmp (void *a, void *b)
+{
+  f64 ta = ((gc_ev_t *) a)->t, tb = ((gc_ev_t *) b)->t;
+  return ta < tb ? 1 : ta > tb ? -1 : 0; /* od najnowszych */
+}
+
+/* Ostatnie naruszenia ze wszystkich wątków (bez bariery — workery nie są zatrzymywane; wektor per_thread zmienia
+   się tylko w barierze, więc jest stabilny).
+   Format stały dla router-top:  event: <czas> <src> <sport> <dst> <dport> <typ> <werdykt> <akcja> */
+static clib_error_t *
+sg_events_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  sg_main_t *sm = &sg_main;
+  static const char *cls_n[] = { "none", "syn", "syn-ack", "rst", "udp" }; /* gc_class_t */
+  static const char *ver_n[] = { "ignore", "pass", "no-flow", "bad-isn", "udp-frag" }; /* gc_verdict_t */
+  static const char *act_n[] = { "passed", "dropped", "dropped+rst" };
+  u32 count = 30;
+  (void) unformat (input, "count %u", &count);
+  gc_ev_t *evs = 0;
+  sg_per_thread_t *pt;
+  vec_foreach (pt, sm->per_thread)
+    {
+      for (u32 k = 0; k < pt->ev.n; k++)
+        vec_add1 (evs, pt->ev.ev[k]);
+    }
+  vec_sort_with_function (evs, sg_ev_cmp);
+  vlib_cli_output (vm, "now: %.3f", vlib_time_now (vm));
+  for (u32 k = 0; k < vec_len (evs) && k < count; k++)
+    {
+      gc_ev_t *e = &evs[k];
+      u8 *src = e->is_v6 ? format (0, "%U", format_ip6_address, (ip6_address_t *) e->src) :
+                           format (0, "%U", format_ip4_address, e->src);
+      u8 *dst = e->is_v6 ? format (0, "%U", format_ip6_address, (ip6_address_t *) e->dst) :
+                           format (0, "%U", format_ip4_address, e->dst);
+      vlib_cli_output (vm, "event: %.3f %v %u %v %u %s %s %s", e->t, src, e->sport, dst, e->dport,
+                       cls_n[e->cls < 5 ? e->cls : 0], ver_n[e->verdict < 5 ? e->verdict : 0],
+                       act_n[e->action < 3 ? e->action : 0]);
+      vec_free (src);
+      vec_free (dst);
+    }
+  vec_free (evs);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sg_events_command, static) = {
+  .path = "show synack-guard events",
+  .short_help = "show synack-guard events [count <n>]",
+  .function = sg_events_command_fn,
+  .is_mp_safe = 1, /* bez bariery: kopia pierścieni w trakcie zapisu może mieć pojedynczy niespójny wpis — tylko podgląd */
+};
 VLIB_CLI_COMMAND (sg_interface_command, static) = {
   .path = "synack-guard interface",
   .short_help = "synack-guard interface <interface> in|out [disable]",
@@ -6417,13 +7970,46 @@ VLIB_CLI_COMMAND (sg_mode_command, static) = {
 VLIB_CLI_COMMAND (sg_config_command, static) = {
   .path = "synack-guard config",
   .short_help = "synack-guard config [ttl <s>] [udp-ttl <s>] [check-isn on|off] [tcp-rst pass|handshake] [udp on|off] "
-                "[udp-frags pass|drop] [udp-ports <p,p,...>] [table-v4 <n>] [table-v6 <n>]",
+                "[udp-frags pass|drop] [reply-rst on|off] [reply-rst-pps <n>] [udp-ports <p,p,...>] [table-v4 <n>] "
+                "[table-v6 <n>]",
   .function = sg_config_command_fn,
 };
+/* "show" bez bariery (is_mp_safe): czyta tylko stan zmieniany przez wątek główny i liczniki — wątki robocze
+   przetwarzają pakiety bez przerwy, także gdy router-top / router-guard odpytują co sekundę */
 VLIB_CLI_COMMAND (sg_show_command, static) = {
   .path = "show synack-guard",
   .short_help = "show synack-guard",
   .function = sg_show_command_fn,
+  .is_mp_safe = 1,
+};
+
+/* Proces w tle (wątek główny, nie workery): co SG_COUNT_EVERY s liczy wpisy tablic stanów. Przejście po tablicy
+   bez bariery — pakiety płyną dalej; wynik jest przybliżony (tablica zmienia się w trakcie), do podglądu wystarcza. */
+#define SG_COUNT_EVERY 10.0
+static uword
+sg_count_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
+{
+  sg_main_t *sm = &sg_main;
+  while (1)
+    {
+      vlib_process_wait_for_event_or_clock (vm, SG_COUNT_EVERY);
+      vlib_process_get_events (vm, 0);
+      if (!sm->tables_ready)
+        continue;
+      u64 n4 = 0, n6 = 0;
+      clib_bihash_foreach_key_value_pair_16_8 (&sm->flows4, sg_count_cb4, &n4);
+      clib_bihash_foreach_key_value_pair_48_8 (&sm->flows6, sg_count_cb6, &n6);
+      sm->used4 = n4;
+      sm->used6 = n6;
+      sm->used_at = vlib_time_now (vm);
+    }
+  return 0;
+}
+
+VLIB_REGISTER_NODE (sg_count_node) = {
+  .function = sg_count_process,
+  .type = VLIB_NODE_TYPE_PROCESS,
+  .name = "synack-guard-count",
 };
 
 static clib_error_t *
@@ -6480,6 +8066,15 @@ st_vpp_build() {
   rm -f "$DEB_DIR"/vpp*.deb "$DEB_DIR"/libvppinfra*.deb "$DEB_DIR"/python3-vpp-api*.deb
   cp -f "$vdir"/build-root/*.deb "$DEB_DIR/"
   ls -1 "$DEB_DIR"/*.deb | sed 's/^/    /'
+  # wtyczka synack_guard trafia do paczki vpp-plugin-core (domyślny komponent add_vpp_plugin)
+  local core_deb
+  core_deb=$(ls -1 "$DEB_DIR"/vpp-plugin-core_*.deb 2>/dev/null | grep -v -- '-dbg_' | head -1)
+  if [[ -n $core_deb ]] && dpkg-deb -c "$core_deb" | grep -q 'synack_guard_plugin\.so'; then
+    ok "wtyczka synack_guard_plugin.so skompilowana (w ${core_deb##*/})"
+  else
+    echo "Brak synack_guard_plugin.so w paczce vpp-plugin-core — kompilacja wtyczki nie powiodła się (szukaj 'synack_guard' w wyjściu make)"
+    return 1
+  fi
   man_add dir "$DEB_DIR" "zbudowane paczki .deb (VPP, hsflowd)"
   ok "VPP zbudowany, paczki w $DEB_DIR"
 }
@@ -6583,7 +8178,7 @@ EOF
 st_ifaces() {
   local bu i n=${#NIC_PCI[@]}
   bu=$(bird_unit)
-  mkdir -p /var/lib/router /var/log/router-monitor
+  mkdir -p /var/lib/router /var/log/router
   prog_router_ifaces | put_file /opt/router/bin/router-ifaces "interfejsy VPP z /etc/router/ifaces.conf (VLAN-y, adresy, loopbacki, opisy)" 755
   ln -sfn /opt/router/bin/router-ifaces /usr/local/sbin/router-ifaces
   man_add file /usr/local/sbin/router-ifaces "polecenie router-ifaces (show / diff / apply / check)"
@@ -6676,11 +8271,11 @@ EOF
   man_add service router-ifaces.service "odtwarza interfejsy po starcie VPP (przed BIRD)"
   man_add service router-ifaces-check.timer "co 5 min: rozjazd VPP vs ifaces.conf → %IFACE-4-DRIFT"
   man_add dir /var/lib/router "stan router-ifaces (ifaces.state.json, ifaces.last-good.conf)"
-  man_add file /var/log/router-monitor/router-ifaces.log "log router-ifaces: każde polecenie vppctl z wynikiem"
+  man_add file /var/log/router/ifaces.log "log router-ifaces: każde polecenie vppctl z wynikiem"
 
   say "router-ifaces: kontrola pliku i zastosowanie"
   if vppctl show version >/dev/null 2>&1; then
-    /opt/router/bin/router-ifaces apply -y || warn "router-ifaces apply zakończył się błędem — zobacz /var/log/router-monitor/router-ifaces.log"
+    /opt/router/bin/router-ifaces apply -y || warn "router-ifaces apply zakończył się błędem — zobacz /var/log/router/ifaces.log"
     /opt/router/bin/router-ifaces show || true
   else
     warn "VPP nie odpowiada — interfejsy zostaną skonfigurowane przy starcie VPP (router-ifaces.service)"
@@ -6696,6 +8291,7 @@ st_snmp() {
 agentaddress udp:161,udp6:161
 rocommunity $SNMP_COMMUNITY 127.0.0.1
 rocommunity $SNMP_COMMUNITY $SNMP_ALLOW
+$(snmp_trusted_block)
 sysName $(hostname -f 2>/dev/null || hostname)
 sysLocation R630 BGP router
 sysContact noc
@@ -6855,6 +8451,9 @@ st_raid() {
 
 st_monitor() {
   prog_router_monitor | put_file /opt/router/bin/router-monitor "router-monitor: obciążenie VPP, rx-miss, CPU, RAID w czasie rzeczywistym" 755
+  prog_router_top | put_file /opt/router/bin/router-top "router-top: podgląd na żywo — interfejsy (Gb/s, pkt/s), liczniki ACL, guard" 755
+  ln -sfn /opt/router/bin/router-top /usr/local/sbin/router-top
+  man_add file /usr/local/sbin/router-top "polecenie router-top (1 VPP, 2 interfejsy, 3 firewall, 4 guard)"
   put_file /etc/router/router-monitor.conf "progi router-monitor (zmiana: edytuj i systemctl restart router-monitor)" <<EOF
 # router-monitor — progi alarmów. Po zmianie: systemctl restart router-monitor
 INTERVAL=1
@@ -6895,19 +8494,9 @@ Nice=-5
 [Install]
 WantedBy=multi-user.target
 EOF
-  put_file /etc/logrotate.d/router-monitor "rotacja logów router-monitor (60 dni)" <<'EOF'
-/var/log/router-monitor/*.log {
-  daily
-  rotate 60
-  compress
-  delaycompress
-  missingok
-  notifempty
-  create 0640 root adm
-}
-EOF
-  mkdir -p /var/log/router-monitor
-  man_add dir /var/log/router-monitor "logi zdarzeń: router-monitor, router-alert, mdadm-alert"
+  migrate_logdir
+  router_logrotate
+  man_add dir /var/log/router "wszystkie logi routera (alarmy, firewall, guard, ifaces, vpp, bird)"
   python3 -m py_compile /opt/router/bin/router-monitor
   rm -rf /opt/router/bin/__pycache__
   systemctl daemon-reload
@@ -6915,8 +8504,8 @@ EOF
   systemctl restart router-monitor.service || warn "router-monitor nie wystartował — journalctl -u router-monitor"
   man_add service router-monitor.service "logowanie przeciążeń w czasie rzeczywistym"
   sleep 3
-  tail -n 5 /var/log/router-monitor/router-monitor.log 2>/dev/null || true
-  ok "router-monitor działa — log: /var/log/router-monitor/router-monitor.log"
+  tail -n 5 /var/log/router/alarmy.log 2>/dev/null || true
+  ok "router-monitor działa — log: /var/log/router/alarmy.log"
 }
 
 st_resilience() {
@@ -7087,23 +8676,131 @@ fw_example_conf() {
   cat <<'EOF'
 # /etc/router/firewall.conf — firewall tranzytu na VPP (polecenie router-fw)
 # Po edycji:  router-fw check  →  router-fw diff  →  router-fw apply   (apply --confirm 120 = cofnięcie bez potwierdzenia)
-# Ruchu DO routera (BGP, BFD, SNMP, ICMP) ten plik nie dotyczy — to zadanie netfiltera w netns dataplane.
+# Firewall po instalacji jest NIEAKTYWNY. Po dopasowaniu pliku i udanym apply/confirm: router-fw enable (na stałe).
+# Ten plik jest do ruchu PRZECHODZĄCEGO (tranzyt). Reguły widzą też pakiety do adresów routera, ale ochrona samego
+# routera (SSH, SNMP, loop0) jest w iptables: /etc/iptables/dataplane.rules.v4 — nie blokuj tu portów 22/161/179.
 #
 # zone   INTERFEJS  STREFA       strefa to dowolna nazwa do 24 znaków; blokady doraźne (router-fw block) działają w strefie "internet"
-# list   NAZWA      adres/prefiks ...        albo:  list NAZWA include /etc/router/fw-lists/plik.list
-# kierunek    akcja   proto  src   sport  dst   dport  opis
+# list   NAZWA  "opis listy"     a pod spodem adresy we WCIĘTYCH liniach (jeden na linię, komentarz po # = opis adresu);
+#                                w liście można też:  include /etc/router/fw-lists/plik.list
+# kierunek    akcja   proto  src   sport  dst   dport  "opis reguły"   (opis widać w router-fw show i counters)
 #   kierunek: internet->  = ruch wchodzący z interfejsów strefy,   ->internet  = ruch wychodzący do strefy
+#             hu0.200->   = tylko ten interfejs (musi być w jakiejś strefie); jego reguły działają PRZED regułami strefy
 #   akcja: permit | deny      proto: tcp udp icmp icmp6 any      adres: any | prefiks | @lista | a,b,c
 #   port: any | 25 | 25,587 | 1024-65535 (tylko tcp i udp)
 # Kolejność ma znaczenie: pierwsza pasująca reguła wygrywa, wyjątki (whitelist) wpisuj nad blokadą.
-# Co nie pasuje do żadnej reguły, przechodzi.
+# ZASADA DOMYŚLNA: na końcu KAŻDEJ listy reguł jest zawsze "przepuść resztę" (permit, IPv4 i IPv6) — nie da się
+# tego zmienić. Firewall działa jak czarna lista: wpisujesz, co blokować (deny), wszystko inne przechodzi.
+# "permit" piszesz tylko jako wyjątek NAD blokadą. Interfejs bez żadnych reguł (swoich ani strefy) nie ma
+# w ogóle ACL — ruch przez niego przechodzi bez filtra. W "router-fw counters" widać to jako
+# "Domyślnie: przepuść resztę".
 #
+# ---------------------------------------------------------------- PRZYKŁAD (odkomentuj i dopasuj interfejsy)
+# Strefy, nasze prefiksy (BCP38), blokady portów w tranzycie — do skopiowania:
+# ============================================================ STREFY
+# każdy filtrowany interfejs VPP (porty i VLAN-y z ifaces.conf)
 #zone  hu0.100  internet     # Transit: EPIX
+#zone  hu0.200  internet     # Transit: Upstream-2
 #zone  hu0.300  clients      # Core: BNG
-#list  smtp-ok  203.0.113.25/32  203.0.113.26/32
-#->internet   permit  tcp  @smtp-ok  any  any  25     serwery poczty klientów
-#->internet   deny    tcp  any       any  any  25     blokada SMTP od klientów
-#internet->   deny    tcp  any       any  any  445    SMB z internetu
+#
+# ============================================================ LISTY ADRESÓW (@nazwa w regułach)
+# nagłówek: list NAZWA "opis";  pod nim adresy we WCIĘTYCH liniach, komentarz po # opisuje adres
+#list smtp-ok  "Serwery poczty klientów z prawem do portu 25"
+#    203.0.113.25/32     # klient A — mail.klient-a.pl
+#    203.0.113.26/32     # klient B — mx.klient-b.pl
+#
+#list bogony  "Bogony – adresy nieroutowalne (anty-spoofing)"
+#    10.0.0.0/8          # RFC1918
+#    172.16.0.0/12       # RFC1918
+#    192.168.0.0/16      # RFC1918
+#    100.64.0.0/10       # CGNAT (RFC6598)
+#    169.254.0.0/16      # link-local
+#    127.0.0.0/8         # loopback
+#   include /etc/router/fw-lists/bogony-extra.list    # długą listę można trzymać w osobnym pliku
+#
+# --- nasze prefiksy (BCP38: tylko z tych adresów klienci mogą wysyłać ruch do internetu) ---
+#list blokowe  "BLOKOWE"
+#    46.45.64.0/18
+#
+#list infotech  "INFOTECH"
+#    188.212.135.0/24
+#    5.253.206.0/24
+#
+#list grs  "GRS"
+#    195.62.40.0/23
+#    195.66.144.0/23
+#
+#list nortis  "NORTIS (prefix_trans_nortis z BIRD; '+' = z podsieciami — dla źródła pakietu to to samo)"
+#    91.196.108.0/22
+#    176.97.48.0/21
+#    194.116.166.0/24
+#    185.140.100.0/22
+#    193.32.36.0/24
+#    91.240.106.0/23
+#    91.233.136.0/22
+#    88.220.168.0/23
+#    195.136.104.0/22
+#    45.128.108.0/22
+#    195.136.104.0/24    # zawiera się w 195.136.104.0/22 (zostawione jak w BIRD)
+#    91.239.114.0/23
+#    91.239.113.0/24
+#    185.139.124.0/22
+#    185.16.32.0/22
+#    195.136.10.0/24
+#    192.166.255.0/24
+#    185.228.57.0/24
+#    46.245.232.0/24
+#    185.144.174.0/23
+#
+#list nasze  "Wszystkie nasze prefiksy (BLOKOWE, INFOTECH, GRS, NORTIS)"
+#    @blokowe
+#    @infotech
+#    @grs
+#    @nortis
+#
+#list prywatne  "Adresy prywatne infrastruktury (łącza z BNG, zarządzanie)"
+#    10.0.0.0/8
+#    172.16.0.0/12
+#    192.168.0.0/16
+#    100.64.0.0/10
+#
+# ============================================================ BCP38: ŹRÓDŁA OD KLIENTÓW
+# Ruch wchodzący od klientów (clients->) przechodzi tylko z naszych prefiksów. Wyjątki: infrastruktura na adresach
+# prywatnych (BGP z BNG, monitoring) do adresów prywatnych i do naszych prefiksów (np. loop0). Reszta IPv4 — DROP.
+# IPv6 nie jest tu filtrowane (dst 0.0.0.0/0 = tylko IPv4) — dopisz prefiksy IPv6, zanim zrobisz to samo dla v6.
+# kierunek     akcja   proto  src        sport  dst          dport  "opis reguły" (widać w router-fw show i counters)
+#clients->      permit  any    @nasze     any    any          any    "BCP38: nasze prefiksy"
+#clients->      permit  any    @prywatne  any    @prywatne    any    "Infrastruktura: prywatne do prywatnych (BGP z BNG)"
+#clients->      permit  any    @prywatne  any    @nasze       any    "Infrastruktura: prywatne do naszych adresów (loop0, monitoring)"
+#clients->      deny    any    any        any    0.0.0.0/0    any    "BCP38: obce źródła IPv4 od klientów (spoofing)"
+#
+# ============================================================ RUCH KLIENTÓW DO INTERNETU
+#->internet     permit  tcp    @smtp-ok  any    any   25                 "SMTP: wyjątek dla serwerów poczty klientów"
+#->internet     deny    tcp    any       any    any   25                 "SMTP od klientów (spam)"
+#->internet     deny    tcp    any       any    any   135,137-139,445    "SMB/NetBIOS od klientów"
+#->internet     deny    udp    any       any    any   135,137-139,445    "SMB/NetBIOS od klientów (UDP)"
+#
+# ============================================================ RUCH Z INTERNETU
+#internet->     deny    any    @bogony   any    any   any                "Anty-spoofing: bogony z internetu"
+#internet->     deny    any    @nasze    any    any   any                "Anty-spoofing: nasze adresy jako źródło z zewnątrz"
+#internet->     deny    tcp    any       any    any   135,137-139,445    "SMB/NetBIOS z internetu"
+#internet->     deny    udp    any       any    any   135,137-139,445    "SMB/NetBIOS z internetu (UDP)"
+#internet->     deny    tcp    any       any    any   0                  "Port 0 (TCP)"
+#internet->     deny    udp    any       any    any   0                  "Port 0 (UDP)"
+#internet->     deny    udp    any       any    any   17,19,1900,11211   "Amplifikatory u klientów (qotd, chargen, SSDP, memcached)"
+#internet->     deny    tcp    any       any    any   23,2323            "Telnet z internetu (botnety IoT)"
+#internet->     deny    any    198.51.100.7/32  any  203.0.113.50/32  any   "Atak na klienta X (para src+dst)"
+#
+# ============================================================ REGUŁY DLA JEDNEGO INTERFEJSU
+# Zamiast strefy wpisujesz nazwę interfejsu (musi być w linii zone). Reguła działa TYLKO na tym interfejsie.
+# Nie trzeba dopisywać "permit" dla reszty ruchu — wszystko, czego nic nie zablokowało, przechodzi (na końcu
+# każdej listy jest "przepuść resztę"). Kolejność sprawdzania na hu0.200:
+#   blokady doraźne → reguły hu0.200 → reguły strefy internet → przepuść resztę   (wygrywa pierwsza pasująca)
+# Poniżej: 1) NTP blokujemy tylko na Upstream-2 (na EPIX NTP przechodzi),
+#          2) partner z 198.51.100.0/24 może SMB przez Upstream-2, mimo że strefa internet blokuje SMB (port 445).
+#hu0.200->      deny    udp    any       any    any   123    "Blokada NTP (tylko na Upstream-2)"
+#hu0.200->      permit  tcp    198.51.100.0/24  any  any  445  "Wyjątek SMB dla partnera na Upstream-2"
+#
 
 set counters on
 EOF
@@ -7111,7 +8808,7 @@ EOF
 
 st_fw() {
   local bu; bu=$(bird_unit)
-  mkdir -p /var/lib/router /var/log/router-monitor /etc/router/fw-lists
+  mkdir -p /var/lib/router /var/log/router /etc/router/fw-lists
   prog_router_fw | put_file /opt/router/bin/router-fw "firewall tranzytu VPP (acl-plugin): strefy, reguły, blokady, liczniki" 755
   ln -sfn /opt/router/bin/router-fw /usr/local/sbin/router-fw
   man_add file /usr/local/sbin/router-fw "polecenie router-fw (show / diff / apply / check / block / counters)"
@@ -7125,6 +8822,8 @@ st_fw() {
 [Unit]
 Description=Router: firewall tranzytu VPP (ACL z /etc/router/firewall.conf)
 Documentation=file:/opt/router/README.md
+# działa dopiero po aktywacji: router-fw enable (tworzy ten plik); router-fw disable go usuwa
+ConditionPathExists=/etc/router/firewall.enabled
 BindsTo=vpp.service
 After=vpp.service netns-dataplane.service router-ifaces.service
 OnFailure=router-alert@%n.service
@@ -7145,6 +8844,7 @@ EOF
 [Unit]
 Description=Router: kontrola zgodności ACL w VPP z firewall.conf
 Documentation=file:/opt/router/README.md
+ConditionPathExists=/etc/router/firewall.enabled
 After=router-fw.service
 
 [Service]
@@ -7169,6 +8869,7 @@ EOF
 [Unit]
 Description=Router: zdjęcie wygasłych blokad doraźnych firewalla
 Documentation=file:/opt/router/README.md
+ConditionPathExists=/etc/router/firewall.enabled
 After=router-fw.service
 
 [Service]
@@ -7193,17 +8894,23 @@ EOF
   systemctl enable router-fw.service router-fw-check.timer router-fw-expire.timer >/dev/null 2>&1 \
     || warn "nie włączono jednostek router-fw"
   systemctl start router-fw-check.timer router-fw-expire.timer >/dev/null 2>&1 || true
-  if vppctl show version >/dev/null 2>&1; then
-    systemctl start router-fw.service || warn "router-fw.service nie wystartował — journalctl -u router-fw"
-  else
-    warn "VPP nie odpowiada — reguły firewalla zostaną wgrane przy starcie VPP (router-fw.service)"
+  # Instalator NIE uruchamia firewalla: plik trzeba najpierw dopasować, potem: apply --confirm, confirm, enable.
+  # Router, na którym firewall był już stosowany (wersje sprzed aktywacji), zostaje aktywny jak dotąd.
+  if [[ ! -e /etc/router/firewall.enabled && -s /var/lib/router/fw.last-good.conf ]]; then
+    echo "# install-router.sh: firewall był stosowany przed wprowadzeniem 'router-fw enable' — pozostaje aktywny" \
+      >/etc/router/firewall.enabled
+    say "firewall był już stosowany na tym routerze — pozostaje aktywny na stałe (/etc/router/firewall.enabled)"
   fi
   systemd-analyze verify /etc/systemd/system/router-fw.service /etc/systemd/system/router-fw-check.timer \
     /etc/systemd/system/router-fw-expire.timer 2>&1 | sed 's/^/    /' || true
   man_add service router-fw.service "odtwarza reguły firewalla po starcie VPP (przed BIRD)"
   man_add service router-fw-check.timer "co 5 min: rozjazd VPP vs firewall.conf → %FW-4-DRIFT"
   man_add service router-fw-expire.timer "co 1 min: wygasanie blokad doraźnych (router-fw block)"
-  ok "firewall: edytuj /etc/router/firewall.conf, potem: router-fw check / diff / apply"
+  if [[ -e /etc/router/firewall.enabled ]]; then
+    ok "firewall aktywny na stałe (router-fw show); zmiany: router-fw check / diff / apply --confirm 120"
+  else
+    ok "firewall zainstalowany, NIEAKTYWNY: dopasuj /etc/router/firewall.conf, potem check / diff / apply --confirm 120 / confirm / enable"
+  fi
 }
 
 guard_example_conf() {
@@ -7232,14 +8939,338 @@ guard_example_conf() {
 #udp-ports      19 53 111 123 137 161 389 1900 3702 5353 11211
 #udp-frags      pass      # pass | drop (niepierwsze fragmenty UDP)
 #check-isn      on        # numer potwierdzenia SYN-ACK musi być ISN+1
+#reply-rst      off       # on = na odrzucany SYN-ACK bez pasującego SYN odpowiadaj RST do nadawcy (tylko enforce)
+#reply-rst-pps  10000     # limit wysyłanych RST na sekundę (łącznie); ponad limit — sam drop
 #table-v4       4000000   # rozmiary tablic stanów (zmiana tylko przy wyłączonej ochronie)
 #table-v6       1000000
 #alarm-pps      10000     # %GUARD-4-VIOLATIONS powyżej tylu naruszeń na sekundę
 EOF
 }
 
+# Debian 13 nie ma domyślnie demona syslog (tylko journald) — rsyslog rozkłada logi routera na pliki
+st_logs() {
+  apt-get install "${APT_OPTS[@]}" rsyslog
+  man_add pkg "rsyslog $(dpkg-query -W -f='${Version}' rsyslog)" "demon syslog: logi routera w /var/log/router/"
+  migrate_logdir
+  # journald przekazuje wszystko do rsysloga (także stdout/stderr usług)
+  printf '[Journal]\nForwardToSyslog=yes\n' \
+    | put_file /etc/systemd/journald.conf.d/50-router-syslog.conf "journald przekazuje wpisy do rsysloga (pliki w /var/log/router)"
+  put_file /etc/rsyslog.d/30-router.conf "rozkład logów routera na pliki /var/log/router/*.log" <<'EOF'
+# install-router.sh — VPP i BIRD do /var/log/router/{vpp,bird}.log. Alarmy (local0) programy routera zapisują same
+# do /var/log/router/*.log, więc tu tylko nie powielamy ich w /var/log/syslog (zostają w journalu).
+# Przekazanie na zewnętrzny serwer dopisz w pliku o NIŻSZYM numerze (np. 10-remote.conf), bo tu jest "stop".
+template(name="RouterFmt" type="string"
+         string="%timereported:::date-rfc3339% %HOSTNAME% %syslogtag%%msg:::sp-if-no-1st-sp%%msg:::drop-last-lf%\n")
+
+if $programname == 'vpp' then {
+  action(type="omfile" file="/var/log/router/vpp.log" template="RouterFmt" fileCreateMode="0640" fileGroup="adm")
+  stop
+}
+if $programname startswith 'bird' then {
+  action(type="omfile" file="/var/log/router/bird.log" template="RouterFmt" fileCreateMode="0640" fileGroup="adm")
+  stop
+}
+if $syslogfacility-text == 'local0' then stop
+EOF
+  router_logrotate
+  rsyslogd -N1 2>&1 | sed 's/^/    /' || { echo "błąd składni konfiguracji rsyslog (rsyslogd -N1)"; return 1; }
+  systemctl enable rsyslog >/dev/null 2>&1 || warn "nie włączono rsyslog"
+  systemctl restart systemd-journald rsyslog || warn "restart rsyslog/journald nie powiódł się — journalctl -u rsyslog"
+  man_add service rsyslog.service "demon syslog: rozkład logów na /var/log/router/*.log"
+  logger -t vpp -p daemon.info "%LOG-5-TEST: kontrola zapisu rsyslog do /var/log/router (wpis testowy instalatora)"
+  sleep 1
+  if grep -q 'LOG-5-TEST' /var/log/router/vpp.log 2>/dev/null; then
+    ok "logi zapisują się w /var/log/router/"
+  else
+    warn "wpis testowy nie dotarł do /var/log/router — sprawdź: journalctl -u rsyslog"
+  fi
+}
+
+# --------------------------------------------------------------------------- etap 25: czas, DNS, iptables
+# Tablice sąsiadów (ARP/ND): Linux (obie przestrzenie sieciowe) i VPP — z NEIGH_MAX / NEIGH_AGE
+neigh_sysctl() {
+  cat <<EOF
+# install-router.sh: duże tablice ARP/ND (LAN IX, wielu sąsiadów) — NEIGH_MAX=$NEIGH_MAX
+net.ipv4.neigh.default.gc_thresh1 = $((NEIGH_MAX / 4))
+net.ipv4.neigh.default.gc_thresh2 = $((NEIGH_MAX / 2))
+net.ipv4.neigh.default.gc_thresh3 = $NEIGH_MAX
+net.ipv6.neigh.default.gc_thresh1 = $((NEIGH_MAX / 4))
+net.ipv6.neigh.default.gc_thresh2 = $((NEIGH_MAX / 2))
+net.ipv6.neigh.default.gc_thresh3 = $NEIGH_MAX
+EOF
+}
+
+# VPP: limit wpisów, wygasanie nieużywanych, a przy zapełnieniu zastąpienie najstarszego (zamiast odmowy)
+neigh_vpp_cmds() {
+  echo "set ip neighbor-config ip4 limit $NEIGH_MAX age $NEIGH_AGE recycle"
+  echo "set ip neighbor-config ip6 limit $NEIGH_MAX age $NEIGH_AGE recycle"
+}
+
+# Blok rocommunity dla zaufanych sieci w snmpd.conf (między znacznikami; etap 25 go odświeża)
+snmp_trusted_block() {
+  local e
+  echo "# >>> zaufane sieci (TRUSTED_NETS w install-router.sh)"
+  for e in "${TRUSTED_NETS[@]}"; do echo "rocommunity $SNMP_COMMUNITY ${e%%|*}   # ${e#*|}"; done
+  for e in "${TRUSTED_NETS6[@]}"; do echo "rocommunity6 $SNMP_COMMUNITY ${e%%|*}   # ${e#*|}"; done
+  echo "# <<< zaufane sieci"
+}
+
+# Reguły iptables-restore: zaufane sieci → ACCEPT, limit pingu, SSH/SNMP z reszty świata → DROP.
+# fw_rules <4|6> <opis miejsca>
+fw_rules() {
+  local v=$1 where=$2 e ping="-p icmp --icmp-type echo-request"
+  local -a nets
+  if [[ $v == 6 ]]; then nets=("${TRUSTED_NETS6[@]}"); ping="-p ipv6-icmp --icmpv6-type echo-request"; else nets=("${TRUSTED_NETS[@]}"); fi
+  cat <<EOF
+# install-router.sh — ochrona CPU routera: $where (IPv$v)
+# Edytuj ten plik, potem: $( [[ $where == *dataplane* ]] && echo "systemctl restart router-dataplane-fw" || echo "netfilter-persistent reload" )
+# Zasada: zaufane sieci mają pełny dostęp; reszta świata nie dostaje się do SSH i SNMP ($PROTECT_PORTS);
+# ping do routera ograniczony (z jednego adresu $ICMP_ECHO_PER_SRC/s, łącznie $ICMP_ECHO_TOTAL/s). Pozostały ruch (BGP, BFD,
+# odpowiedzi na połączenia routera) przechodzi bez zmian.
+# Tabela raw (PREROUTING): odrzucenie zaraz po wejściu pakietu, przed trasowaniem — najtańsze miejsce w kernelu.
+# Conntrack jest na tym routerze wyłączony (tylko tranzyt w VPP), więc reguły nie używają stanu połączeń.
+# Podgląd z licznikami: iptables -t raw -L PREROUTING -nv
+*raw
+:PREROUTING ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A PREROUTING -i lo -j ACCEPT
+EOF
+  for e in "${nets[@]}"; do
+    printf -- '-A PREROUTING -s %s -m comment --comment "%s" -j ACCEPT\n' "${e%%|*}" "${e#*|}"
+  done
+  if [[ $v == 4 && -n $SNMP_ALLOW ]]; then   # LibreNMS (SNMP_ALLOW) zawsze ma SNMP, nawet spoza TRUSTED_NETS
+    printf -- '-A PREROUTING -s %s -p udp --dport 161 -m comment --comment "SNMP_ALLOW (LibreNMS)" -j ACCEPT\n' "$SNMP_ALLOW"
+  fi
+  cat <<EOF
+-A PREROUTING $ping -m hashlimit --hashlimit-above ${ICMP_ECHO_PER_SRC}/sec --hashlimit-burst $((ICMP_ECHO_PER_SRC * 2)) --hashlimit-mode srcip --hashlimit-name ping-src$v -m comment --comment "ping limit per source" -j DROP
+-A PREROUTING $ping -m hashlimit --hashlimit-above ${ICMP_ECHO_TOTAL}/sec --hashlimit-burst $((ICMP_ECHO_TOTAL * 2)) --hashlimit-name ping-all$v -m comment --comment "ping limit total" -j DROP
+-A PREROUTING -p tcp -m multiport --dports $PROTECT_PORTS -m comment --comment "SSH/SNMP from untrusted" -j DROP
+-A PREROUTING -p udp -m multiport --dports $PROTECT_PORTS -m comment --comment "SSH/SNMP from untrusted" -j DROP
+COMMIT
+# tabela filter celowo pusta (czyści reguły z wcześniejszych wersji)
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+COMMIT
+EOF
+}
+
+# Czy adres sesji SSH, z której działa instalator, jest w zaufanych sieciach (żeby nie odciąć dostępu)
+ssh_client_trusted() {
+  local ip=${SSH_CLIENT%% *}
+  [[ -z $ip ]] && ip=$(who -m 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
+  [[ -z $ip ]] && return 2
+  python3 - "$ip" "${TRUSTED_NETS[@]%%|*}" "${TRUSTED_NETS6[@]%%|*}" <<'PYEOF'
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+sys.exit(0 if any(ip in ipaddress.ip_network(n, strict=False) for n in sys.argv[2:]
+                  if ipaddress.ip_network(n, strict=False).version == ip.version) else 1)
+PYEOF
+}
+
+st_system() {
+  local bu; bu=$(bird_unit)
+  # --- strefa czasowa
+  timedatectl set-timezone "$TIMEZONE" 2>/dev/null || ln -sfn "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+  man_add file /etc/localtime "strefa czasowa $TIMEZONE"
+  ok "strefa czasowa: $(timedatectl show -p Timezone --value 2>/dev/null || readlink /etc/localtime)"
+
+  # --- DNS
+  if [[ -L /etc/resolv.conf ]]; then
+    warn "/etc/resolv.conf to dowiązanie ($(readlink /etc/resolv.conf)) — zastępuję zwykłym plikiem"
+    cp -a /etc/resolv.conf "$BACKUP_DIR/resolv.conf.link" 2>/dev/null || true
+    rm -f /etc/resolv.conf
+  fi
+  { echo "# install-router.sh — serwery DNS (DNS_SERVERS)"; for e in $DNS_SERVERS; do echo "nameserver $e"; done
+    echo "options timeout:2 attempts:2 rotate"; } | put_file /etc/resolv.conf "serwery DNS routera" 644
+  mkdir -p /etc/netns/dataplane
+  cp /etc/resolv.conf /etc/netns/dataplane/resolv.conf
+  man_add file /etc/netns/dataplane/resolv.conf "serwery DNS w netns dataplane (kopia /etc/resolv.conf)"
+  if [[ -f /etc/dhcp/dhclient.conf ]] && ! grep -q '^supersede domain-name-servers' /etc/dhcp/dhclient.conf; then
+    echo "supersede domain-name-servers $(echo "$DNS_SERVERS" | sed 's/ /, /g');   # install-router.sh" >>/etc/dhcp/dhclient.conf
+    man_add file /etc/dhcp/dhclient.conf "DHCP nie nadpisuje serwerów DNS (supersede)"
+  fi
+  getent hosts "${NTP_SERVERS%% *}" >/dev/null && ok "DNS działa ($DNS_SERVERS)" || warn "DNS nie rozwiązuje ${NTP_SERVERS%% *} — sprawdź $DNS_SERVERS"
+
+  # --- czas: chrony z serwerami GUM
+  apt-get install "${APT_OPTS[@]}" chrony
+  man_add pkg "chrony $(dpkg-query -W -f='${Version}' chrony)" "synchronizacja czasu (NTP)"
+  mkdir -p /etc/chrony/sources.d
+  { echo "# install-router.sh — serwery czasu (NTP_SERVERS)"; for e in $NTP_SERVERS; do echo "server $e iburst"; done; } \
+    | put_file /etc/chrony/sources.d/router.sources "serwery czasu routera (GUM)" 644
+  if grep -qE '^(pool|server) ' /etc/chrony/chrony.conf; then
+    cp -a /etc/chrony/chrony.conf "$BACKUP_DIR/chrony.conf.orig" 2>/dev/null || true
+    sed -i -E 's/^(pool|server) /#&/' /etc/chrony/chrony.conf
+    man_add file /etc/chrony/chrony.conf "wyłączone domyślne serwery Debiana (tylko NTP_SERVERS)"
+  fi
+  grep -q '^sourcedir /etc/chrony/sources.d' /etc/chrony/chrony.conf || echo 'sourcedir /etc/chrony/sources.d' >>/etc/chrony/chrony.conf
+  systemctl enable chrony >/dev/null 2>&1 || true
+  systemctl restart chrony || warn "chrony nie wystartował — journalctl -u chrony"
+  man_add service chrony.service "synchronizacja czasu z $NTP_SERVERS"
+  sleep 3
+  chronyc -n sources 2>/dev/null | sed 's/^/    /' || true
+
+  # --- iptables: ochrona CPU routera (port zarządzający i netns dataplane)
+  echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections
+  echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
+  apt-get install "${APT_OPTS[@]}" iptables iptables-persistent
+  man_add pkg "iptables-persistent $(dpkg-query -W -f='${Version}' iptables-persistent)" "reguły iptables wczytywane przy starcie"
+  mkdir -p /etc/iptables
+  local f
+  for f in dataplane.rules.v4 dataplane.rules.v6; do
+    if [[ -s /etc/iptables/$f ]]; then say "zostawiam istniejący /etc/iptables/$f"; continue; fi
+    fw_rules "${f: -1}" "netns dataplane — adresy w VPP (interfejsy, loop0), BGP, SNMP" \
+      | put_file "/etc/iptables/$f" "iptables w netns dataplane: ochrona adresów VPP i loop0 (SSH/SNMP, ping)" 640
+  done
+  put_file /etc/systemd/system/router-dataplane-fw.service "iptables w netns dataplane przy każdym starcie" <<EOF
+[Unit]
+Description=Router: iptables w netns dataplane (ochrona CPU: adresy VPP, loop0, SNMP)
+Documentation=file:/etc/router/INSTRUKCJA.md
+Requires=netns-dataplane.service
+After=netns-dataplane.service
+Before=snmpd-dataplane.service vpp-snmp-agent.service $bu.service vpp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ip netns exec dataplane /usr/sbin/iptables-restore /etc/iptables/dataplane.rules.v4
+ExecStart=/usr/sbin/ip netns exec dataplane /usr/sbin/ip6tables-restore /etc/iptables/dataplane.rules.v6
+ExecReload=/usr/sbin/ip netns exec dataplane /usr/sbin/iptables-restore /etc/iptables/dataplane.rules.v4
+ExecReload=/usr/sbin/ip netns exec dataplane /usr/sbin/ip6tables-restore /etc/iptables/dataplane.rules.v6
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  printf '[Unit]\nWants=router-dataplane-fw.service\n' \
+    | put_file /etc/systemd/system/router.target.d/30-dataplane-fw.conf "router.target obejmuje iptables netns dataplane"
+  systemctl daemon-reload
+  systemctl enable router-dataplane-fw.service >/dev/null 2>&1 || warn "nie włączono router-dataplane-fw"
+  if systemctl restart router-dataplane-fw.service; then
+    ok "iptables w netns dataplane: $(ip netns exec dataplane iptables -t raw -S PREROUTING | grep -c '^-A') reguł IPv4 (raw)"
+  else
+    warn "błąd wczytania reguł netns dataplane — journalctl -u router-dataplane-fw"
+  fi
+  man_add service router-dataplane-fw.service "iptables w netns dataplane (adresy VPP, loop0)"
+
+  for f in rules.v4 rules.v6; do
+    if [[ -s /etc/iptables/$f ]]; then say "zostawiam istniejący /etc/iptables/$f"; continue; fi
+    fw_rules "${f: -1}" "port zarządzający (eth2, domyślna przestrzeń sieciowa)" \
+      | put_file "/etc/iptables/$f" "iptables portu zarządzającego (SSH/SNMP, ping)" 640
+  done
+  local rc=0; ssh_client_trusted || rc=$?
+  if ((rc == 1)); then
+    warn "Twoja sesja SSH (${SSH_CLIENT%% *}) NIE jest w TRUSTED_NETS — reguły portu zarządzającego odcięłyby dostęp."
+    warn "Zapisano /etc/iptables/rules.v4, ale NIE wczytano i wyłączono netfilter-persistent. Dopisz swój adres i: --from 25"
+    systemctl disable netfilter-persistent >/dev/null 2>&1 || true
+  else
+    ((rc == 2)) && warn "nie ustalono adresu sesji SSH (konsola?) — wczytuję reguły portu zarządzającego"
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    systemctl restart netfilter-persistent || warn "netfilter-persistent: błąd wczytania reguł — journalctl -u netfilter-persistent"
+    ok "iptables portu zarządzającego: $(iptables -t raw -S PREROUTING | grep -c '^-A') reguł IPv4 w raw (wczytywane przy starcie)"
+    man_add service netfilter-persistent.service "iptables portu zarządzającego (/etc/iptables/rules.v4, rules.v6)"
+  fi
+
+  # --- conntrack wyłączony: kernel nie przekazuje ruchu (robi to VPP), śledzenie połączeń jest zbędne
+  put_file /etc/modprobe.d/router-no-conntrack.conf "conntrack zablokowany (router tranzytowy, kernel nie śledzi połączeń)" <<'EOF'
+# install-router.sh — conntrack wyłączony: ruch tranzytowy obsługuje VPP, kernel nie śledzi połączeń.
+# Reguła iptables wymagająca stanu (-m state, -m conntrack, NAT, -j CT) nie wczyta się — to celowe.
+install nf_conntrack /bin/false
+install nf_nat /bin/false
+install xt_conntrack /bin/false
+install xt_state /bin/false
+install xt_CT /bin/false
+EOF
+  if grep -q '^nf_conntrack ' /proc/modules; then
+    modprobe -r -a xt_conntrack xt_state xt_CT nf_nat nf_conntrack 2>/dev/null \
+      && ok "conntrack usunięty z kernela" \
+      || warn "conntrack jest w użyciu ($(awk '$1=="nf_conntrack"{print $4}' /proc/modules)) — zniknie po restarcie serwera"
+  else
+    ok "conntrack nie jest załadowany (i nie zostanie: /etc/modprobe.d/router-no-conntrack.conf)"
+  fi
+
+  # --- SNMP: zaufane sieci także w snmpd (community)
+  if [[ -f /etc/snmp/snmpd.conf ]]; then
+    awk '/^# >>> zaufane sieci/{skip=1} !skip{print} /^# <<< zaufane sieci/{skip=0}' /etc/snmp/snmpd.conf >"$STATE_DIR/snmpd.conf.new"
+    snmp_trusted_block >>"$STATE_DIR/snmpd.conf.new"
+    put_file /etc/snmp/snmpd.conf "snmpd: community dla zaufanych sieci (TRUSTED_NETS)" 600 <"$STATE_DIR/snmpd.conf.new"
+    systemctl restart snmpd-dataplane.service 2>/dev/null || warn "snmpd-dataplane nie zrestartował się"
+    ok "SNMP: dostęp dla zaufanych sieci (${TRUSTED_NETS[*]%%|*}) i $SNMP_ALLOW"
+  fi
+
+  # --- kernel: limity odpowiedzi ICMP (obie przestrzenie: netns-dataplane wczytuje sysctl.d przy starcie)
+  put_file /etc/sysctl.d/84-router-icmp.conf "kernel: limity odpowiedzi ICMP (błędy, ping)" <<'EOF'
+# install-router.sh — kernel: limity odpowiedzi ICMP (dotyczy portu zarządzającego i netns dataplane).
+# Ping i mtr na adresy w VPP obsługuje VPP, nie kernel — patrz /etc/router/INSTRUKCJA.md, rozdział o ochronie CPU.
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# odstęp (ms) między odpowiedziami ICMP do jednego adresu dla typów z icmp_ratemask; 6169 = także echo-reply
+net.ipv4.icmp_ratelimit = 100
+net.ipv4.icmp_ratemask = 6169
+net.ipv4.icmp_msgs_per_sec = 500
+net.ipv4.icmp_msgs_burst = 100
+net.ipv6.icmp.ratelimit = 100
+EOF
+  sysctl -q -p /etc/sysctl.d/84-router-icmp.conf || warn "nie ustawiono części limitów ICMP"
+  ip netns exec dataplane sysctl -q -p /etc/sysctl.d/84-router-icmp.conf 2>/dev/null || true
+  # --- tablice ARP/ND: Linux (obie przestrzenie) i VPP (od razu + przy każdym starcie, bootstrap.vpp)
+  neigh_sysctl | put_file /etc/sysctl.d/82-router-neigh.conf "duże tablice ARP/ND (NEIGH_MAX); stosowane też w netns dataplane"
+  sysctl -q -p /etc/sysctl.d/82-router-neigh.conf || true
+  ip netns exec dataplane sysctl -q -p /etc/sysctl.d/82-router-neigh.conf 2>/dev/null || true
+  if [[ -f /etc/vpp/bootstrap.vpp ]]; then
+    { grep -v '^set ip neighbor-config ' /etc/vpp/bootstrap.vpp; neigh_vpp_cmds; } >"$STATE_DIR/bootstrap.vpp.new"
+    put_file /etc/vpp/bootstrap.vpp "polecenia VPP po starcie (+ tablice ARP/ND: NEIGH_MAX, NEIGH_AGE)" <"$STATE_DIR/bootstrap.vpp.new"
+  fi
+  if vppctl show version >/dev/null 2>&1; then
+    local c
+    while read -r c; do vppctl "$c" >/dev/null 2>&1 || warn "vppctl $c — błąd"; done < <(neigh_vpp_cmds)
+    ok "VPP: tablice ARP/ND $(vppctl show ip neighbor-config 2>/dev/null | tr -s ' \n' ' ')"
+  fi
+
+  # --- IPv6 w netns dataplane: bez RA/SLAAC/przekierowań, nowe interfejsy bez link-local (linux-cp nie włącza
+  #     wtedy IPv6 w VPP). IPv6 działa tylko tam, gdzie ifaces.conf ma adres IPv6 (router-ifaces).
+  put_file /etc/router/dataplane-sysctl.conf "netns dataplane: IPv6 bez RA/SLAAC, interfejsy bez link-local" 644 <<'EOF'
+# install-router.sh — netns dataplane (interfejsy linux-cp): wczytywane przy tworzeniu netns.
+# Router nie przyjmuje ogłoszeń RA ani przekierowań, nie konfiguruje sobie adresów (SLAAC) i nie nadaje
+# adresów link-local — IPv6 jest tylko na interfejsach z adresem IPv6 w /etc/router/ifaces.conf.
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.autoconf = 0
+net.ipv6.conf.default.autoconf = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.default.addr_gen_mode = 1
+EOF
+  printf '[Service]
+ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/router/dataplane-sysctl.conf
+' \
+    | put_file /etc/systemd/system/netns-dataplane.service.d/20-dataplane-sysctl.conf "netns dataplane: ustawienia IPv6 przy każdym starcie"
+  systemctl daemon-reload
+  ip netns exec dataplane sysctl -q -p /etc/router/dataplane-sysctl.conf 2>/dev/null || warn "nie ustawiono IPv6 w netns dataplane"
+  ok "IPv6: bez RA i SLAAC; tylko na interfejsach z adresem IPv6 w ifaces.conf — sprawdź: router-ifaces diff"
+
+  ok "czas, DNS, iptables, limity ICMP, ARP/ND i IPv6 ustawione"
+}
+
+# Dowód z logu VPP, że wtyczka się załadowała (komunikaty vlib/unix/plugin.c: "Loaded plugin: …" albo błąd)
+guard_plugin_log() {
+  local lines
+  lines=$( { vppctl show logging 2>/dev/null; journalctl -u vpp -b --no-pager 2>/dev/null; } | grep -i 'synack_guard' | sort -u | tail -5)
+  if [[ -z $lines ]]; then
+    warn "w logu VPP brak wpisu o synack_guard_plugin.so (vppctl show logging, journalctl -u vpp)"
+  elif grep -qiE 'Failed to load|mismatch|Not a plugin|disabled|Bad r2' <<<"$lines"; then
+    warn "VPP nie załadował wtyczki synack_guard:"
+    sed 's/^/    /' <<<"$lines"
+  else
+    ok "log VPP:"
+    sed 's/^/    /' <<<"$lines"
+  fi
+}
+
 st_guard() {
-  mkdir -p /var/lib/router /var/log/router-monitor
+  mkdir -p /var/lib/router /var/log/router
   prog_router_guard | put_file /opt/router/bin/router-guard "ochrona przed odbiciami SYN-ACK/RST/UDP (wtyczka VPP synack_guard): włączanie na żądanie" 755
   ln -sfn /opt/router/bin/router-guard /usr/local/sbin/router-guard
   man_add file /usr/local/sbin/router-guard "polecenie router-guard (on / off / status / enforce / monitor)"
@@ -7318,6 +9349,7 @@ EOF
   systemctl enable router-guard.service router-guard-check.timer router-guard-expire.timer >/dev/null 2>&1 \
     || warn "nie włączono jednostek router-guard"
   systemctl start router-guard-check.timer router-guard-expire.timer >/dev/null 2>&1 || true
+  guard_plugin_log
   if vppctl show synack-guard >/dev/null 2>&1 && ! vppctl show synack-guard 2>&1 | grep -q 'unknown input'; then
     systemctl start router-guard.service || warn "router-guard.service nie wystartował — journalctl -u router-guard"
     ok "wtyczka synack_guard załadowana w VPP"
@@ -7334,6 +9366,7 @@ EOF
 
 st_docs() {
   local bu; bu=$(bird_unit)
+  router_manual | put_file /etc/router/INSTRUKCJA.md "instrukcja obsługi produkcyjnej: interfejsy, firewall, guard, alarmy, e-maile, awarie" 644
   local ifn=() i
   for i in "${!NIC_PCI[@]}"; do ifn+=("hu$i"); done
   local readme
@@ -7349,7 +9382,7 @@ Szybki stan routera w każdej chwili:
 ```
 router-check                      # pełna kontrola: usługi, VPP, BIRD, SNMP, RAID, ostatnie alarmy
 systemctl status router.target    # wszystkie usługi routera naraz
-tail -f /var/log/router-monitor/router-monitor.log   # alarmy na żywo
+tail -f /var/log/router/alarmy.log   # alarmy na żywo
 ```
 
 ---
@@ -7431,6 +9464,7 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | Ścieżka | Zawartość |
 |---|---|
 | `/opt/router/README.md` | ta dokumentacja |
+| `/etc/router/INSTRUKCJA.md` | **instrukcja obsługi produkcyjnej** — jak zmieniać konfigurację, co robić przy alarmie, ataku, awarii |
 | `/opt/router/install-router.sh` | kopia skryptu instalacyjnego (`router-check` = `install-router.sh --check`; aktualizacja programów: `upgrade_script`) |
 | `/etc/router/version` | wersja skryptu zainstalowana na routerze i daty instalacji/aktualizacji |
 | `/opt/router/bin/router-monitor` | monitor obciążenia (Python) |
@@ -7440,6 +9474,7 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/opt/router/bin/router-notify` | wysyłka alarmów e-mailem (SMTP) |
 | `/opt/router/bin/smartd-alert` | alarm z smartd (zdrowie dysków) |
 | `/opt/router/bin/router-fw` | firewall tranzytu VPP (`router-fw check / diff / apply / block / counters`), konfiguracja `/etc/router/firewall.conf` |
+| `/opt/router/bin/router-top` | podgląd na żywo: obciążenie VPP, interfejsy (Gb/s, pkt/s), liczniki ACL, guard (rozdział 10d) |
 | `/opt/router/bin/router-guard` | ochrona przed odbiciami SYN-ACK/RST/UDP w VPP (`router-guard on / off / status / enforce`), konfiguracja `/etc/router/synack-guard.conf` |
 | `/opt/router/bin/router-fw-update` | ręczna aktualizacja firmware karty (`router-fw-update`) |
 | `/opt/router/bin/router-ifaces` | interfejsy z `ifaces.conf` (`router-ifaces`, rozdział 10) |
@@ -7467,7 +9502,10 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo |
 | `/var/lib/router/` | znaczniki czystego wyłączenia (wykrywanie awarii), stan `router-ifaces` (`ifaces.state.json`, `ifaces.last-good.conf`) |
 | `/var/spool/router-notify/` | kolejka alarmów do wysłania e-mailem |
-| `/var/log/router-monitor/` | logi alarmów (60 dni, rotacja dzienna) |
+| `/etc/iptables/rules.v4`, `rules.v6` | iptables portu zarządzającego (ochrona CPU, rozdział 10c) |
+| `/etc/iptables/dataplane.rules.v4`, `dataplane.rules.v6` | iptables w netns dataplane: adresy VPP i loop0 (rozdział 10c) |
+| `/etc/chrony/sources.d/router.sources` | serwery czasu (GUM) |
+| `/var/log/router/` | wszystkie logi routera (rotacja codziennie, domyślnie 20 dni — `LOG_KEEP_DAYS`) |
 | `@@DATADIR@@/` | źródła, paczki .deb, logi instalacji, kopie oryginałów, `MANIFEST.txt` |
 
 Pełna lista każdego zapisanego pliku, usługi i pakietu: `@@DATADIR@@/MANIFEST.txt`.
@@ -7476,20 +9514,30 @@ Pełna lista każdego zapisanego pliku, usługi i pakietu: `@@DATADIR@@/MANIFEST
 
 ## 4. Logi
 
-| Co | Gdzie |
-|---|---|
-| Alarmy routera (monitor, awarie usług, RAID, kontrola po starcie) | `/var/log/router-monitor/router-monitor.log` oraz syslog/journal, facility `local0` |
-| Zmiany interfejsów (każde polecenie vppctl z wynikiem) | `/var/log/router-monitor/router-ifaces.log` |
-| VPP | `/var/log/vpp/vpp.log`, `journalctl -u vpp` |
-| BIRD | syslog (`journalctl -u @@BIRDUNIT@@`) |
-| Instalacja | `@@DATADIR@@/logs/install.log` + osobny log każdego etapu |
+Wszystkie logi routera są w **jednym katalogu `/var/log/router/`** (rotacja codziennie, domyślnie 20 dni — zmienna `LOG_KEEP_DAYS` w instalatorze; `/etc/logrotate.d/router`).
 
-Alarmy wysyłane są do sysloga z facility `local0`. Jeśli przekierujesz syslog na zewnętrzny serwer (np. rsyslog → LibreNMS), alarmy pojawią się też tam:
+| Plik | Co zawiera | Kto pisze |
+|---|---|---|
+| `alarmy.log` | **wszystkie alarmy i zdarzenia** w stylu Cisco (`%SYS-…`, `%FW-…`, `%GUARD-…`): monitor obciążenia, awarie usług, RAID, dyski, kontrola po starcie, firewall, guard, zmiany interfejsów, aktualizacje skryptu. Z tego pliku router-notify wysyła e-maile | programy routera |
+| `firewall.log` | szczegóły router-fw: każde polecenie vppctl i odpowiedź VPP | router-fw |
+| `guard.log` | szczegóły router-guard: każde polecenie vppctl i odpowiedź VPP | router-guard |
+| `ifaces.log` | szczegóły router-ifaces: każde polecenie vppctl i odpowiedź VPP | router-ifaces |
+| `vpp.log` | komunikaty VPP (start, ładowanie wtyczek, błędy) | rsyslog |
+| `bird.log` | BIRD: sesje BGP, zmiany stanów protokołów | rsyslog |
+
+Zasada: **co się stało → `alarmy.log`; jak dokładnie (polecenia VPP) → plik danego programu.**
+
+Poza tym katalogiem: VPP prowadzi też własny `/var/log/vpp/vpp.log` (ustawienie `startup.conf`), a log instalacji jest w `@@DATADIR@@/logs/install.log`. Wszystko jest również w journalu (`journalctl -u vpp`, `journalctl -u @@BIRDUNIT@@`, `journalctl SYSLOG_FACILITY=16` dla alarmów).
+
+Konfiguracja rsysloga: `/etc/rsyslog.d/30-router.conf`. Wpisy VPP, BIRD i alarmów (`local0`) nie są powielane w `/var/log/syslog`.
+
+Przekazanie alarmów na zewnętrzny serwer (np. LibreNMS) — plik musi mieć numer **niższy niż 30**, bo `30-router.conf` kończy obsługę tych wpisów (`stop`):
 
 ```
-# /etc/rsyslog.d/90-remote.conf
+# /etc/rsyslog.d/10-remote.conf
 local0.*  @adres-serwera-syslog:514
 ```
+Potem: `systemctl restart rsyslog`.
 
 Bieżący stan monitora (odświeżany co sekundę): `/run/router-monitor/state.json`.
 
@@ -7671,7 +9719,7 @@ loop0        -     203.0.113.1/32      2001:db8::1/128        Loopback: router-i
 |---|---|
 | interfejs | port VPP (`hu0`, `hu1`) albo loopback (`loop0`, `loop1`, …) |
 | vlan | numer VLAN 1–4094 (802.1Q); `-` = sam port albo loopback |
-| ipv4, ipv6 | adres z maską; kilka adresów po przecinku; `-` = brak |
+| ipv4, ipv6 | adres z maską; kilka adresów po przecinku bez spacji (`192.0.2.2/30,203.0.113.65/27`); `-` = brak. Kilka adresów z tej samej podsieci tylko z tą samą maską (wymóg VPP — `check`/`diff` to sprawdza) |
 | opis | reszta linii; trafia do SNMP (ifAlias = opis portu w LibreNMS/Cacti) i do `ip link` w netns `dataplane` |
 
 Polecenia:
@@ -7710,7 +9758,13 @@ Wykrywanie rozjazdu: co 5 minut `router-ifaces-check.timer` porównuje VPP z ost
 | `%IFACE-2-CONFIG_ERROR` | przy starcie plik miał błąd — użyto ostatniej poprawnej wersji |
 | `%IFACE-3-APPLY_FAIL`, `%IFACE-2-APPLY_FAIL` | części zmian nie dało się zastosować / VPP nie odpowiadał |
 
-Szczegóły każdej zmiany (polecenie vppctl i odpowiedź VPP): `/var/log/router-monitor/router-ifaces.log`. Historia samego pliku: etckeeper (`git -C /etc log -p router/ifaces.conf`).
+**IPv6 tylko tam, gdzie wpiszesz adres IPv6.** Interfejs (VLAN, port, loopback) z `-` w kolumnie ipv6 ma IPv6 całkowicie wyłączone: w VPP (`disable ip6 interface`) i w Linuksie (bez adresu link-local). Nie odpowiada na ND, nie bierze udziału w IPv6. Interfejs z adresem IPv6 ma IPv6 włączone i link-local w Linuksie (potrzebny do ND i sesji BGP po IPv6).
+
+**Router nie wysyła ogłoszeń RA** — nie adresuje innych routerów ani hostów w sieci. VPP domyślnie RA nie wysyła, a `router-ifaces` dodatkowo ustawia `ip6 nd <interfejs> ra-suppress` na każdym interfejsie z IPv6. W netns dataplane (`/etc/router/dataplane-sysctl.conf`) Linux nie przyjmuje RA, przekierowań ani nie konfiguruje sobie adresów (SLAAC) — cudzy RA w sieci nie zmieni adresów ani tras routera.
+
+Gdy IPv6 pojawi się tam, gdzie go nie ma w pliku (np. ręczne `enable ip6 interface`), `router-ifaces check` zgłasza rozjazd, a `apply` wyłącza je z powrotem.
+
+Szczegóły każdej zmiany (polecenie vppctl i odpowiedź VPP): `/var/log/router/ifaces.log`. Historia samego pliku: etckeeper (`git -C /etc log -p router/ifaces.conf`).
 
 Uwagi:
 
@@ -7724,17 +9778,52 @@ Uwagi:
 
 `router-fw` steruje filtrami ruchu **przechodzącego** przez router (ACL w VPP, tryb bezstanowy). Ruchu **do samego routera** (BGP, BFD, SNMP, ICMP) nie dotyka — to zadanie netfiltera w netns `dataplane`. SSH przez eth2 jest poza VPP, więc błąd w regułach nie odetnie dostępu do routera.
 
-Reguły są w `/etc/router/firewall.conf` (w etckeeper). Strefa to nazwa nadana interfejsom, a kierunek mówi, czy reguła dotyczy ruchu wchodzącego z interfejsów strefy (`internet->`) czy wychodzącego do nich (`->internet`). Pierwsza pasująca reguła wygrywa, więc wyjątki (whitelist) stoją nad blokadą; co nie pasuje do żadnej reguły, przechodzi.
+Reguły są w `/etc/router/firewall.conf` (w etckeeper). Strefa to nazwa nadana interfejsom, a kierunek mówi, czy reguła dotyczy ruchu wchodzącego z interfejsów strefy (`internet->`) czy wychodzącego do nich (`->internet`). Pierwsza pasująca reguła wygrywa, więc wyjątki (whitelist) stoją nad blokadą.
+
+**Zasada domyślna:** na końcu każdej listy reguł jest zawsze „przepuść resztę” (`permit`, IPv4 i IPv6) i nie da się tego zmienić. Firewall działa jak czarna lista: wpisujesz, co blokować (`deny`), a wszystko inne przechodzi. `permit` jest potrzebny tylko jako wyjątek nad blokadą. Interfejs bez żadnych reguł (swoich ani strefy) nie ma w ogóle ACL, więc ruch przez niego przechodzi bez filtra. W `router-fw counters` widać to jako wiersz „Domyślnie: przepuść resztę”.
 
 ```
 zone  hu0.100  internet                       # Transit: EPIX
 zone  hu0.300  clients                        # Core: BNG
-list  smtp-ok  203.0.113.25/32  203.0.113.26/32
-->internet    permit  tcp  @smtp-ok  any  any  25     serwery poczty klientów
-->internet    deny    tcp  any       any  any  25     blokada SMTP od klientów
-internet->    deny    any  @bogony   any  any  any    bogony z internetu
-internet->    deny    tcp  any       any  any  445    SMB z internetu
+
+list bogony  "Bogony – adresy nieroutowalne"
+    10.0.0.0/8          # sieć prywatna
+    172.16.0.0/12       # sieć prywatna
+    192.168.0.0/16      # sieć prywatna
+    100.64.0.0/10       # CGNAT
+
+list smtp-ok  "Serwery poczty klientów z prawem do portu 25"
+    203.0.113.25/32     # klient A
+    203.0.113.26/32     # klient B
+
+->internet    permit  tcp  @smtp-ok  any  any  25     "SMTP: wyjątek dla serwerów poczty klientów"
+->internet    deny    tcp  any       any  any  25     "SMTP: blokada od klientów (spam)"
+internet->    deny    any  @bogony   any  any  any    "Anty-spoofing: bogony z internetu"
+internet->    deny    tcp  any       any  any  445    "SMB z internetu"
 ```
+
+### Reguły dla jednego interfejsu
+
+Zamiast nazwy strefy w kierunku można wpisać nazwę interfejsu (port albo VLAN), np. `hu0.200->` albo `->hu0.200`. Taka reguła działa **tylko na tym interfejsie** i **dodatkowo** do reguł jego strefy:
+
+```
+zone  hu0.100  internet        # Transit: EPIX
+zone  hu0.200  internet        # Transit: Upstream-2
+
+internet->  deny    tcp  any              any  any  445  "SMB z internetu"                          # hu0.100 i hu0.200
+hu0.200->   deny    udp  any              any  any  123  "Blokada NTP (tylko na Upstream-2)"        # tylko hu0.200
+hu0.200->   permit  tcp  198.51.100.0/24  any  any  445  "Wyjątek SMB dla partnera na Upstream-2"   # tylko hu0.200
+```
+
+- Interfejs musi być w jakiejś strefie (`zone`) — zostaje w niej, więc nadal działają na nim reguły strefy i blokady doraźne (`router-fw block` w strefie `internet`).
+- Kolejność sprawdzania na takim interfejsie: **blokady doraźne → reguły interfejsu → reguły strefy → przepuść resztę**. Pierwsza pasująca wygrywa, więc regułą interfejsu można też zrobić wyjątek (`permit`) od blokady strefy — jak w przykładzie z SMB.
+- Pod spodem: interfejs dostaje własną ACL w VPP (`iface=hu0.200:in`) zawierającą jego reguły i kopię reguł strefy; pozostałe interfejsy strefy mają wspólną ACL strefy (`internet:in`). Na każdym interfejsie jest więc zawsze dokładnie jedna ACL `router-fw`, a kolejność reguł jest pewna. Gdy usuniesz reguły interfejsu, `apply` przepnie go z powrotem na ACL strefy.
+- Nazwa strefy nie może być taka sama jak nazwa interfejsu.
+- `router-fw show` oznacza takie interfejsy dopiskiem „(+ własne reguły)”, a `router-fw counters` pokazuje je osobno, np. `hu0.200->  (wejście na hu0.200; reguły interfejsu + strefy internet)`.
+
+### Listy adresów
+
+Lista: nagłówek `list NAZWA "opis"`, a pod nim adresy we **wciętych** liniach — jeden na linię, komentarz po `#` opisuje adres. Lista kończy się na pierwszej niewciętej linii. Krótką listę można nadal zapisać w jednej linii (`list x 10.0.0.0/8 192.168.0.0/16`), a długą trzymać w osobnym pliku (`include /etc/router/fw-lists/plik.list` — także jako wcięta linia). Opis reguły (w cudzysłowie albo po `#`) widać w `router-fw show` i `router-fw counters`.
 
 ```
 router-fw check                  # składnia, reguły zacienione, ostrzeżenia o BGP/BFD, rozjazd VPP
@@ -7743,16 +9832,47 @@ router-fw apply                  # wdrożenie na żywo (różnicowo, bez restart
 router-fw apply --confirm 120    # j.w., ale zmiana wraca po 120 s, jeśli nie wpiszesz: router-fw confirm
 router-fw block 198.51.100.7 2h  # blokada doraźna (źródło) w strefie "internet"; bez czasu = bezterminowo
 router-fw unblock 198.51.100.7   # zdjęcie blokady;  router-fw blocks = lista
-router-fw counters [-w]          # liczniki trafień każdej reguły: pakiety, bajty, pkt/s;  counters clear = zerowanie
+router-fw counters [-w]          # liczniki trafień każdej reguły z jej opisem: pakiety, bajty, pkt/s;  counters clear = zerowanie
+router-fw counters -v            # j.w. + liczniki każdego adresu z list (który adres z @listy był trafiany)
 ```
 
-Reguły wracają same po każdym starcie VPP (`router-fw.service`, przed BIRD). Gdy `firewall.conf` ma błąd, po starcie używana jest ostatnia poprawna wersja (`/var/lib/router/fw.last-good.conf`). Wygasłe blokady zdejmuje co minutę `router-fw-expire.timer`, a rozjazd VPP względem pliku wykrywa co 5 minut `router-fw-check.timer`.
+Przykład `router-fw counters -v`:
+```
+internet->  (wejście: hu0.100)  ACL 0
+  opis                                                          pakiety       bajty     pkt/s
+  Anty-spoofing: bogony z internetu                              12 345      1.2 MB        10
+      linia 8: internet-> deny any @bogony any any any
+        src 10.0.0.0/8  sieć prywatna                            12 000      1.2 MB
+        src 192.168.0.0/16  sieć prywatna                           345     34.5 KB
+```
+Liczniki są w VPP dla każdej reguły ACL osobno (każdy adres z listy to osobna reguła); `router-fw` sumuje je do jednego wiersza na regułę z pliku. VPP zeruje liczniki listy ACL przy każdej zmianie jej treści (`apply`).
+
+### Aktywacja na stałe
+
+**Instalator nie uruchamia firewalla.** `firewall.conf` po instalacji ma tylko zakomentowany przykład, a usługi `router-fw` czekają na aktywację (`ConditionPathExists=/etc/router/firewall.enabled`). Kolejność po dopasowaniu pliku:
+
+```
+nano /etc/router/firewall.conf     # strefy (zone) z Twoimi interfejsami, listy, reguły
+router-fw check                    # składnia + ostrzeżenia
+router-fw diff                     # co trafi do VPP
+router-fw apply --confirm 120      # wgranie na próbę: bez potwierdzenia cofnie się po 120 s
+router-fw counters                 # czy ruch płynie, czy reguły łapią to, co trzeba
+router-fw confirm                  # zostaje
+router-fw enable                   # AKTYWACJA NA STAŁE: reguły wracają po każdym restarcie VPP i serwera
+router-fw show                     # pierwsza linia: "Firewall: AKTYWNY NA STAŁE"
+```
+
+Do czasu `enable` reguły działają tylko do restartu VPP — po restarcie ich nie ma, a timery kontroli i wygasania blokad nic nie robią. `apply` przypomina o tym, dopóki firewall nie jest aktywny. Dalsze zmiany po aktywacji: `check` → `diff` → `apply --confirm 120` → `confirm` (bez ponownego `enable`).
+
+Wyłączenie: `router-fw disable` — zdejmuje wszystkie reguły z VPP i usuwa aktywację (plik `firewall.conf` zostaje). Router, na którym firewall był stosowany przed wprowadzeniem aktywacji, pozostaje aktywny.
+
+Po aktywacji reguły wracają same po każdym starcie VPP (`router-fw.service`, przed BIRD). Gdy `firewall.conf` ma błąd, po starcie używana jest ostatnia poprawna wersja (`/var/lib/router/fw.last-good.conf`). Wygasłe blokady zdejmuje co minutę `router-fw-expire.timer`, a rozjazd VPP względem pliku wykrywa co 5 minut `router-fw-check.timer`.
 
 | Zdarzenie w logu | Znaczenie |
 |---|---|
 | `%FW-5-APPLIED` | reguły zastosowane (lista zmian) |
 | `%FW-2-CONFIG_ERROR` | błędy w `firewall.conf` (po starcie: użyto ostatniej poprawnej wersji) |
-| `%FW-3-APPLY_FAIL` | VPP odrzucił polecenie; szczegóły w `/var/log/router-monitor/router-fw.log` |
+| `%FW-3-APPLY_FAIL` | VPP odrzucił polecenie; szczegóły w `/var/log/router/firewall.log` |
 | `%FW-4-DRIFT` / `%FW-5-DRIFT_END` | VPP różni się od pliku (np. ręczna zmiana) / znów zgodny |
 | `%FW-5-BLOCK`, `%FW-5-UNBLOCK`, `%FW-5-BLOCK_EXPIRED` | blokady doraźne |
 | `%FW-4-ROLLBACK` | `apply --confirm` nie został potwierdzony, przywrócono poprzednią wersję |
@@ -7777,9 +9897,171 @@ router-guard on web --enforce --for 2h          # grupa z pliku, automatyczne wy
 router-guard off 203.0.113.0/24                 # zdejmij jeden prefiks;  router-guard off = wszystko
 ```
 
-Konfiguracja w osobnym pliku `/etc/router/synack-guard.conf` (interfejsy uplinków `in-if` i strony klientów `out-if`, grupy prefiksów, TTL, `tcp-rst`, `udp-ports`, `udp-frags`, rozmiary tablic). Stan włączenia przeżywa restart VPP (`router-guard.service`: po starcie monitor, po rozgrzewce enforce). Zdarzenia: `%GUARD-5-ON/OFF/MODE/EXPIRED`, `%GUARD-4-VIOLATIONS` (naruszeń na sekundę ponad `alarm-pps`), `%GUARD-4-DRIFT`, `%GUARD-2-TABLE_FULL` (tablica zapełniona: automatyczny powrót do monitora). Liczniki: `router-guard status` albo `vppctl show errors` (węzły `synack-guard-*`).
+Konfiguracja w osobnym pliku `/etc/router/synack-guard.conf` (interfejsy uplinków `in-if` i strony klientów `out-if`, grupy prefiksów, TTL, `tcp-rst`, `udp-ports`, `udp-frags`, `reply-rst`, `reply-rst-pps`, rozmiary tablic). Stan włączenia przeżywa restart VPP (`router-guard.service`: po starcie monitor, po rozgrzewce enforce). Zdarzenia: `%GUARD-5-ON/OFF/MODE/EXPIRED`, `%GUARD-4-VIOLATIONS` (naruszeń na sekundę ponad `alarm-pps`), `%GUARD-4-DRIFT`, `%GUARD-2-TABLE_FULL` (tablica zapełniona: automatyczny powrót do monitora). Liczniki: `router-guard status` albo `vppctl show errors` (węzły `synack-guard-*`).
+
+### Jak działa ochrona — od zera
+
+Atak odbity (reflection) wygląda tak: atakujący wysyła do tysięcy serwerów w internecie pakiety **SYN** (albo zapytania UDP: DNS, NTP, memcached…) z **podrobionym adresem nadawcy — adresem Twojego klienta**. Serwery odpowiadają — **SYN-ACK** (albo dużą odpowiedzią UDP) — do klienta, który o nic nie pytał. Ten zalew odpowiedzi to atak.
+
+Ochrona rozpoznaje „odpowiedź bez pytania”:
+1. Na interfejsach **od strony klientów** (`out-if`) zapamiętuje każde pytanie wysłane z chronionego prefiksu: **SYN** (i jego numer sekwencyjny) oraz **pakiet UDP do portu amplifikacji** (53, 123, 161, 11211…). Wpis żyje `ttl` = 60 s (UDP: `udp-ttl` = 30 s).
+2. Na **uplinkach** (`in-if`) każdą **odpowiedź do chronionego prefiksu** porównuje z zapamiętanymi pytaniami:
+   - **SYN-ACK** — czy był pasujący SYN (te same adresy i porty, nie starszy niż 60 s) i czy numer potwierdzenia = numer SYN + 1,
+   - **UDP ze źródłowego portu amplifikacji** — czy było zapytanie do tego serwera i portu (nie starsze niż 30 s),
+   - **RST** — tylko gdy `tcp-rst handshake` (domyślnie RST nie jest sprawdzany),
+   - **niepierwszy fragment UDP** — tylko gdy `udp-frags drop` (nie ma portów, nie da się sprawdzić — wtedy odrzucany w enforce).
+3. Odpowiedź bez pasującego pytania to **naruszenie**. Co się z nim dzieje — zależy od **trybu**.
+
+**Nigdy nie jest sprawdzane** (zawsze przechodzi bez zmian): ruch do adresów, które nie są chronione; nowe połączenia przychodzące (sam SYN — serwery klientów działają); ACK i dane TCP; UDP z innych portów niż lista amplifikacji; ruch wychodzący od klientów (jest tylko zapamiętywany); ICMP.
+
+### Tryby — co dokładnie robi każdy
+
+| Tryb | Pakiet bez naruszenia | Naruszenie (odpowiedź bez pytania) | Kiedy używać |
+|---|---|---|---|
+| **off** (wyłączona) | przechodzi | — (nic nie jest sprawdzane) | normalnie. Węzły filtra są zdjęte z interfejsów — **zero kosztu**, VPP działa jakby filtra nie było |
+| **monitor** | przechodzi | **przechodzi** do klienta; liczony w „naruszenia”, zapisany w dzienniku zdarzeń (`router-top` karta 4: „PRZESZEDŁ (monitor)”) | na początku ataku i zawsze przed enforce: sprawdzasz, czy filtr rozpoznaje atak i czy **nie łapie normalnego ruchu** |
+| **enforce** | przechodzi | **odrzucony** w VPP — nie dociera do klienta; liczony w „odrzucone”. Router nic nie odsyła (chyba że `reply-rst on`, niżej) | gdy monitor potwierdził atak, a przy normalnym ruchu naruszeń jest ~0 |
+
+**Odrzucony** znaczy: pakiet jest usuwany w VPP na wejściu uplinka, zanim trafi do tablicy tras — nie idzie dalej, nie obciąża łącza do klienta, klient go nie widzi. Nic nie jest wysyłane z powrotem (ani ICMP, ani RST).
+
+**`reply-rst on`** (w `synack-guard.conf`, domyślnie wyłączone) zmienia tylko jedno: w **enforce**, dla **SYN-ACK bez pasującego SYN**, zamiast samego odrzucenia router odsyła do serwera, który go wysłał, pakiet **RST** — tak jak zrobiłby to komputer klienta. Serwer kończy wtedy połączenie i **przestaje powtarzać SYN-ACK** (bez RST powtarza do ok. 60 s). Limit `reply-rst-pps` (domyślnie 10 000/s); ponad limit — samo odrzucenie. RST nigdy nie jest wysyłany dla: złego numeru potwierdzenia, RST, UDP, trybu monitor (tam tylko licznik „RST do wysłania”).
+
+### Polecenia — co dokładnie robi każde
+
+| Polecenie | Co robi |
+|---|---|
+| `router-guard on <prefiks\|IP\|grupa>[,…]` | Włącza ochronę dla wskazanych adresów (dopisuje je do już chronionych). Podpina filtr na interfejsach `in-if` i `out-if`, wgrywa ustawienia z pliku. Tryb: jeśli ochrona już działa — dotychczasowy docelowy; jeśli nie — `default-mode` z pliku (domyślnie **monitor**). |
+| `… --monitor` | Jak wyżej, tryb **monitor**. |
+| `… --enforce` | Jak wyżej, ale **najpierw monitor przez `warmup` (60 s), potem automatycznie enforce**. Rozgrzewka jest po to, żeby filtr zdążył zapamiętać SYN-y połączeń, które klient już nawiązuje — bez niej zerwałyby się w pierwszej minucie. |
+| `… --for 2h` | Ochrona wyłączy się sama po tym czasie (30m, 2h, 1d). Bez `--for` — po `max-on` (domyślnie 6 h). Nie da się ustawić dłużej niż `max-on`. |
+| `router-guard enforce` | Przełącza **od razu** na enforce (bez rozgrzewki — zakłada, że monitor już działał). Dotyczy wszystkich chronionych prefiksów. |
+| `router-guard monitor` | Przełącza od razu na monitor (przestaje odrzucać, dalej liczy). |
+| `router-guard off <prefiks>` | Zdejmuje ochronę z jednego prefiksu; reszta działa dalej. |
+| `router-guard off` | Wyłącza całkowicie: tryb off, filtr zdjęty z interfejsów, lista prefiksów pusta. |
+| `router-guard status` | Stan: tryb, prefiksy, za ile się wyłączy, zapełnienie tablic, liczniki (sprawdzone, przepuszczone, naruszenia, odrzucone, RST) z szybkością na sekundę. |
+| `router-guard check` | Sprawdza plik i czy VPP zgadza się ze stanem ochrony. |
+
+**Dodanie nowego prefiksu w trakcie enforce** (`on <nowy> --enforce`): cała ochrona wraca na czas rozgrzewki do monitora (żeby nowy prefiks nie stracił trwających połączeń), potem znów enforce.
+
+### Co dzieje się samo
+| Sytuacja | Zachowanie |
+|---|---|
+| minął czas (`--for` / `max-on`) | co minutę timer sprawdza; po terminie ochrona się wyłącza, w `alarmy.log` `%GUARD-5-EXPIRED` + e-mail |
+| koniec rozgrzewki | przejście z monitor na enforce (`%GUARD-5-MODE`) |
+| restart VPP lub serwera w trakcie ochrony | ochrona wraca **w monitorze**, po rozgrzewce enforce (jeśli taki był cel); jeśli czas minął — nie wraca |
+| tablica stanów zapełniona w ≥ 90 % (w enforce) | **automatyczne przejście na monitor** (`%GUARD-2-TABLE_FULL`) — przy pełnej tablicy filtr nie zapamiętuje nowych SYN, więc w enforce zacząłby odrzucać prawdziwe połączenia |
+| naruszeń więcej niż `alarm-pps` na sekundę | `%GUARD-4-VIOLATIONS` (najwyżej raz na 10 min) |
+| ktoś zmienił VPP ręcznie | `%GUARD-4-DRIFT` |
+
+### Ustawienia (`/etc/router/synack-guard.conf`)
+| Ustawienie | Domyślnie | Znaczenie |
+|---|---|---|
+| `in-if` | — | uplinki (stąd przychodzą odpowiedzi do sprawdzenia) |
+| `out-if` | — | interfejsy klientów (stąd wychodzą SYN i zapytania UDP, które są zapamiętywane) |
+| `group NAZWA prefiks…` | — | nazwa dla `router-guard on NAZWA` |
+| `ttl` | 60 | ile sekund pamiętany jest SYN |
+| `udp-ttl` | 30 | ile sekund pamiętane jest zapytanie UDP |
+| `warmup` | 60 | ile sekund monitora przed enforce |
+| `max-on` | 6h | najdłuższy czas ochrony |
+| `default-mode` | monitor | tryb po `on` bez `--monitor`/`--enforce` |
+| `check-isn` | on | SYN-ACK musi potwierdzać numer z SYN (wykrywa podrobione SYN-ACK do trwających połączeń) |
+| `tcp-rst` | pass | `pass` = RST nie jest sprawdzany; `handshake` = RST też musi mieć pasujący SYN |
+| `udp` | on | sprawdzanie UDP z portów amplifikacji |
+| `udp-ports` | 19 53 111 123 137 161 389 1900 3702 5353 11211 | porty źródłowe odpowiedzi UDP, które są sprawdzane |
+| `udp-frags` | pass | `drop` = w enforce odrzucaj niepierwsze fragmenty UDP do chronionych adresów |
+| `reply-rst` | off | `on` = w enforce odsyłaj RST na SYN-ACK bez SYN |
+| `reply-rst-pps` | 10000 | limit RST na sekundę |
+| `table-v4` / `table-v6` | 4000000 / 1000000 | rozmiar pamięci zapamiętanych pytań (zmiana tylko przy wyłączonej ochronie) |
+| `alarm-pps` | 10000 | próg alarmu o naruszeniach |
+
+### Ważne ograniczenia
+- Router **musi widzieć oba kierunki** ruchu chronionego prefiksu (pytanie wychodzi przez ten router i odpowiedź wraca przez ten router). Jeśli część ruchu klienta wychodzi inną drogą, odpowiedzi na nią wyglądają jak atak — w monitorze zobaczysz naruszenia przy normalnym ruchu. **Wtedy nie włączaj enforce.**
+- Atak większy niż przepustowość łączy do upstreamów zapcha łącza, zanim dotrze do routera — guard tego nie zmieni; potrzebny RTBH / Flowspec u operatora.
+
+### Co się dzieje z niechcianym SYN-ACK
+
+Na interfejsach klientów (`out-if`) wtyczka zapisuje każdy SYN wysłany z chronionego prefiksu (wpis ważny `ttl` = 60 s). Na uplinkach (`in-if`) każdy SYN-ACK do chronionego adresu jest sprawdzany:
+
+| Sytuacja | monitor | enforce | enforce + `reply-rst on` |
+|---|---|---|---|
+| jest pasujący SYN, `ack = ISN+1` | przechodzi | przechodzi | przechodzi |
+| brak pasującego SYN (odbicie) | przechodzi, licznik naruszeń; licznik „RST do wysłania” | **odrzucony** po cichu | **odrzucony + RST do nadawcy** (w limicie `reply-rst-pps`; ponad limit sam drop) |
+| SYN jest, ale zły numer potwierdzenia | przechodzi, licznik | **odrzucony** po cichu | **odrzucony po cichu** (bez RST — patrz niżej) |
+
+**Po co RST (`reply-rst`).** Serwer, od którego atakujący odbija ruch, ponawia SYN-ACK do ok. 60 s (Linux: 6 razy), dopóki nie dostanie odpowiedzi. Gdy enforce odrzuca SYN-ACK po cichu, klient nie odpowiada i serwer wysyła wszystkie powtórki. RST kończy to po pierwszym pakiecie — tak samo zachowałby się host klienta bez filtra. Odbitego ruchu może być wtedy nawet kilka razy mniej.
+
+**Ograniczenia, celowo:**
+- RST tylko na **SYN-ACK bez pasującego SYN**. Nigdy na zły numer potwierdzenia (RST z numerem wybranym przez atakującego mógłby zerwać cudze, prawdziwe połączenie), nigdy na RST i nigdy na UDP.
+- Limit `reply-rst-pps` (domyślnie 10 000/s łącznie, dzielony równo na wątki VPP). Na każdy odrzucony SYN-ACK wychodzi najwyżej jeden mały RST (bez wzmocnienia), ale przy ataku idzie to uplinkami w drugą stronę. Ponad limit — sam drop, licznik „RST pominięte”.
+- Jeśli atakujący wysyła SYN-ACK bezpośrednio z podrobionym nadawcą, RST trafi pod ten podrobiony adres — dlatego domyślnie `reply-rst off` i limit.
+- RST powstaje z odrzucanego pakietu (bez nowych buforów) i idzie zwykłym routingiem w tym samym VRF; filtr firewalla wyjściowego (`router-fw`) też go obejmuje.
+
+Jak ocenić skalę przed włączeniem: ustaw `reply-rst on` i włącz ochronę w trybie monitor — `router-guard status` pokaże „RST do wysłania (monitor)”, czyli ile RST router wysyłałby w enforce (nic nie jest wtedy wysyłane ani odrzucane). Liczniki: „RST wysłane”, „RST pominięte (limit reply-rst-pps)”.
 
 Wtyczka jest budowana razem z VPP (etap 10). Na routerze zainstalowanym wcześniej wymaga `install-router.sh --from 10` (30–60 min) i restartu VPP; do tego czasu `router-guard` zgłasza, że wtyczka nie jest załadowana. Odpowiedź na atak większy niż pojemność łączy upstreamowych to nadal RTBH lub Flowspec u upstreamów.
+
+---
+
+## 10c. Czas, DNS i ochrona CPU routera (iptables)
+
+**Czas:** strefa `Europe/Warsaw`, synchronizacja `chrony` z serwerami GUM `tempus1.gum.gov.pl` (194.146.251.100) i `tempus2.gum.gov.pl` (194.146.251.101) przez port zarządzający. Stan: `chronyc sources`, `timedatectl`.
+
+**DNS:** `/etc/resolv.conf` (i kopia w netns dataplane): 46.45.78.2, 46.45.114.2, 8.8.8.8. DHCP na eth2 ich nie nadpisuje.
+
+**Tablice sąsiadów (ARP / ND) — dużo urządzeń w sieci:**
+
+| Gdzie | Ustawienie (`NEIGH_MAX=65536`, `NEIGH_AGE=14400`) |
+|---|---|
+| VPP (forwarding) | `set ip neighbor-config ip4|ip6 limit 65536 age 14400 recycle` — osobno IPv4 i IPv6; po 4 h bez ARP/ND od sąsiada VPP pyta go ponownie (do 3 prób) — odpowiedź odświeża wpis bez przerwy w ruchu, brak odpowiedzi usuwa wpis; przy zapełnieniu najstarszy wpis ustępuje nowemu (domyślnie VPP odmówiłby nowego sąsiada). W `/etc/vpp/bootstrap.vpp`, więc działa po każdym starcie VPP |
+| Linux (obie przestrzenie) | `gc_thresh1/2/3` = 16384 / 32768 / 65536 (`/etc/sysctl.d/82-router-neigh.conf`) |
+
+Dlaczego 4 h (jak Cisco): to najmniejsze obciążenie — w LAN IX (/21–/22, do ok. 2000 sąsiadów) ok. 0,1 zapytania ARP/ND na sekundę. Zmiana MAC sąsiada nie czeka 4 h: nowy router ogłasza się sam (GARP), a do zestawienia BGP i tak pyta o Twój MAC — wtedy wpis poprawia się od razu. 4 h dotyczy tylko sąsiada w IX, który wymienił router, nie ogłosił się i nie rozmawia z Tobą bezpośrednio (np. trasy tylko przez route server). Na łączach /30–/31 z tier1 czas nie ma znaczenia. Limit 65 536 wpisów to duży zapas (IX /21 to najwyżej 2046 adresów); zapełniona tablica nie odmawia nowych sąsiadów, tylko usuwa najstarszy wpis.
+
+Podgląd: `vppctl show ip neighbor-config`, liczba wpisów: `vppctl show ip neighbors | wc -l`.
+
+**Ochrona CPU (iptables).** Router ma dwie przestrzenie sieciowe i każda ma własne reguły, wczytywane przy każdym starcie:
+
+| Gdzie | Plik | Wczytuje | Dotyczy |
+|---|---|---|---|
+| port zarządzający (eth2, SSH) | `/etc/iptables/rules.v4`, `rules.v6` | `netfilter-persistent` | SSH i wszystko, co przychodzi na eth2 |
+| netns `dataplane` | `/etc/iptables/dataplane.rules.v4`, `dataplane.rules.v6` | `router-dataplane-fw.service` | **adresy w VPP: interfejsy i loop0** — ruch, który VPP przekazuje do Linuksa (SNMP, BGP, SSH na adres VPP) |
+
+Polityka (ta sama w obu miejscach):
+1. zaufane sieci (`TRUSTED_NETS`: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 — LOCAL; 46.45.64.0/18 — ALL BLOKOWE) mają pełny dostęp,
+2. LibreNMS (`SNMP_ALLOW`) zawsze ma SNMP,
+3. ping do routera: najwyżej 10/s z jednego adresu i 500/s łącznie,
+4. **SSH i SNMP (TCP/UDP 22, 161) z reszty świata — DROP**,
+5. reszta (BGP, BFD, odpowiedzi na połączenia routera) przechodzi.
+
+SNMP w VPP (snmpd w netns dataplane) wpuszcza community z tych samych zaufanych sieci. loop0 jest chroniony tak samo jak każdy adres w VPP — reguły netns dataplane obejmują wszystkie adresy lokalne.
+
+Zmiana reguł: edytuj plik, potem `netfilter-persistent reload` (eth2) albo `systemctl restart router-dataplane-fw` (VPP). Reguły są w tabeli **raw** (łańcuch `PREROUTING`) — pakiet jest odrzucany zaraz po wejściu, przed trasowaniem, co przy zalewaniu najmniej kosztuje CPU. **Conntrack jest wyłączony** (`/etc/modprobe.d/router-no-conntrack.conf`, `router-check` to sprawdza): ruch tranzytowy obsługuje VPP, kernel nie musi śledzić połączeń; reguły ze stanem (`-m state`, `-m conntrack`, NAT) celowo nie zadziałają. Podgląd z licznikami: `iptables -t raw -L PREROUTING -nv` oraz `ip netns exec dataplane iptables -t raw -L PREROUTING -nv`. Instalator nie nadpisuje istniejących plików reguł. Jeśli adres Twojej sesji SSH nie jest w zaufanych sieciach, reguły eth2 zostaną zapisane, ale nie wczytane (ochrona przed odcięciem).
+
+**Ping i mtr na adresy w VPP odpowiada VPP, nie kernel** (wtyczka ping VPP; „TTL exceeded” dla mtr generuje węzeł `ip4-icmp-error`, z własnym dławieniem). Limity w iptables i `sysctl` (`/etc/sysctl.d/84-router-icmp.conf`: `icmp_ratelimit` 100 ms, `icmp_msgs_per_sec` 500) chronią kernel — port zarządzający i ruch przekazany przez VPP do Linuksa — ale nie dotyczą pingu obsłużonego przez VPP.
+
+---
+
+## 10d. Podgląd na żywo (`router-top`)
+
+```
+router-top          # start na karcie 1;  router-top 4 = od razu guard
+```
+Odświeżanie co sekundę, tylko odczyt (niczego nie zmienia). Klawisze: **1** VPP, **2** interfejsy, **3** firewall, **4** guard, **↑ ↓ PgUp PgDn Home End** (albo **j k**) przewijanie, **p** pauza, **q** wyjście.
+
+**Przewijanie:** gdy lista nie mieści się na ekranie (dużo VLAN-ów, reguł, zdarzeń), na dole pojawia się pasek „wiersze 1–40 z 230”. Nagłówek tabeli zostaje na górze, każda karta pamięta swoje przewinięcie, a odświeżanie co sekundę go nie resetuje. Przy dużej liczbie VLAN-ów warto też powiększyć okno terminala.
+
+| Karta | Co pokazuje | Źródło |
+|---|---|---|
+| **1 VPP** | **obciążenie VPP** (odpowiednik QFP w Cisco): każdy worker z paskiem i średnim rozmiarem wektora — 1 = luz, 64 = alarm (`VEC_WARN`), 160 = krytyczne, 256 = nasycenie — oraz pętle/s; ruch łącznie na portach fizycznych (RX/TX Gb/s i pkt/s) i pakiety zgubione przez kartę | statystyki VPP (`/sys/vector_rate_per_worker`, liczniki interfejsów) |
+| **2 Interfejsy** | każdy port i jego VLAN-y (`└ hu0.100`) z opisem z `ifaces.conf`: RX/TX w Gb/s i pkt/s, pakiety zgubione przez kartę (czerwony wiersz); suma portów fizycznych — jak iptraf-ng | liczniki interfejsów VPP (segment statystyk), dokładne |
+| **3 Firewall** | każda reguła z opisem: pakiety razem, pkt/s, przepustowość; zielone = reguła łapie ruch, czerwone = `deny` w akcji | liczniki ACL (jak `router-fw counters`), dokładne |
+| **4 Guard** | stan ochrony, liczniki z szybkością (sprawdzone, przepuszczone, naruszenia, **odrzucone**, **RST wysłane**), najczęstsze źródła i atakowane adresy, **ostatnie 30 naruszeń**: źródło:port → cel:port, typ (syn-ack / rst / udp), powód, decyzja (ODRZUCONY / ODRZUCONY + RST / PRZESZEDŁ w monitorze) | liczniki węzłów VPP (dokładne) + dziennik wtyczki `show synack-guard events` |
+
+Lista zdarzeń guarda to **próbka**: przy ataku przez router idą miliony pakietów na sekundę, więc wtyczka zapisuje najwyżej 200 naruszeń/s na wątek (pierścień 256 ostatnich na wątek, bez blokad, bez wpływu na wydajność). Liczniki nad listą są dokładne.
+
+Bez terminala (skrypty, szybki podgląd): `router-top --once 1` (albo 2, 3, 4) — jeden odczyt jako zwykły tekst.
+
+**Bezpieczne w czasie ataku.** Wszystkie liczniki (interfejsy, reguły ACL, guard) router-top czyta z segmentu statystyk VPP — pamięci współdzielonej, bez angażowania VPP. Polecenia `vppctl`, które na moment zatrzymują wątki przetwarzające pakiety (tzw. bariera), są wywoływane rzadko: mapa list ACL co 15 s. Polecenia guarda (`show synack-guard`, `show synack-guard events`) działają bez bariery, a liczbę wpisów w tablicach stanów wtyczka liczy w tle co 10 s na wątku głównym, nie przy każdym zapytaniu. router-top działa na rdzeniach systemowych, nie na rdzeniach VPP.
 
 ---
 
@@ -7843,7 +10125,7 @@ Kopie firmware i wyniki zapytań: `@@DATADIR@@/firmware/`. Karta z PSID zaczynaj
 ./install-router.sh upgrade_script            # podmień tylko zmienione programy
 ```
 
-Podmieniane są wyłącznie programy w `/opt/router/bin`, `router-check` i kopia skryptu w `/opt/router`. Konfiguracja (`ifaces.conf`, `notify.conf`, `router.env`, `bird.conf`, `startup.conf`), jednostki systemd, VPP i BIRD pozostają nietknięte — sesje BGP się nie przerywają. Skrypt najpierw sprawdza składnię wszystkich nowych programów, potem robi kopię starych w `@@DATADIR@@/backup/upgrade-<data>/`, podmienia pliki i restartuje tylko `router-monitor` i `router-notify`, jeśli ich programy się zmieniły. Wynik trafia do `router-monitor.log` (`%SYS-5-SCRIPTS_UPGRADED`) i do historii `/etc` (etckeeper).
+Podmieniane są wyłącznie programy w `/opt/router/bin`, `router-check`, instrukcja `/etc/router/INSTRUKCJA.md` i kopia skryptu w `/opt/router`. Konfiguracja (`ifaces.conf`, `notify.conf`, `router.env`, `bird.conf`, `startup.conf`), jednostki systemd, VPP i BIRD pozostają nietknięte — sesje BGP się nie przerywają. Skrypt najpierw sprawdza składnię wszystkich nowych programów, potem robi kopię starych w `@@DATADIR@@/backup/upgrade-<data>/`, podmienia pliki i restartuje tylko `router-monitor` i `router-notify`, jeśli ich programy się zmieniły. Przy przejściu ze starszej wersji logi z dawnego `/var/log/router-monitor/` są przenoszone do `/var/log/router/`. Wynik trafia do `/var/log/router/alarmy.log` (`%SYS-5-SCRIPTS_UPGRADED`) i do historii `/etc` (etckeeper).
 
 **Aktualizacja VPP lub BIRD** (w oknie serwisowym):
 
@@ -8010,13 +10292,17 @@ run_stage 20 "Dokumentacja (/opt/router)"             st_docs
 run_stage 21 "Raport instalacji"                      st_report
 run_stage 22 "Firewall tranzytu (router-fw)"          st_fw
 run_stage 23 "Ochrona przed odbiciami (router-guard)"  st_guard
+run_stage 24 "Logi w plikach (rsyslog → /var/log/router)" st_logs
+run_stage 25 "System: czas, DNS, iptables (ochrona CPU)" st_system
 
 printf '\n%s[%s] INSTALACJA ZAKOŃCZONA.%s\n' "$c_ok" "$(now)" "$c_off"
 cat <<EOF
+  Instrukcja:    /etc/router/INSTRUKCJA.md   (obsługa produkcyjna)
   Dokumentacja:  /opt/router/README.md
   Raport:        $MANIFEST
   Kontrola:      router-check
-  Alarmy:        tail -f /var/log/router-monitor/router-monitor.log
+  Alarmy:        tail -f /var/log/router/alarmy.log
+  Logi:          /var/log/router/ (vpp, bird, firewall, guard, ifaces, alarmy)
   Interfejsy:    edytuj /etc/router/ifaces.conf, potem: router-ifaces diff / router-ifaces apply
 
   Izolacja rdzeni i pełna pula hugepages działają dopiero po restarcie serwera.

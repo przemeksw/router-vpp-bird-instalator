@@ -63,4 +63,4 @@
 
 ### Task 5: Przegląd końcowy
 
-- [ ] Recenzja całości (świeży kontekst), poprawki Critical/Important z testem RED→GREEN, ledger.
+- [x] Recenzja całości (świeży kontekst), poprawki Critical/Important z testem RED→GREEN, ledger.

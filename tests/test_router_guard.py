@@ -81,6 +81,17 @@ class TestConfig(Base):
             _c, errs = gd.parse_conf(text)
             self.assertTrue(any(want in e for e in errs), (text, errs))
 
+    def test_reply_rst_defaults_and_parsing(self):
+        conf, errs = gd.parse_conf("in-if a\nout-if b\n")
+        self.assertEqual(errs, [])
+        self.assertEqual((conf.reply_rst, conf.reply_rst_pps), ("off", 10000))
+        conf, errs = gd.parse_conf("in-if a\nout-if b\nreply-rst on\nreply-rst-pps 500\n")
+        self.assertEqual(errs, [])
+        self.assertEqual((conf.reply_rst, conf.reply_rst_pps), ("on", 500))
+        self.assertIn("reply-rst on reply-rst-pps 500", gd.config_cmd(conf, with_tables=False))
+        _c, errs = gd.parse_conf("in-if a\nout-if b\nreply-rst tak\n")
+        self.assertTrue(any("reply-rst" in e for e in errs), errs)
+
     def test_duration(self):
         self.assertEqual([gd.parse_duration(x) for x in ("90", "30s", "30m", "2h", "1d")], [90, 30, 1800, 7200, 86400])
         with self.assertRaises(ValueError):
@@ -129,7 +140,7 @@ class Cli(Base):
 
     def log_text(self):
         try:
-            with open(self.root + "/var/log/router-monitor/router-monitor.log") as f:
+            with open(self.root + "/var/log/router/alarmy.log") as f:
                 return f.read()
         except OSError:
             return ""
@@ -326,6 +337,21 @@ class TestCheckStatus(Cli):
             self.assertIn(want, out)
         rc, out = self.guard("status")
         self.assertEqual(rc, 0, out)
+
+    def test_status_shows_rst_counters(self):
+        self.guard("on", "web")
+        self.vpp("fake guard-errors " + json.dumps({"synack-guard-in-ip4|RST sent": 321,
+                                                    "synack-guard-in-ip4|RST would be sent": 77,
+                                                    "synack-guard-in-ip4|RST rate limited": 5}))
+        rc, out = self.guard("status")
+        self.assertEqual(rc, 0, out)
+        for want in ("RST wysłane", "321", "RST do wysłania", "77", "RST pominięte", "5"):
+            self.assertIn(want, out)
+
+    def test_on_sends_reply_rst_config_to_vpp(self):
+        self.write_conf(CONF_TEXT + "reply-rst on\nreply-rst-pps 2000\n")
+        self.assertEqual(self.guard("on", "web")[0], 0)
+        self.assertIn("reply-rst on reply-rst-pps 2000", self.show())
 
     def test_status_when_off(self):
         rc, out = self.guard("status")

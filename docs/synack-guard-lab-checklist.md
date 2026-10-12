@@ -9,7 +9,7 @@ Moduł C (`synack_guard.c`) nie był kompilowany ani uruchamiany na maszynie dew
 | 1 | Moduł się kompiluje w drzewie VPP | `install-router.sh --from 10`; błędy kompilacji `synack_guard.c` | `synack_guard.c` (miejsca „WERSJA:”) |
 | 2 | Nagłówki bihash i szablony | błędy przy dwóch typach tablic w jednym pliku | kolejność `#include <vppinfra/bihash_*.h>` i `bihash_template.[hc]` |
 | 3 | `vnet_feature_next_u16` | błąd nazwy funkcji | makro `SG_FEATURE_NEXT` |
-| 4 | `clib_bihash_add_or_overwrite_stale_*`, `clib_bihash_search_inline_2_with_hash_*`, `clib_bihash_elts_*` | błędy sygnatur | użycia w `sg_node_inline`, `sg_show_command_fn` |
+| 4 | `clib_bihash_add_or_overwrite_stale_*`, `clib_bihash_search_inline_2_with_hash_*`, `clib_bihash_foreach_key_value_pair_*` (sprawdzone ze źródłami v26.06) | błędy sygnatur | użycia w `sg_node_inline`, `sg_show_command_fn` |
 | 5 | Wtyczka się ładuje | `vppctl show plugins | grep synack`, `vppctl show synack-guard` | — |
 
 ## B. Zachowanie (generator: scapy lub TRex)
@@ -27,6 +27,13 @@ Moduł C (`synack_guard.c`) nie był kompilowany ani uruchamiany na maszynie dew
 | 14 | IPv6 (SYN, SYN-ACK, UDP), podinterfejsy VLAN (dot1q) | j.w. |
 | 15 | Asymetria uplinków: SYN wychodzi uplinkiem A, SYN-ACK wraca B | przechodzi (tablica globalna) |
 | 16 | Retransmisja SYN | odświeża czas, SYN-ACK przechodzi |
+| 16a | `reply-rst on`, enforce: SYN-ACK bez SYN | Dropped i RST sent rosną; na uplinku wychodzi RST: adresy i porty zamienione, `seq` = ack z SYN-ACK, flaga tylko RST, poprawne sumy (tcpdump/wireshark), ten sam VRF |
+| 16b | `reply-rst on`: SYN-ACK ze złym ISN, RST przychodzący, UDP | brak RST |
+| 16c | `reply-rst-pps 100` i 10 000 SYN-ACK/s | ok. 100 RST/s, reszta „RST rate limited”; przy kilku workerach łącznie ok. 100/s |
+| 16d | `reply-rst on`, tryb monitor | RST nie wychodzi, rośnie „RST would be sent” |
+| 16e | `show synack-guard events count 30` przy naruszeniach (monitor i enforce, IPv4 i IPv6) | wiersze `event: …` z poprawnymi adresami, portami, typem i decyzją (passed / dropped / dropped+rst); `router-top 4` je pokazuje |
+| 16f | Atak 1 Mpps+ SYN-ACK, enforce | liczniki węzłów rosną dokładnie; dziennik zapisuje najwyżej ok. 200 zdarzeń/s na wątek; brak spadku wydajności względem wersji bez dziennika (`show runtime`) |
+| 16g | Atak + `router-top 4` i `watch -n1 vppctl show synack-guard` przez 10 min, tablica 4 mln wpisów | brak wzrostu `rx-miss` względem pracy bez podglądu; `table-v4` aktualizuje się co ok. 10 s (proces `synack-guard-count`); `show runtime` — proces liczący nie blokuje CLI na dłużej niż kilkadziesiąt ms |
 
 ## C. Wydajność i odporność
 
