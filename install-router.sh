@@ -5422,6 +5422,7 @@ BIRD działa w netns `dataplane` i startuje dopiero po odtworzeniu interfejsów 
 | Zła zmiana w pliku | `git -C /etc log -p router/<plik>`; przywrócenie: `git -C /etc checkout <commit> -- router/<plik>`, potem `apply` |
 | Zmiana firewalla odcięła ruch | jeśli była z `--confirm`, cofnie się sama; inaczej: popraw plik i `router-fw apply`, albo przywróć z gita |
 | Restart serwera | wszystko wstaje samo (`router.target`); sprawdź `grep BOOT_ /var/log/router/alarmy.log \| tail -1` |
+| Padł pierwszy dysk systemowy | serwer startuje z drugiego, jeśli wcześniej uruchomiono `install-uefi-mdadm.sh` (osobny skrypt z repozytorium: kopia partycji EFI na drugi dysk + wpis UEFI). Po wymianie dysku: odtwórz partycje, `mdadm --manage /dev/mdX --add …`, potem ponownie `install-uefi-mdadm.sh` |
 | Brak e-maili | `router-notify test`; `ls /var/spool/router-notify/`; `grep MAIL_FAIL /var/log/router/alarmy.log` |
 
 **Restart VPP zawsze oznacza krótką przerwę w ruchu i ponowne zestawienie sesji BGP.** Restartuj świadomie: `systemctl restart vpp`.

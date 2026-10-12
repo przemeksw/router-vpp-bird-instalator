@@ -203,3 +203,14 @@ Strefa `Europe/Warsaw`, chrony z serwerami GUM (`tempus1/2.gum.gov.pl`), DNS 46.
 ## Audyt zgodności z VPP
 
 `docs/audyt-vpp-2026-10-12.md` — zgodność konfiguracji, poleceń i wtyczki z VPP v26.06 oraz wpływ wszystkich mechanizmów na wydajność i ciągłość pracy routera.
+
+## Start z drugiego dysku RAID1 (`install-uefi-mdadm.sh`)
+
+Osobny skrypt (nie jest częścią `install-router.sh`). Przy rozruchu UEFI partycja EFI (`/boot/efi`) jest tylko na pierwszym dysku — gdy ten padnie, serwer nie wystartuje, choć RAID z systemem działa. Skrypt kopiuje ESP na drugi dysk macierzy, dodaje wpis UEFI „debian-sdX” (na końcu kolejności startu) i instaluje hook apt, który po każdej aktualizacji pakietów (GRUB, shim) odświeża kopię. Niczego nie formatuje, można go uruchamiać wielokrotnie.
+
+```
+scp install-uefi-mdadm.sh root@router:/root/
+bash /root/install-uefi-mdadm.sh --dry-run    # plan: który dysk, która partycja, jaki wpis UEFI
+bash /root/install-uefi-mdadm.sh              # wykonanie (pyta o potwierdzenie)
+```
+Opcje: `--disk /dev/sdb` (wskaż drugi dysk ręcznie), `--yes`, `--no-hook`. Test startu z drugiego dysku: w oknie serwisowym F11 / iDRAC → „debian-sdb”.
