@@ -7196,7 +7196,9 @@ linux-nl {
 
 logging {
   default-log-level info
-  default-syslog-log-level notice
+  default-syslog-log-level warn
+  # "ignore neighbour add" co ~30 s dla vetha rpki1 (bez pary LCP) — szum
+  class linux-cp/router { level warn syslog-level warn }
 }
 EOF
   {
