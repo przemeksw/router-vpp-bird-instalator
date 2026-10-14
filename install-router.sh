@@ -41,7 +41,8 @@
 #   ./install-router.sh upgrade_script             # tylko aktualizacja programów routera (bez restartu VPP/BIRD)
 #   ./install-router.sh upgrade_script --dry-run   # pokaż, co by się zmieniło, bez zapisywania
 #   ./install-router.sh --version                  # wersja skryptu i wersja zainstalowana na routerze
-#   ./install-router.sh set_workers [N] [--dry-run] # zmiana liczby workerów VPP bez ponownej instalacji (po zmianie restart serwera)
+#   ./install-router.sh set_workers [N] [--dry-run] # zmiana liczby workerów VPP bez ponownej instalacji (po zmianie restart serwera);
+#                                                   #   bez N: obecna liczba, odświeża układ rdzeni i izolację (upgrade_script robi to sam)
 #   ./install-router.sh [set_workers N] --choose-nic  # wybór portu Mellanox numerem (1,2,3…); bez tej flagi pyta tylko przy pierwszej instalacji z wieloma portami
 #
 # Po instalacji: dokumentacja /opt/router/README.md, kontrola stanu: router-check
@@ -183,7 +184,11 @@ fi
 ((DRY_RUN)) && [[ $MODE != upgrade && $MODE != workers ]] && { echo "--dry-run działa tylko z upgrade_script i set_workers"; exit 1; }
 if [[ $MODE == workers ]]; then
   ASSUME_YES=1                                     # bez pytań: zmiana dotyczy tylko rdzeni (GRUB, startup.conf)
-  [[ -z $WORKERS_REQ ]] || VPP_WORKERS=$WORKERS_REQ
+  if [[ -n $WORKERS_REQ ]]; then VPP_WORKERS=$WORKERS_REQ
+  else                                             # bez liczby: zostaje obecna liczba workerów (odświeżenie rdzeni i izolacji)
+    cur_w=$(sed -n 's/^[[:space:]]*corelist-workers[[:space:]]*//p' /etc/vpp/startup.conf 2>/dev/null | head -n1)
+    [[ -n $cur_w ]] && VPP_WORKERS=$(tr ',' '\n' <<<"$cur_w" | grep -c .)
+  fi
 fi
 [[ $EUID -eq 0 ]] || { echo "Uruchom jako root."; exit 1; }
 mkdir -p "$SRC_DIR" "$DEB_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR"
@@ -201,6 +206,12 @@ expand_cpulist() {   # "1,3,5-9" -> "1 3 5 6 7 8 9"
   echo "${out[@]}"
 }
 join_by() { local IFS="$1"; shift; echo "$*"; }
+cpu_mask() {   # cpu_mask 0 1 40 -> "00000100,00000003" (maska hex w formacie sysfs, słowa 32-bitowe)
+  local c w max=0 out="" words=()
+  for c in "$@"; do w=$((c / 32)); words[w]=$(( ${words[w]:-0} | (1 << (c % 32)) )); ((w > max)) && max=$w; done
+  for ((w = max; w >= 0; w--)); do out+="${out:+,}$(printf '%08x' "${words[w]:-0}")"; done
+  echo "$out"
+}
 normalize_pci() { local p="${1,,}"; [[ $p =~ ^[0-9a-f]{4}: ]] || p="0000:$p"; echo "$p"; }
 netdev_of() { ls "${PCI_SYSFS:-/sys/bus/pci/devices}/$1/net" 2>/dev/null | head -n1 || true; }
 # bufory VPP od zapotrzebowania: każda kolejka RX/TX trzyma swoje bufory (deskryptory) + cache wątków; bierzemy 8× tyle
@@ -500,6 +511,9 @@ prog_router_ifaces() {
   router-ifaces render       wypisz pełną konfigurację jako polecenia vppctl
   router-ifaces boot         (systemd) po starcie VPP odtwórz konfigurację
   router-ifaces snmp         odtwórz plik opisów dla SNMP (/etc/router/snmp-ifaces.yaml) bez dotykania VPP
+  router-ifaces optics       porty i wkładki: admin/link/prędkość z VPP, DDM z ethtool -m (moc TX/RX dBm, bias, temp.);
+                             -w odświeża co 10 s (--interval SEK), --json
+  router-ifaces errors       błędy portów (CRC, symbol, discards, rx-miss, drops…) z przyrostem; -w co 10 s
 
 Plik ifaces.conf jest jedynym źródłem prawdy: adres usunięty z pliku znika z VPP,
 VLAN usunięty z pliku jest kasowany, zmiana opisu trafia do SNMP (ifAlias) i Linuksa.
@@ -1403,6 +1417,356 @@ def do_snmp(args):
     return 0
 
 
+# --------------------------------------------------------------------------- wkładki: DDM (ethtool -m)
+ETHTOOL = os.environ.get("ROUTER_IFACES_ETHTOOL", "ethtool")
+SYSPCI = ROOT + "/sys/bus/pci/devices"
+KV_RE = re.compile(r"^\s*([^:]+?)\s*:\s*(.*?)\s*$")
+DBM_RE = re.compile(r"(-inf|[-+]?\d+(?:\.\d+)?)\s*dBm", re.I)
+NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+LANE_RE = re.compile(r"\(\s*(?:channel|chan|lane)\s*(\d+)\s*\)", re.I)
+INFO_KEYS = ("identifier", "vendor name", "vendor pn", "vendor sn", "laser wavelength", "transceiver type")
+LEVELS = ("high alarm", "low alarm", "high warning", "low warning")
+
+
+def port_pci():
+    """hu0..huN → adres PCI, w kolejności INST_NIC_PCI (tak nazywa porty startup.conf)."""
+    try:
+        with open(ENVF) as f:
+            m = re.search(r'^INST_NIC_PCI="([^"]*)"', f.read(), re.M)
+    except OSError:
+        return {}
+    return {"hu%d" % i: p for i, p in enumerate(m.group(1).split())} if m else {}
+
+
+def pci_netdev(pci):
+    """mlx5 działa pod VPP w trybie bifurcated: netdev portu zostaje w Linuksie (główna przestrzeń)."""
+    try:
+        return sorted(os.listdir(os.path.join(SYSPCI, pci, "net")))[0]
+    except (OSError, IndexError):
+        return None
+
+
+def _dbm(v):
+    m = DBM_RE.search(v)
+    return None if not m else float("-inf") if m.group(1).lower() == "-inf" else float(m.group(1))
+
+
+def _num(v):
+    m = NUM_RE.search(v)
+    return float(m.group()) if m else None
+
+
+def _kind(kl):
+    """Wielkość, której dotyczy klucz ethtool (SFF-8472 SFP i SFF-8636 QSFP mają różne nazwy)."""
+    if "bias" in kl:
+        return "bias"
+    if "rx power" in kl or "rcvr" in kl or "receiver" in kl:
+        return "rx"
+    if "tx power" in kl or "output power" in kl or "transmit" in kl:
+        return "tx"
+    if "temperature" in kl:
+        return "temp"
+    if "voltage" in kl:
+        return "volt"
+    return None
+
+
+def parse_ethtool_m(text):
+    """Wynik `ethtool -m`: moduł, temperatura, napięcie, tory (tx/rx dBm, bias mA), progi i aktywne flagi."""
+    d = {"info": {}, "temp": None, "volt": None, "lanes": {}, "thr": {}, "flags": []}
+    for line in text.splitlines():
+        m = KV_RE.match(line)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2)
+        kl = k.lower()
+        if kl in INFO_KEYS:
+            d["info"][kl] = v
+            continue
+        if v in ("On", "Off"):                                   # flagi alarmów modułu
+            if v == "On":
+                d["flags"].append(" ".join(k.split()))
+            continue
+        kind = _kind(kl)
+        if not kind:
+            continue
+        val = _dbm(v) if kind in ("rx", "tx") else _num(v)
+        if val is None:
+            continue
+        if "threshold" in kl:
+            lvl = next((x for x in LEVELS if x in kl), None)
+            if lvl:
+                d["thr"].setdefault(kind, {})[lvl] = val
+        elif kind == "temp":
+            d["temp"] = val
+        elif kind == "volt":
+            d["volt"] = val
+        else:
+            lm = LANE_RE.search(k)
+            d["lanes"].setdefault(int(lm.group(1)) if lm else 1, {})[kind] = val
+    return d
+
+
+def ddm_state(val, thr):
+    """ALARM / WARN / OK względem progów zapisanych w module; '' gdy brak wartości lub progów."""
+    if val is None or not thr:
+        return ""
+    if val <= thr.get("low alarm", float("-inf")) or val >= thr.get("high alarm", float("inf")):
+        return "ALARM"
+    if val <= thr.get("low warning", float("-inf")) or val >= thr.get("high warning", float("inf")):
+        return "WARN"
+    return "OK"
+
+
+HW_LINK_RE = re.compile(r"^(\S+)\s+\d+\s+(up|down)\b")
+
+
+def read_links():
+    """Stan portów z VPP: admin (show interface) i fizyczny link + prędkość (show hardware-interfaces)."""
+    links = {}
+    try:
+        admin = {n: i["up"] for n, i in read_vpp().ifaces.items()}
+        cur = None
+        for line in cli("show hardware-interfaces").splitlines():
+            m = HW_LINK_RE.match(line)
+            if m:
+                cur = m.group(1)
+                links[cur] = {"admin": "up" if admin.get(cur) else "down", "link": m.group(2), "speed": None}
+                continue
+            sp = re.match(r"^\s+Link speed:\s*(.+?)\s*$", line)
+            if cur and sp and sp.group(1).lower() != "unknown":
+                links[cur]["speed"] = sp.group(1).replace(" ", "")
+    except VppError:
+        pass
+    return links
+
+
+def read_optics():
+    res = []
+    links = read_links()
+    for port, pci in sorted(port_pci().items(), key=lambda x: int(x[0][2:])):
+        dev = pci_netdev(pci)
+        r = {"port": port, "pci": pci, "netdev": dev, "error": None}
+        r.update(links.get(port, {"admin": "?", "link": "?", "speed": None}))   # ? = VPP nie odpowiada
+        if not dev:
+            r["error"] = "brak netdeva dla %s" % pci
+        else:
+            try:
+                p = subprocess.run([ETHTOOL, "-m", dev], capture_output=True, text=True, timeout=10)
+                out = p.stdout if p.returncode == 0 else ""
+                err = (p.stderr or p.stdout).strip().splitlines()
+            except (OSError, subprocess.TimeoutExpired) as e:
+                out, err = "", [str(e)]
+            if not out:
+                e = err[-1] if err else ""
+                r["error"] = ("brak wkładki w gnieździe" if "input/output" in e.lower() else
+                              "moduł bez DDM (np. DAC)" if "not supported" in e.lower() else
+                              "brak danych z modułu: %s" % (e or "?"))
+            else:
+                r.update(parse_ethtool_m(out))
+                if not r["lanes"] and r["temp"] is None:
+                    r["error"] = "moduł bez DDM (np. kabel DAC)"
+        if not r["error"]:
+            states = [ddm_state(r["temp"], r["thr"].get("temp")), ddm_state(r["volt"], r["thr"].get("volt"))]
+            for ln in r["lanes"].values():
+                for kind in ("tx", "rx", "bias"):
+                    ln[kind + "_state"] = ddm_state(ln.get(kind), r["thr"].get(kind))
+                    states.append(ln[kind + "_state"])
+            r["state"] = "ALARM" if "ALARM" in states or r["flags"] else "WARN" if "WARN" in states else "OK"
+        if r["admin"] == "up" and r["link"] == "down":
+            r["state"] = "ALARM"                                  # port włączony, a link się nie zestawił
+        res.append(r)
+    return res
+
+
+def _f(v, fmt):
+    return "-" if v is None else "-inf" if v == float("-inf") else fmt % v
+
+
+def _st(text, state):
+    return color(text, {"ALARM": "31;1", "WARN": "33"}.get(state, "0")) if state in ("ALARM", "WARN") else text
+
+
+def watch(fn, args):
+    """Tryb -w: odświeżanie co args.interval s; ekran składany w całości przed wyczyszczeniem (bez migania)."""
+    if not args.watch:
+        return fn(args)
+    try:
+        while True:
+            out = []
+            real = sys.stdout
+            sys.stdout = type("Buf", (), {"write": lambda self, x: out.append(x), "flush": lambda self: None,
+                                           "isatty": lambda self: real.isatty()})()
+            try:
+                fn(args)
+            finally:
+                sys.stdout = real
+            sys.stdout.write("\033[H\033[2J" if TTY else "\n")
+            sys.stdout.write(color("%s  odświeżanie co %d s (Ctrl+C kończy)\n\n" % (now(), args.interval), "2"))
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def do_optics(args):
+    return watch(show_optics, args)
+
+
+# --------------------------------------------------------------------------- błędy portów
+ERRSTATE = ROOT + "/var/lib/router/port-errors.json"
+IF_HDR_RE = re.compile(r"^(\S+)\s+(\d+)\s+(up|down)\s+\S+\s*(.*)$")
+CNT_RE = re.compile(r"^\s*(\S(?:.*?\S)?)\s+(\d+)\s*$")
+VPP_ERR = ("drops", "rx-miss", "rx-no-buf", "rx-error", "tx-error")
+HW_ERR_RE = re.compile(r"err|discard|out_of_buffer|crc|symbol|undersize|oversize|fragment|jabber|miss|too_long|"
+                       r"len_?error|no_?buf|drop", re.I)
+
+
+def port_errors():
+    """{port: {licznik: wartość}} — liczniki błędów VPP (show interface) i karty (show hardware-interfaces)."""
+    ports = set(port_pci())
+    res = {p: {} for p in ports}
+    cur = None
+    for line in cli("show interface").splitlines():
+        m = IF_HDR_RE.match(line)
+        if m:
+            cur, rest = m.group(1), m.group(4)
+        elif cur and line[:1].isspace():
+            rest = line
+        else:
+            cur = None
+            continue
+        c = CNT_RE.match(rest)
+        if c and cur in ports and c.group(1) in VPP_ERR:
+            res[cur]["vpp " + c.group(1)] = int(c.group(2))
+    cur = None
+    for line in cli("show hardware-interfaces").splitlines():
+        m = HW_LINK_RE.match(line)
+        if m:
+            cur = m.group(1) if m.group(1) in ports else None
+            continue
+        c = CNT_RE.match(line)
+        if cur and c and "_" in c.group(1) and " " not in c.group(1) and HW_ERR_RE.search(c.group(1)):
+            res[cur][c.group(1)] = int(c.group(2))
+    return res
+
+
+def show_errors(args):
+    try:
+        cur = port_errors()
+        links = read_links()
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return 2
+    t = time.time()
+    prev = getattr(args, "_prev", None)
+    if prev is None:
+        try:
+            with open(ERRSTATE) as f:
+                prev = json.load(f)
+        except (OSError, ValueError):
+            prev = {}
+    since = t - prev.get("t", t)
+    try:
+        os.makedirs(os.path.dirname(ERRSTATE), exist_ok=True)
+        with open(ERRSTATE, "w") as f:
+            json.dump({"t": t, "ports": cur}, f)
+    except OSError:
+        pass
+    args._prev = {"t": t, "ports": cur}
+    old = prev.get("ports", {})
+    if args.json:
+        print(json.dumps({p: {k: {"total": v, "delta": v - old.get(p, {}).get(k, v)} for k, v in c.items()}
+                          for p, c in cur.items()}, indent=2))
+        return 0
+    span = ("ostatnie %d s" % since) if since >= 1 else "brak poprzedniego odczytu"
+    hdr = ("Port", "Link", "Licznik", "Razem", "Przyrost (%s)" % span)
+    rows, growing = [], False
+    for p in sorted(cur, key=lambda x: int(x[2:])):
+        lk = links.get(p, {})
+        link = "%s %s" % (lk.get("link", "?"), lk.get("speed") or "")
+        nz = sorted((k, v) for k, v in cur[p].items() if v)
+        if not nz:
+            rows.append((p, link.strip(), color("brak błędów", "32"), "", ""))
+            continue
+        for i, (k, v) in enumerate(nz):
+            d = v - old.get(p, {}).get(k, v)
+            growing |= d > 0
+            ds = color("+%d" % d, "31;1") if d > 0 else "0" if since >= 1 else "-"
+            rows.append((p if i == 0 else "", link.strip() if i == 0 else "", k, str(v), ds))
+    w = [max(len(ANSI_RE.sub("", r[c])) for r in rows + [hdr]) for c in range(len(hdr))]
+    pad = lambda s, n: s + " " * (n - len(ANSI_RE.sub("", s)))  # noqa: E731
+    print(color("  ".join(pad(h, w[c]) for c, h in enumerate(hdr)).rstrip(), "1"))
+    for r in rows:
+        print("  ".join(pad(x, w[c]) for c, x in enumerate(r)).rstrip())
+    print(color("\nRazem = od startu VPP. Czerwony przyrost = błędy rosną teraz. vpp … = liczniki VPP, "
+                "reszta = liczniki karty (CRC, symbol, discards, out_of_buffer…).", "2"))
+    return 1 if growing else 0
+
+
+def do_errors(args):
+    return watch(show_errors, args)
+
+
+def show_optics(args):
+    res = read_optics()
+    if not res:
+        print("brak portów VPP (INST_NIC_PCI w %s)" % ENVF)
+        return 2
+    if args.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False, default=lambda x: None))
+        return 1 if any(r.get("state") == "ALARM" for r in res) else 0
+    hdr = ("Port", "Netdev", "Admin", "Link", "Prędk.", "Moduł", "Temp°C", "Zasil.V", "Tor", "TX dBm", "RX dBm", "Bias mA", "Stan")
+    rows = []
+    for r in res:
+        lk = r["link"]
+        lks = "ALARM" if r["admin"] == "up" and lk == "down" else ""
+        head = (r["port"], r["netdev"] or "-", r["admin"], _st(lk, lks), r["speed"] or "-")
+        if r["error"]:
+            rows.append((head + (r["error"],), None))
+            continue
+        i = r["info"]
+        typ = re.search(r"\((.*?)\)", i.get("identifier", ""))
+        mod = " ".join(x for x in (typ.group(1) if typ else "", i.get("vendor name", ""), i.get("vendor pn", "")) if x)
+        first = True
+        for no, ln in sorted(r["lanes"].items()) or [(1, {})]:
+            lst = [ln.get(k + "_state", "") for k in ("tx", "rx", "bias")]
+            st = "ALARM" if "ALARM" in lst else "WARN" if "WARN" in lst else "OK"
+            rows.append(((head if first else ("",) * 5) + (mod if first else "",
+                          _st(_f(r["temp"], "%.1f"), ddm_state(r["temp"], r["thr"].get("temp"))) if first else "",
+                          _st(_f(r["volt"], "%.2f"), ddm_state(r["volt"], r["thr"].get("volt"))) if first else "",
+                          str(no), _st(_f(ln.get("tx"), "%.2f"), lst[0]), _st(_f(ln.get("rx"), "%.2f"), lst[1]),
+                          _st(_f(ln.get("bias"), "%.2f"), lst[2]), _st(st, st)), r))
+            first = False
+    w = [max([len(hdr[c])] + [len(ANSI_RE.sub("", x[0][c])) for x in rows if c < 5 or x[1]]) for c in range(len(hdr))]
+    pad = lambda s, n: s + " " * (n - len(ANSI_RE.sub("", s)))  # noqa: E731
+    print(color("  ".join(pad(h, w[c]) for c, h in enumerate(hdr)).rstrip(), "1"))
+    for cols, r in rows:
+        if r is None:
+            print("  ".join(pad(cols[c], w[c]) for c in range(5)) + "  " + color(cols[5], "2"))
+        else:
+            print("  ".join(pad(x, w[c]) for c, x in enumerate(cols)).rstrip())
+    for r in res:
+        if r.get("error"):
+            continue
+        thr = r["thr"]
+        lines = []
+        for kind, name, unit in (("rx", "RX", "dBm"), ("tx", "TX", "dBm")):
+            t = thr.get(kind, {})
+            if t:
+                lines.append("%s alarm %s…%s, ostrz. %s…%s %s" % (
+                    name, _f(t.get("low alarm"), "%.1f"), _f(t.get("high alarm"), "%.1f"),
+                    _f(t.get("low warning"), "%.1f"), _f(t.get("high warning"), "%.1f"), unit))
+        if lines:
+            print(color("  %s progi modułu: %s" % (r["port"], "; ".join(lines)), "2"))
+        if r["flags"]:
+            print(color("  %s flagi modułu: %s" % (r["port"], ", ".join(r["flags"])), "31"))
+    return 1 if any(r.get("state") == "ALARM" for r in res) else 0
+
+
 def do_show(args):
     desired, errs, _ = get_desired(CONF, quiet=True)
     desired = desired or {}
@@ -1460,15 +1824,19 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
     ap.add_argument("--version", action="version", version="router-ifaces — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
-    ap.add_argument("cmd", nargs="?", default="show", choices=["show", "diff", "apply", "check", "render", "boot", "snmp"])
+    ap.add_argument("cmd", nargs="?", default="show", choices=["show", "diff", "apply", "check", "render", "boot", "snmp",
+                                                          "optics", "errors"])
     ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
     ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
     ap.add_argument("--timeout", type=int, default=180, help="boot: ile sekund czekać na VPP")
+    ap.add_argument("--json", action="store_true", help="optics/errors: wynik jako JSON")
+    ap.add_argument("-w", "--watch", action="store_true", help="optics/errors: odświeżanie na żywo")
+    ap.add_argument("--interval", type=int, default=10, metavar="SEK", help="-w: co ile sekund (domyślnie 10)")
     args = ap.parse_args()
     if os.geteuid() != 0 and not ROOT:
         sys.exit("Uruchom jako root.")
     fn = {"show": do_show, "diff": do_diff, "check": do_check, "render": do_render, "snmp": do_snmp,
-          "apply": lambda a: do_apply(a), "boot": lambda a: do_apply(a, boot=True)}[args.cmd]
+          "optics": do_optics, "errors": do_errors, "apply": lambda a: do_apply(a), "boot": lambda a: do_apply(a, boot=True)}[args.cmd]
     rc = fn(args)
     signature()
     sys.exit(rc)
@@ -6837,6 +7205,11 @@ AREAS = [
            mode="write", preview=["router-ifaces", "diff"]),
          A("Sprawdź rozjazd", "czy VPP zgadza się z ostatnio zastosowaną konfiguracją", ["router-ifaces", "check"]),
          A("Pokaż jako polecenia vppctl", "pełna konfiguracja zapisana jako polecenia VPP", ["router-ifaces", "render"]),
+         A("Wkładki optyczne (DDM)", "link up/down i prędkość, moc TX/RX w dBm, prąd lasera, temperatura, progi modułów",
+           ["router-ifaces", "optics"]),
+         A("Wkładki optyczne na żywo", "to samo, odświeżane co 10 s (Ctrl+C wraca do menu)", ["router-ifaces", "optics", "-w"]),
+         A("Błędy portów na żywo", "CRC, symbol, discards, out_of_buffer, rx-miss, drops; przyrost co 10 s (Ctrl+C wraca)",
+           ["router-ifaces", "errors", "-w"]),
          A("Odśwież opisy SNMP", "przebuduj plik opisów dla SNMP bez dotykania VPP", ["router-ifaces", "snmp"], mode="write",
            confirm=True)]},
     {"key": "fw", "alias": "router-fw", "title": "Firewall tranzytu",
@@ -7160,7 +7533,8 @@ def run(argv, paged=False):
         if not pager:
             return subprocess.call([path] + argv[1:])
         p = subprocess.Popen([path] + argv[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        subprocess.call([pager, "-FRX", "-P", "q = koniec, strzałki/PgUp/PgDn = przewijanie"], stdin=p.stdout)
+        env = dict(os.environ, LESSCHARSET="utf-8")                # bez locale UTF-8 less pokazuje <C5><82> zamiast ł
+        subprocess.call([pager, "-FRX", "-P", "q = koniec, strzałki/PgUp/PgDn = przewijanie"], stdin=p.stdout, env=env)
         p.stdout.close()
         return p.wait()
     except KeyboardInterrupt:
@@ -7464,6 +7838,10 @@ do_check() {
   else warn "brak $VERSION_FILE (instalacja sprzed wersjonowania — uruchom: install-router upgrade_script)"; fi
   printf '\n%s== Kernel i pamięć ==%s\n' "$c_hdr" "$c_off"
   if grep -q isolcpus /proc/cmdline; then ok "cmdline: $(grep -o 'isolcpus=[^ ]*' /proc/cmdline)"; else warn "brak isolcpus w /proc/cmdline — zrób restart"; fi
+  if grep -q 'nohz_full=' /proc/cmdline; then ok "bez tiku zegara: $(cat /sys/devices/system/cpu/nohz_full 2>/dev/null)"
+  else warn "brak nohz_full — workery VPP dostają tik zegara (install-router set_workers, potem restart serwera)"; fi
+  if grep -q 'managed_irq' /proc/cmdline; then ok "przerwania sterowników poza rdzeniami VPP (managed_irq, irqaffinity)"
+  else warn "brak isolcpus=managed_irq — przerwania sterowników mogą trafiać na rdzenie VPP"; fi
   for n in /sys/devices/system/node/node*; do
     printf '  %s: hugepages 2M total=%s free=%s\n' "$(basename "$n")" \
       "$(cat "$n/hugepages/hugepages-2048kB/nr_hugepages")" "$(cat "$n/hugepages/hugepages-2048kB/free_hugepages")"
@@ -8089,7 +8467,7 @@ do_upgrade() {
     fi
   fi
 
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT   # ścieżka wpisana teraz: przy wyjściu zmienna lokalna już nie istnieje
   CUR_STAGE="upgrade_script $SCRIPT_VERSION"
   # 1. wygeneruj i sprawdź składnię WSZYSTKICH programów, zanim cokolwiek zostanie zapisane
   for entry in "${UPGRADE_PROGRAMS[@]}"; do
@@ -8179,11 +8557,20 @@ do_upgrade() {
   ok "gotowe — wersja na routerze: $SCRIPT_VERSION. Cofnięcie: skopiuj pliki z $bdir"
 }
 
-if [[ $MODE == upgrade ]]; then do_upgrade; exit 0; fi
+upgrade_isolation() {   # po upgrade_script: stary układ izolacji → nowy, bez restartu VPP (działa po restarcie serwera)
+  local g=/etc/default/grub.d/90-vpp.cfg
+  ((DRY_RUN)) && return 0
+  [[ -f $g && -x /opt/router/install-router.sh ]] || return 0
+  grep -q 'managed_irq' "$g" && grep -q 'nohz_full=' "$g" && return 0
+  say "izolacja rdzeni VPP w starym układzie — uzupełniam (ta sama liczba workerów, VPP bez restartu)"
+  /opt/router/install-router.sh set_workers || warn "nie udało się uzupełnić izolacji — uruchom: install-router set_workers"
+}
+
+if [[ $MODE == upgrade ]]; then do_upgrade; upgrade_isolation; exit 0; fi
 
 # --- set_workers: zmiana liczby workerów VPP (rdzenie, izolacja, startup.conf) bez ponownej instalacji
 # różnice między /etc/vpp/startup.conf a tym, co wyliczył instalator (rdzenie, bufory, sterta, porty); kod 0 = są zmiany
-vpp_conf_diff() {
+vpp_conf_diff() {   # vpp_conf_diff [vpp] — "vpp": tylko startup.conf i hugepages (bez izolacji w GRUB)
   local f=${VPP_STARTUP_CONF:-/etc/vpp/startup.conf} cw cb ch cp chp rc=1
   cw=$(grep -oE 'corelist-workers [0-9,]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
   cb=$(grep -oE 'buffers-per-numa [0-9]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
@@ -8195,6 +8582,10 @@ vpp_conf_diff() {
   [[ $cb == "$BUFFERS" ]] || { echo "  zmiana: bufory ${cb:-brak} → $BUFFERS"; rc=0; }
   [[ $ch == "$MAIN_HEAP" ]] || { echo "  zmiana: sterta ${ch:-brak} → $MAIN_HEAP"; rc=0; }
   [[ $cp == "${NIC_PCI[*]}" ]] || { echo "  zmiana: porty ${cp:-brak} → ${NIC_PCI[*]}"; rc=0; }
+  local g=${VPP_GRUB_CONF:-/etc/default/grub.d/90-vpp.cfg}
+  if [[ ${1:-} != vpp && -n ${NOHZ_CSV:-} ]] && ! { grep -q "managed_irq" "$g" && grep -q "nohz_full=$NOHZ_CSV " "$g" && grep -q "irqaffinity=$HK_CSV " "$g"; } 2>/dev/null; then
+    echo "  zmiana: izolacja rdzeni (isolcpus managed_irq, nohz_full=$NOHZ_CSV, irqaffinity=$HK_CSV)"; rc=0
+  fi
   return $rc
 }
 
@@ -8215,7 +8606,11 @@ workers_plan() {
   fi
   if d=$(vpp_conf_diff); then
     printf '%s\n' "$d"
-    printf '  Zmiana działa po restarcie serwera (nowe isolcpus w GRUB), a VPP wstanie z nową liczbą kolejek RX i buforami.\n'
+    if vpp_conf_diff vpp >/dev/null; then
+      printf '  Zmiana działa po restarcie serwera (nowe isolcpus w GRUB), a VPP wstanie z nową liczbą kolejek RX i buforami.\n'
+    else
+      printf '  Zmienia się tylko izolacja rdzeni: VPP i BGP działają dalej bez przerwy, nowy układ działa po restarcie serwera.\n'
+    fi
   else
     ok "startup.conf jest już zgodny (rdzenie, bufory, sterta, porty) — bez zmian"
   fi
@@ -8224,6 +8619,14 @@ workers_plan() {
 do_set_workers() {
   workers_plan
   vpp_conf_diff >/dev/null || return 0
+  if ! vpp_conf_diff vpp >/dev/null; then
+    # zmienia się tylko izolacja rdzeni: GRUB, sysctl, systemd — bez restartu VPP i bez przerwy w ruchu
+    FROM_STAGE=6
+    run_stage 06 "Izolacja rdzeni, taktowanie, panic (GRUB)" st_isolation
+    ok "izolacja rdzeni zapisana (VPP bez restartu): $(isol_cmdline)"
+    warn "nowa izolacja działa po RESTARCIE SERWERA — zrób go w oknie serwisowym: systemctl reboot"
+    return 0
+  fi
   FROM_STAGE=5
   run_stage 05 "Moduły mlx5, sysctl, hugepages" st_kernel
   run_stage 06 "Izolacja rdzeni, taktowanie, panic (GRUB)" st_isolation
@@ -8583,14 +8986,21 @@ MAIN_CORE=${PHYS[1]}
 WORKERS=("${PHYS[@]:2:VPP_WORKERS}")
 WORKERS_CSV=$(join_by , "${WORKERS[@]}")
 ISOL=("$MAIN_CORE" "${WORKERS[@]}")
+NOHZ=("${WORKERS[@]}")              # bez tiku zegara: tylko workery (pętla odpytywania karty); main-core śpi i budzi się
 if ((HT)); then
   for c in "$MAIN_CORE" "${WORKERS[@]}"; do
     read -ra sibs <<<"$(expand_cpulist "$(cat "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list")")"
-    for s in "${sibs[@]:1}"; do ISOL+=("$s"); done
+    for s in "${sibs[@]:1}"; do ISOL+=("$s"); [[ $c != "$MAIN_CORE" ]] && NOHZ+=("$s"); done
   done
 fi
 ISOL_CSV=$(join_by , "${ISOL[@]}")
-audit AUTO "Rdzenie" "węzeł $NUMA" "main $MAIN_CORE, workery $WORKERS_CSV, izolowane $ISOL_CSV"
+NOHZ_CSV=$(join_by , "${NOHZ[@]}")
+HK=()                               # rdzenie systemowe (housekeeping): wszystko poza VPP — kernel, przerwania, usługi
+for c in $(expand_cpulist "$(cat /sys/devices/system/cpu/online)"); do
+  [[ " ${ISOL[*]} " == *" $c "* ]] || HK+=("$c")
+done
+HK_CSV=$(join_by , "${HK[@]}")
+audit AUTO "Rdzenie" "węzeł $NUMA" "main $MAIN_CORE, workery $WORKERS_CSV (bez tiku zegara), izolowane $ISOL_CSV, system $HK_CSV"
 if ((MEM_MB >= 32768)); then MAIN_HEAP=4G; else MAIN_HEAP=2G; fi
 HEAP_MB=$(( ${MAIN_HEAP%G} * 1024 ))
 HP_AUTO=0; [[ $HUGEPAGES_2M == auto ]] && HP_AUTO=1
@@ -8815,19 +9225,47 @@ EOF
   ok "hugepages teraz: $(awk '/HugePages_Total/{print $2}' /proc/meminfo) × 2 MB (pełna pula po restarcie)"
 }
 
+isol_cmdline() {   # parametry kernela izolacji rdzeni VPP
+  echo "isolcpus=managed_irq,domain,$ISOL_CSV nohz_full=$NOHZ_CSV rcu_nocbs=$ISOL_CSV irqaffinity=$HK_CSV"
+}
+
 st_isolation() {
   put_file /etc/default/grub.d/90-vpp.cfg "parametry kernela: izolacja rdzeni VPP" <<EOF
-# install-router.sh: rdzenie VPP (main + workery) wyłączone z harmonogramu systemu
-GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=$ISOL_CSV rcu_nocbs=$ISOL_CSV ${EXTRA_CMDLINE[*]}"
+# install-router.sh: rdzenie VPP (main + workery) tylko dla VPP; kernel, przerwania i usługi na rdzeniach $HK_CSV
+#   isolcpus=managed_irq,domain  bez procesów, bez równoważenia obciążenia, bez przerwań zarządzanych przez sterowniki
+#   nohz_full (workery)          bez tiku zegara, gdy na rdzeniu działa tylko wątek VPP
+#   rcu_nocbs                    wywołania RCU kernela na rdzeniach systemowych
+#   irqaffinity                  domyślna maska przerwań = rdzenie systemowe
+GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT $(isol_cmdline) ${EXTRA_CMDLINE[*]}"
 EOF
   if command -v update-grub >/dev/null; then
     say "update-grub"
     update-grub
     man_add file /boot/grub/grub.cfg "wygenerowany ponownie przez update-grub (isolcpus=$ISOL_CSV)"
-    ok "GRUB: isolcpus=$ISOL_CSV ${EXTRA_CMDLINE[*]} (działa po restarcie)"
+    ok "GRUB: $(isol_cmdline) ${EXTRA_CMDLINE[*]} (działa po restarcie)"
   else
-    warn "Brak update-grub — dodaj ręcznie do linii kernela: isolcpus=$ISOL_CSV rcu_nocbs=$ISOL_CSV"
+    warn "Brak update-grub — dodaj ręcznie do linii kernela: $(isol_cmdline)"
   fi
+  put_file /etc/sysctl.d/85-router-isolation.conf "kernel: liczniki i watchdog tylko na rdzeniach systemowych" <<EOF
+# install-router.sh: rdzenie VPP ($ISOL_CSV) bez okresowej pracy kernela
+# statystyki pamięci co 10 s zamiast co 1 s (mniej przerw na rdzeniach bez tiku zegara)
+vm.stat_interval = 10
+# watchdog zawieszeń kernela (softlockup/hardlockup) pilnuje rdzeni systemowych
+kernel.watchdog_cpumask = $HK_CSV
+EOF
+  sysctl -q -p /etc/sysctl.d/85-router-isolation.conf || warn "część ustawień izolacji nie została przyjęta przez kernel"
+  put_file /etc/systemd/system.conf.d/90-router-cpu.conf "systemd: wszystkie usługi na rdzeniach systemowych" <<EOF
+# install-router.sh: BIRD, snmpd, Routinator, sshd, monitoring… tylko na rdzeniach systemowych ($HK_CSV);
+# rdzenie VPP ($ISOL_CSV) zostają dla VPP (vpp.service.d/05-cpu.conf)
+[Manager]
+CPUAffinity=${HK_CSV//,/ }
+EOF
+  put_file /etc/systemd/system/vpp.service.d/05-cpu.conf "VPP: dostęp do swoich rdzeni (main + workery) mimo CPUAffinity systemd" <<EOF
+# install-router.sh: VPP sam przypina main-core $MAIN_CORE i workery $WORKERS_CSV; proces startuje na rdzeniach systemowych
+[Service]
+CPUAffinity=${HK_CSV//,/ } ${ISOL_CSV//,/ }
+EOF
+  systemctl daemon-reload
   local cfg
   cfg=$(grep -v -e '^IRQBALANCE_BANNED_CPULIST=' -e '^# install-router.sh: przerwania' /etc/default/irqbalance 2>/dev/null || true)
   {
@@ -8840,8 +9278,10 @@ EOF
     echo "# install-router.sh: taktowanie CPU (stosowane przy każdym starcie przez systemd-tmpfiles)"
     [[ -e /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]] && echo "w /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor - - - - performance"
     [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]] && echo "w /sys/devices/system/cpu/intel_pstate/no_turbo - - - - 0"
+    # kolejki robocze kernela (workqueue bez przypisania) tylko na rdzeniach systemowych
+    [[ -e /sys/devices/virtual/workqueue/cpumask ]] && echo "w /sys/devices/virtual/workqueue/cpumask - - - - $(cpu_mask "${HK[@]}")"
     true
-  } | put_file /etc/tmpfiles.d/router-cpu.conf "taktowanie CPU: governor performance, turbo włączone"
+  } | put_file /etc/tmpfiles.d/router-cpu.conf "taktowanie CPU (performance, turbo), workqueue kernela na rdzeniach systemowych"
   systemd-tmpfiles --create /etc/tmpfiles.d/router-cpu.conf || warn "nie ustawiono governora (sterowanie przez BIOS?)"
   ok "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'BIOS')"
   man_add service irqbalance.service "rozdział przerwań z pominięciem rdzeni VPP"
@@ -12363,7 +12803,7 @@ Zasada działania:
 - **VPP** przekazuje cały ruch tranzytowy. Kernel Linuksa go nie widzi (dlatego iptables/nftables nie filtrują tranzytu — robią to ACL-e w VPP).
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
-- Rdzenie VPP są wyłączone z harmonogramu systemu (`isolcpus=@@ISOL@@`), a karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@).
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@).
 
 ---
 
@@ -12676,6 +13116,9 @@ router-ifaces diff       # podgląd: co się zmieni (nic nie zmienia)
 router-ifaces apply      # zastosuj: pokazuje zmiany i pyta t/N  (-y bez pytania)
 router-ifaces check      # czy VPP zgadza się z ostatnio zastosowaną konfiguracją
 router-ifaces render     # cała konfiguracja jako polecenia vppctl
+router-ifaces optics     # porty: link up/down, prędkość; wkładki: moc TX/RX (dBm), bias, temperatura (DDM)
+router-ifaces optics -w  # to samo na żywo, odświeżanie co 10 s (--interval SEK); Ctrl+C kończy
+router-ifaces errors -w  # błędy portów (CRC, discards, rx-miss, drops…) i ich przyrost co 10 s
 ```
 
 Co robi `apply`:

@@ -152,7 +152,10 @@ chk "dry-run dozwolony też dla set_workers"   'MODE != upgrade && \$MODE != wor
 chk "set_workers czyta router.env"            'MODE == check \|\| \$MODE == upgrade \|\| \$MODE == workers' 1
 chk "do_set_workers zdefiniowane i wołane"    '^do_set_workers\(\) \{' 1
 chk "dispatch trybu workers po etapie 01"     '^if \[\[ \$MODE == workers \]\]; then do_set_workers; exit \$\?; fi' 1
-chk "set_workers przelicza izolację i VPP"    'run_stage 0[69] .*st_(isolation|vpp_config)$' 4
+chk "set_workers przelicza izolację i VPP"    'run_stage 0[69] .*st_(isolation|vpp_config)$' 5
+chk "sama izolacja: bez restartu VPP"         'if ! vpp_conf_diff vpp >/dev/null; then' 1
+chk "set_workers bez N: obecna liczba"        'cur_w=\$\(sed -n .s/\^\[\[:space:\]\]\*corelist-workers' 1
+chk "upgrade_script uzupełnia izolację"       '^if \[\[ \$MODE == upgrade \]\]; then do_upgrade; upgrade_isolation; exit 0; fi' 1
 chk "set_workers nie wymaga internetu"        '^\[\[ \$MODE == workers \]\] \|\| timeout 10 getent' 1
 chk "bufory liczone funkcją calc_buffers"      '^calc_buffers\(\) \{' 1
 chk "bufory VPP z liczby workerów i portów"   'BUFFERS=\$\(calc_buffers "\$\{#NIC_PCI\[@\]\}" "\$VPP_WORKERS"' 1
@@ -248,6 +251,17 @@ EOC
   tv "zmiana rdzeni"          5,7,9,11 262144 4G "0000:82:00.0 0000:82:00.1" "rdzenie 5,7,9 → 5,7,9,11"
   tv "zmiana sterty"          5,7,9 262144 2G "0000:82:00.0 0000:82:00.1" "sterta 4G → 2G"
   tv "tylko hugepages"        5,7,9 262144 4G "0000:82:00.0 0000:82:00.1" "hugepages 8037 → 11251" 11251
+  vdg=$(mktemp); echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=3,5,7,9 rcu_nocbs=3,5,7,9 panic=10"' >"$vdg"
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == *"izolacja rdzeni"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff stara izolacja: jest '$got'"; fi
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,3,5,7,9 nohz_full=5,7,9 rcu_nocbs=3,5,7,9 irqaffinity=0-2 panic=10"' >"$vdg"
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff nowa izolacja: jest '$got'"; fi
+  cm=$(eval "$(sed -n '/^cpu_mask() {/,/^}/p' install-router.sh)"; cpu_mask 0 1 40)
+  if [[ $cm == "00000100,00000003" ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  cpu_mask: jest '$cm'"; fi
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_GRUB_CONF=/nonexistent WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff vpp (bez izolacji): jest '$got'"; fi
+  rm -f "$vdg"
   rm -f "$vdc" "$vds"
 else
   fail=$((fail+1)); echo "BŁĄD  brak funkcji vpp_conf_diff"

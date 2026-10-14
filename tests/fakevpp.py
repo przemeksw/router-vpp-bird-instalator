@@ -276,6 +276,21 @@ def vppctl(cmd):
                     g["config"][t[k]] = t[k + 1]
             else:
                 raise ValueError("unknown input `%s'" % cmd)
+        elif cmd == "show hardware-interfaces":
+            out = "              Name                Idx   Link  Hardware\n"
+            for n, i in sorted(st["if"].items(), key=lambda x: x[1]["idx"]):
+                if "." in n or n.startswith(("loop", "local")):
+                    continue
+                up = i["up"] and n not in st.get("link_down", [])
+                out += "%-33s %-5d %-5s %s\n  Link speed: %s\n" % (n, i["idx"], "up" if up else "down", n,
+                                                                  "100 Gbps" if up else "unknown")
+                out += "    rx_good_packets                     1000\n"
+                for k, v in sorted(st.get("hw_err", {}).get(n, {}).items()):
+                    out += "    %-35s %d\n" % (k, v)
+        elif t[:2] == ["fake", "hw-err"]:        # tylko testy: licznik błędów karty (fake hw-err hu0 rx_crc_errors_phy 5)
+            st.setdefault("hw_err", {}).setdefault(t[2], {})[t[3]] = int(t[4])
+        elif t[:2] == ["fake", "link-down"]:     # tylko testy: port bez fizycznego linku
+            st["link_down"] = t[2:]
         elif cmd == "show errors":
             g = st.get("guard", {"errors": {}})
             out = "   Count                    Node                  Reason               Severity\n"

@@ -182,5 +182,77 @@ echo
 echo "12. router-rpki"
 python3 tests/test_router_rpki.py || fail=$((fail + 1))
 
+echo
+echo "13. router-ifaces optics (DDM wkładek)"
+mkdir -p "$W/root/sys/bus/pci/devices/0000:82:00.0/net/ens1f0np0" "$W/root/sys/bus/pci/devices/0000:82:00.1/net/ens1f1np1"
+cat >"$W/ddm-ens1f0np0" <<'D'
+	Identifier                                : 0x11 (QSFP28)
+	Vendor name                               : FS
+	Vendor PN                                 : QSFP28-LR4-100G
+	Vendor SN                                 : F2030012345
+	Module temperature                        : 38.20 degrees C / 100.76 degrees F
+	Module voltage                            : 3.2900 V
+	Alarm/warning flags implemented           : Yes
+	Laser tx bias current (Channel 1)         : 40.000 mA
+	Laser tx bias current (Channel 2)         : 41.000 mA
+	Transmit avg optical power (Channel 1)    : 0.8913 mW / -0.50 dBm
+	Transmit avg optical power (Channel 2)    : 0.9120 mW / -0.40 dBm
+	Rcvr signal avg optical power(Channel 1)  : 0.7943 mW / -1.00 dBm
+	Rcvr signal avg optical power(Channel 2)  : 0.0000 mW / -inf dBm
+	Laser bias current high alarm   (Chan 1)  : Off
+	Laser rx power low alarm   (Chan 2)       : On
+	Laser bias current high alarm threshold   : 75.000 mA
+	Laser bias current low alarm threshold    : 10.000 mA
+	Laser output power high alarm threshold   : 3.1623 mW / 5.00 dBm
+	Laser output power low alarm threshold    : 0.1000 mW / -10.00 dBm
+	Laser output power high warning threshold : 2.5119 mW / 4.00 dBm
+	Laser output power low warning threshold  : 0.1585 mW / -8.00 dBm
+	Laser rx power high alarm threshold       : 3.1623 mW / 5.00 dBm
+	Laser rx power low alarm threshold        : 0.0398 mW / -14.00 dBm
+	Laser rx power high warning threshold     : 2.5119 mW / 4.00 dBm
+	Laser rx power low warning threshold      : 0.0794 mW / -11.00 dBm
+	Module temperature high alarm threshold   : 75.00 degrees C / 167.00 degrees F
+	Module temperature low alarm threshold    : -5.00 degrees C / 23.00 degrees F
+D
+cat >"$W/bin/fakeethtool" <<E
+#!/bin/sh
+[ -f "$W/ddm-\$2" ] && exec cat "$W/ddm-\$2"
+echo "netlink error: Operation not supported" >&2; exit 1
+E
+chmod 755 "$W/bin/fakeethtool"
+export ROUTER_IFACES_ETHTOOL=$W/bin/fakeethtool
+t "optics: tor bez światła = alarm (kod 1)" 1 $RI optics
+t "optics: moc RX toru 1"                   0 has "-1.00" $RI optics
+t "optics: typ i model modułu"              0 has "QSFP28 FS QSFP28-LR4-100G" $RI optics
+t "optics: port bez DDM opisany"            0 has "moduł bez DDM" $RI optics
+t "optics: flaga modułu"                    0 has "Laser rx power low alarm" $RI optics
+t "optics --json: progi RX"                 0 has '"low alarm": -14.0' $RI optics --json
+sed -i.bak 's#0.0000 mW / -inf dBm#0.7000 mW / -1.55 dBm#; /Chan 2)       : On/d' "$W/ddm-ens1f0np0"
+cp "$W/ddm-ens1f0np0" "$W/ddm-ens1f1np1"
+t "optics: wszystko w normie (kod 0)"       0 $RI optics
+t "optics: link i prędkość z VPP"           0 has "100Gbps" $RI optics
+vpp fake link-down hu0 >/dev/null
+t "optics: port up bez linku = alarm"       1 $RI optics
+t "optics --json: link down"                0 has '"link": "down"' $RI optics --json
+vpp fake link-down >/dev/null
+watch2() {   # optics -w: co najmniej dwa odświeżenia w ~2,5 s, Ctrl+C kończy z kodem 0
+  python3 - "$@" <<'P'
+import signal, subprocess, sys, time
+p = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE, text=True)
+time.sleep(2.5); p.send_signal(signal.SIGINT); out = p.communicate(timeout=10)[0]
+sys.exit(0 if out.count("odświeżanie co 1 s") >= 2 and "hu0" in out and p.returncode == 0 else 1)
+P
+}
+t "optics -w: odświeża i kończy po Ctrl+C"  0 watch2 python3 $PWD/build/router-ifaces optics -w --interval 1
+t "errors: brak błędów"                     0 has "brak błędów" $RI errors
+vpp fake hw-err hu0 rx_crc_errors_phy 5 >/dev/null
+t "errors: nowy licznik CRC"                0 has "rx_crc_errors_phy" $RI errors
+t "errors: liczniki dobre pominięte"        1 has "rx_good_packets" $RI errors
+vpp fake hw-err hu0 rx_crc_errors_phy 9 >/dev/null
+t "errors: rosnące błędy = kod 1"           1 $RI errors
+t "errors: przyrost +4"                     0 bash -c "vpp() { :; }; $W/bin/fakevppctl fake hw-err hu0 rx_crc_errors_phy 13 >/dev/null; $RI errors | grep -q '+4'"
+t "errors: bez przyrostu = kod 0"           0 $RI errors
+t "errors -w: odświeża i kończy po Ctrl+C"  0 watch2 python3 $PWD/build/router-ifaces errors -w --interval 1
+
 printf '\nWynik: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))
