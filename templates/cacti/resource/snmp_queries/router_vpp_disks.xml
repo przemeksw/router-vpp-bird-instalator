@@ -1,0 +1,74 @@
+<!-- Generowany: tools/build-templates.py (instalator routera). Kopiuj do <cacti>/resource/snmp_queries/ -->
+<interface>
+	<name>Router VPP - dyski SMART</name>
+	<description>Dyski (SMART)</description>
+	<oid_index>.1.3.6.1.4.1.8072.9999.9999.630.12.1.1</oid_index>
+	<index_order>rvDiskName:rvDiskIndex</index_order>
+	<index_order_type>numeric</index_order_type>
+	<index_title_format>|chosen_order_field|</index_title_format>
+	<fields>
+		<rvDiskIndex>
+			<name>Indeks</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.1</oid>
+		</rvDiskIndex>
+		<rvDiskName>
+			<name>Urzadzenie</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.2</oid>
+		</rvDiskName>
+		<rvDiskModel>
+			<name>Model i numer seryjny</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.3</oid>
+		</rvDiskModel>
+		<rvDiskHealthOk>
+			<name>1 = SMART PASSED, 0 = FAILED</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.4</oid>
+		</rvDiskHealthOk>
+		<rvDiskTemp>
+			<name>Temperatura, C</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.5</oid>
+		</rvDiskTemp>
+		<rvDiskRealloc>
+			<name>Sektory realokowane</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.6</oid>
+		</rvDiskRealloc>
+		<rvDiskPending>
+			<name>Sektory oczekujace</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.7</oid>
+		</rvDiskPending>
+		<rvDiskPowerOnHours>
+			<name>Czas pracy, godziny</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.8</oid>
+		</rvDiskPowerOnHours>
+		<rvDiskWearPct>
+			<name>Zuzycie SSD, % (0 = brak danych)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.12.1.9</oid>
+		</rvDiskWearPct>
+	</fields>
+</interface>

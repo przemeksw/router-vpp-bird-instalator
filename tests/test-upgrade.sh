@@ -12,7 +12,7 @@ mkdir -p "$W/bin" "$W/opt/router/bin" "$W/sbin" "$W/etc/router" "$W/var/log" "$W
 # --- funkcje z install-router.sh, ścieżki systemowe przekierowane do $W
 awk '/^# PROGRAMY routera/{f=1} /^if \[\[ \$MODE == upgrade \]\]/{f=0} f' install-router.sh \
   | sed -e "s#/opt/router#$W/opt/router#g" -e "s#/usr/local/sbin#$W/sbin#g" -e "s#/var/log/router#$W/var/log#g" -e "s#/etc/logrotate.d#$W/etc/logrotate.d#g" \
-      -e "s#/etc/router/INSTRUKCJA.md#$W/etc/router/INSTRUKCJA.md#g" \
+      -e "s#/etc/router/INSTRUKCJA.md#$W/etc/router/INSTRUKCJA.md#g" -e "s#/etc/systemd/#$W/etc/systemd/#g" -e "s#/etc/snmp/#$W/etc/snmp/#g" \
   >"$W/funcs.sh"
 [[ -s $W/funcs.sh ]] || { echo "nie znaleziono funkcji upgrade w install-router.sh"; exit 1; }
 
@@ -61,6 +61,11 @@ t() {   # t <opis> <oczekiwany kod> <polecenie...>
 has() { local o; o=$("${@:2}" 2>&1); grep -qF -- "$1" <<<"$o"; }
 
 echo "6. upgrade_script"
+# router sprzed router-snmp: snmpd bez pass_persist, snmpd-dataplane z własnym IF-MIB
+mkdir -p "$W/etc/snmp" "$W/etc/systemd/system"
+printf 'rocommunity x 127.0.0.1\nextend mdadm /etc/snmp/extend/mdadm\n' >"$W/etc/snmp/snmpd.conf"
+printf '[Service]\nExecStart=/usr/sbin/snmpd -LOw -u Debian-snmp -g vpp -I -smux,mteTrigger,mteTriggerConf -f -p /run/snmpd-dataplane.pid\n' \
+  >"$W/etc/systemd/system/snmpd-dataplane.service"
 t "pierwsze wgranie (pliki NOWE)"           0 up SCRIPT_VERSION=1.0.0
 t "router-monitor zainstalowany"            0 test -x "$W/opt/router/bin/router-monitor"
 t "router-check zainstalowany"              0 test -x "$W/sbin/router-check"
@@ -68,6 +73,14 @@ t "router-fw zainstalowany"                 0 test -x "$W/opt/router/bin/router-
 t "router-guard zainstalowany"              0 test -x "$W/opt/router/bin/router-guard"
 t "router (menu) zainstalowany"             0 test -x "$W/opt/router/bin/router"
 t "router-top zainstalowany"                0 test -x "$W/opt/router/bin/router-top"
+t "router-snmp zainstalowany"               0 test -x "$W/opt/router/bin/router-snmp"
+t "router-rpki zainstalowany"               0 test -x "$W/opt/router/bin/router-rpki"
+t "router-snmp.service zapisany"            0 grep -q 'router-snmp collect' "$W/etc/systemd/system/router-snmp.service"
+t "snmpd.conf: pass_persist router-snmp"    0 bash -c "[ \$(grep -c 'router-snmp pass' '$W/etc/snmp/snmpd.conf') = 2 ]"
+t "snmpd-mgmt.conf nieruszany (brak pliku)" 1 test -e "$W/etc/snmp/snmpd-mgmt.conf"
+t "snmpd-dataplane: IF-MIB tylko z VPP"     0 grep -q 'mteTriggerConf,interfaces,ifTable,ifXTable -f' "$W/etc/systemd/system/snmpd-dataplane.service"
+t "restart snmpd po zmianie konfiguracji"   0 grep -q 'try-restart snmpd-dataplane.service' "$W/systemctl.log"
+t "kolektor włączony"                       0 grep -q 'enable --now router-snmp.service' "$W/systemctl.log"
 t "instrukcja w etc/router"                 0 grep -q 'instrukcja obsługi produkcyjnej' "$W/etc/router/INSTRUKCJA.md"
 t "plik wersji: 1.0.0"                      0 grep -qx 'SCRIPT_VERSION=1.0.0' "$W/etc/router/version"
 t "kopia skryptu w opt/router"              0 test -f "$W/opt/router/install-router.sh"
@@ -112,5 +125,7 @@ t "obniżenie z --yes: wykonane"             0 up SCRIPT_VERSION=0.9.0 ASSUME_YE
 echo "# --version"
 t "--version nie wymaga roota"              0 has "wersja" bash install-router.sh --version
 
+echo "# router-snmp po kolejnych upgrade"
+t "pass_persist nie zdublowany"             0 bash -c "[ \$(grep -c 'router-snmp pass' '$W/etc/snmp/snmpd.conf') = 2 ]"
 printf '\nWynik upgrade: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))

@@ -1,0 +1,361 @@
+# Generowany: tools/build-templates.py (instalator routera) — nie edytuj ręcznie
+mib: ROUTER-VPP-MIB
+modules:
+    sensors:
+        state:
+            data:
+                -
+                    oid: 'rvVppUp'
+                    value: 'rvVppUp'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.1.{{ $index }}'
+                    descr: 'VPP'
+                    index: 'rvVppUp.{{ $index }}'
+                    group: 'VPP'
+                    state_name: rvVppUp
+                    states:
+                        - { value: 0, generic: 2, graph: 0, descr: 'nie działa' }
+                        - { value: 1, generic: 0, graph: 0, descr: 'działa' }
+                -
+                    oid: 'rvIfacesDrift'
+                    value: 'rvIfacesDrift'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.21.{{ $index }}'
+                    descr: 'Interfejsy: zgodność z ifaces.conf'
+                    index: 'rvIfacesDrift.{{ $index }}'
+                    group: 'Router'
+                    state_name: rvIfacesDrift
+                    states:
+                        - { value: 0, generic: 0, graph: 0, descr: 'zgodne' }
+                        - { value: 1, generic: 1, graph: 0, descr: 'rozjazd' }
+                -
+                    oid: 'rvFwDrift'
+                    value: 'rvFwDrift'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.8.2.{{ $index }}'
+                    descr: 'Firewall: zgodność ACL'
+                    index: 'rvFwDrift.{{ $index }}'
+                    group: 'Router'
+                    state_name: rvFwDrift
+                    states:
+                        - { value: 0, generic: 0, graph: 0, descr: 'zgodne' }
+                        - { value: 1, generic: 1, graph: 0, descr: 'rozjazd' }
+                -
+                    oid: 'rvGuardDrift'
+                    value: 'rvGuardDrift'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.9.13.{{ $index }}'
+                    descr: 'Guard: zgodność'
+                    index: 'rvGuardDrift.{{ $index }}'
+                    group: 'Router'
+                    state_name: rvGuardDrift
+                    states:
+                        - { value: 0, generic: 0, graph: 0, descr: 'zgodne' }
+                        - { value: 1, generic: 1, graph: 0, descr: 'rozjazd' }
+                -
+                    oid: 'rvGuardMode'
+                    value: 'rvGuardMode'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.9.2.{{ $index }}'
+                    descr: 'Guard: tryb'
+                    index: 'rvGuardMode.{{ $index }}'
+                    group: 'Router'
+                    state_name: rvGuardMode
+                    states:
+                        - { value: 0, generic: 3, graph: 0, descr: 'off' }
+                        - { value: 1, generic: 1, graph: 0, descr: 'monitor' }
+                        - { value: 2, generic: 0, graph: 0, descr: 'enforce' }
+                -
+                    oid: 'rvRpkiValidatorUp'
+                    value: 'rvRpkiValidatorUp'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.14.3.{{ $index }}'
+                    descr: 'RPKI: Routinator'
+                    index: 'rvRpkiValidatorUp.{{ $index }}'
+                    group: 'RPKI'
+                    state_name: rvRpkiValidatorUp
+                    states:
+                        - { value: 0, generic: 2, graph: 0, descr: 'nie działa' }
+                        - { value: 1, generic: 0, graph: 0, descr: 'działa' }
+                -
+                    oid: 'rvRpkiEnforce'
+                    value: 'rvRpkiEnforce'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.14.1.{{ $index }}'
+                    descr: 'RPKI: odrzucanie INVALID'
+                    index: 'rvRpkiEnforce.{{ $index }}'
+                    group: 'RPKI'
+                    state_name: rvRpkiEnforce
+                    states:
+                        - { value: 0, generic: 0, graph: 0, descr: 'tylko podgląd' }
+                        - { value: 1, generic: 0, graph: 0, descr: 'odrzucanie' }
+                -
+                    oid: 'rvBgpPeerTable'
+                    value: 'rvBgpPeerState'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.6.1.6.{{ $index }}'
+                    descr: 'BGP {{ $rvBgpPeerName }} {{ $rvBgpPeerNeighbor }} {{ $rvBgpPeerDescr }}'
+                    index: 'rvBgpPeerState.{{ $index }}'
+                    group: 'BGP'
+                    state_name: rvBgpPeerState
+                    states:
+                        - { value: 1, generic: 2, graph: 0, descr: 'idle' }
+                        - { value: 2, generic: 1, graph: 0, descr: 'connect' }
+                        - { value: 3, generic: 2, graph: 0, descr: 'active' }
+                        - { value: 4, generic: 1, graph: 0, descr: 'opensent' }
+                        - { value: 5, generic: 1, graph: 0, descr: 'openconfirm' }
+                        - { value: 6, generic: 0, graph: 0, descr: 'established' }
+                -
+                    oid: 'rvServiceTable'
+                    value: 'rvServiceUp'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.7.1.3.{{ $index }}'
+                    descr: 'Usługa {{ $rvServiceName }}'
+                    index: 'rvServiceUp.{{ $index }}'
+                    group: 'Usługi'
+                    state_name: rvServiceUp
+                    states:
+                        - { value: 0, generic: 2, graph: 0, descr: 'nie działa' }
+                        - { value: 1, generic: 0, graph: 0, descr: 'działa' }
+                -
+                    oid: 'rvRpkiTable'
+                    value: 'rvRpkiUp'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.10.1.3.{{ $index }}'
+                    descr: 'RPKI {{ $rvRpkiName }}'
+                    index: 'rvRpkiUp.{{ $index }}'
+                    group: 'RPKI'
+                    state_name: rvRpkiUp
+                    states:
+                        - { value: 0, generic: 2, graph: 0, descr: 'nie działa' }
+                        - { value: 1, generic: 0, graph: 0, descr: 'działa' }
+                -
+                    oid: 'rvRaidTable'
+                    value: 'rvRaidDegraded'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.11.1.3.{{ $index }}'
+                    descr: 'RAID {{ $rvRaidName }} {{ $rvRaidLevel }}'
+                    index: 'rvRaidDegraded.{{ $index }}'
+                    group: 'RAID'
+                    state_name: rvRaidDegraded
+                    states:
+                        - { value: 0, generic: 0, graph: 0, descr: 'sprawna' }
+                        - { value: 1, generic: 2, graph: 0, descr: 'zdegradowana' }
+                -
+                    oid: 'rvDiskTable'
+                    value: 'rvDiskHealthOk'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.12.1.4.{{ $index }}'
+                    descr: 'SMART {{ $rvDiskName }} {{ $rvDiskModel }}'
+                    index: 'rvDiskHealthOk.{{ $index }}'
+                    group: 'Dyski'
+                    state_name: rvDiskHealthOk
+                    states:
+                        - { value: 0, generic: 2, graph: 0, descr: 'FAILED' }
+                        - { value: 1, generic: 0, graph: 0, descr: 'PASSED' }
+        count:
+            data:
+                -
+                    oid: 'rvVppVectorMax'
+                    value: 'rvVppVectorMax'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.2.{{ $index }}'
+                    descr: 'VPP: największy wektor workera'
+                    index: 'rvVppVectorMax.{{ $index }}'
+                    group: 'VPP'
+                    warn_limit: 64
+                    high_limit: 160
+                -
+                    oid: 'rvVppPuntPps'
+                    value: 'rvVppPuntPps'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.4.{{ $index }}'
+                    descr: 'VPP: punt pps'
+                    index: 'rvVppPuntPps.{{ $index }}'
+                    group: 'VPP'
+                    high_limit: 20000
+                -
+                    oid: 'rvVppRxMissPps'
+                    value: 'rvVppRxMissPps'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.5.{{ $index }}'
+                    descr: 'VPP: rx-miss pps'
+                    index: 'rvVppRxMissPps.{{ $index }}'
+                    group: 'VPP'
+                    high_limit: 1
+                -
+                    oid: 'rvVppNicDiscardPps'
+                    value: 'rvVppNicDiscardPps'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.6.{{ $index }}'
+                    descr: 'VPP: odrzucenia sprzętowe pps'
+                    index: 'rvVppNicDiscardPps.{{ $index }}'
+                    group: 'VPP'
+                    high_limit: 1
+                -
+                    oid: 'rvServicesDown'
+                    value: 'rvServicesDown'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.1.6.{{ $index }}'
+                    descr: 'Niedziałające usługi'
+                    index: 'rvServicesDown.{{ $index }}'
+                    group: 'Router'
+                    high_limit: 0
+                -
+                    oid: 'rvAlarmsCritHour'
+                    value: 'rvAlarmsCritHour'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.1.4.{{ $index }}'
+                    descr: 'Alarmy krytyczne w ostatniej godzinie'
+                    index: 'rvAlarmsCritHour.{{ $index }}'
+                    group: 'Router'
+                    high_limit: 0
+                -
+                    oid: 'rvFwBlocks'
+                    value: 'rvFwBlocks'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.8.9.{{ $index }}'
+                    descr: 'Firewall: blokady doraźne'
+                    index: 'rvFwBlocks.{{ $index }}'
+                    group: 'Router'
+                -
+                    oid: 'rvRpkiInvalid'
+                    value: 'rvRpkiInvalid'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.14.2.{{ $index }}'
+                    descr: 'RPKI: trasy INVALID w BIRD'
+                    index: 'rvRpkiInvalid.{{ $index }}'
+                    group: 'RPKI'
+                -
+                    oid: 'rvFib4Routes'
+                    value: 'rvFib4Routes'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.16.{{ $index }}'
+                    descr: 'FIB VPP IPv4'
+                    index: 'rvFib4Routes.{{ $index }}'
+                    group: 'Trasy'
+                -
+                    oid: 'rvFib6Routes'
+                    value: 'rvFib6Routes'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.17.{{ $index }}'
+                    descr: 'FIB VPP IPv6'
+                    index: 'rvFib6Routes.{{ $index }}'
+                    group: 'Trasy'
+                -
+                    oid: 'rvBird4Routes'
+                    value: 'rvBird4Routes'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.18.{{ $index }}'
+                    descr: 'BIRD IPv4'
+                    index: 'rvBird4Routes.{{ $index }}'
+                    group: 'Trasy'
+                -
+                    oid: 'rvBird6Routes'
+                    value: 'rvBird6Routes'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.19.{{ $index }}'
+                    descr: 'BIRD IPv6'
+                    index: 'rvBird6Routes.{{ $index }}'
+                    group: 'Trasy'
+                -
+                    oid: 'rvBgpPeerTable'
+                    value: 'rvBgpPeerImported'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.6.1.9.{{ $index }}'
+                    descr: 'Prefiksy od {{ $rvBgpPeerName }} {{ $rvBgpPeerNeighbor }}'
+                    index: 'rvBgpPeerImported.{{ $index }}'
+                    group: 'BGP'
+                -
+                    oid: 'rvBgpPeerTable'
+                    value: 'rvBgpPeerExported'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.6.1.10.{{ $index }}'
+                    descr: 'Prefiksy do {{ $rvBgpPeerName }} {{ $rvBgpPeerNeighbor }}'
+                    index: 'rvBgpPeerExported.{{ $index }}'
+                    group: 'BGP'
+                -
+                    oid: 'rvRpkiTable'
+                    value: 'rvRpkiVrp4'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.10.1.4.{{ $index }}'
+                    descr: 'RPKI {{ $rvRpkiName }} VRP IPv4'
+                    index: 'rvRpkiVrp4.{{ $index }}'
+                    group: 'RPKI'
+                -
+                    oid: 'rvRpkiTable'
+                    value: 'rvRpkiVrp6'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.10.1.5.{{ $index }}'
+                    descr: 'RPKI {{ $rvRpkiName }} VRP IPv6'
+                    index: 'rvRpkiVrp6.{{ $index }}'
+                    group: 'RPKI'
+                -
+                    oid: 'rvWorkerTable'
+                    value: 'rvWorkerVector'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.3.1.3.{{ $index }}'
+                    descr: 'Wektor {{ $rvWorkerName }}'
+                    index: 'rvWorkerVector.{{ $index }}'
+                    group: 'VPP'
+                -
+                    oid: 'rvDiskTable'
+                    value: 'rvDiskPending'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.12.1.7.{{ $index }}'
+                    descr: '{{ $rvDiskName }}: sektory oczekujące'
+                    index: 'rvDiskPending.{{ $index }}'
+                    group: 'Dyski'
+                -
+                    oid: 'rvDiskTable'
+                    value: 'rvDiskRealloc'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.12.1.6.{{ $index }}'
+                    descr: '{{ $rvDiskName }}: sektory realokowane'
+                    index: 'rvDiskRealloc.{{ $index }}'
+                    group: 'Dyski'
+        percent:
+            data:
+                -
+                    oid: 'rvVppBufFreePct'
+                    value: 'rvVppBufFreePct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.11.{{ $index }}'
+                    descr: 'VPP: wolne bufory'
+                    index: 'rvVppBufFreePct.{{ $index }}'
+                    group: 'VPP'
+                    low_limit: 20
+                -
+                    oid: 'rvVppHkCpuMax'
+                    value: 'rvVppHkCpuMax'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.7.{{ $index }}'
+                    descr: 'Rdzeń systemowy: zajętość'
+                    index: 'rvVppHkCpuMax.{{ $index }}'
+                    group: 'Router'
+                    high_limit: 90
+                -
+                    oid: 'rvFibDiffPct'
+                    value: 'rvFibDiffPct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.20.{{ $index }}'
+                    descr: 'FIB VPP vs BIRD: różnica'
+                    index: 'rvFibDiffPct.{{ $index }}'
+                    group: 'Trasy'
+                    high_limit: 2
+                -
+                    oid: 'rvGuardTable4Pct'
+                    value: 'rvGuardTable4Pct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.9.11.{{ $index }}'
+                    descr: 'Guard: tablica IPv4'
+                    index: 'rvGuardTable4Pct.{{ $index }}'
+                    group: 'Router'
+                    high_limit: 90
+                -
+                    oid: 'rvGuardTable6Pct'
+                    value: 'rvGuardTable6Pct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.9.12.{{ $index }}'
+                    descr: 'Guard: tablica IPv6'
+                    index: 'rvGuardTable6Pct.{{ $index }}'
+                    group: 'Router'
+                    high_limit: 90
+                -
+                    oid: 'rvDiskTable'
+                    value: 'rvDiskWearPct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.12.1.9.{{ $index }}'
+                    descr: '{{ $rvDiskName }}: zużycie SSD'
+                    index: 'rvDiskWearPct.{{ $index }}'
+                    group: 'Dyski'
+                    high_limit: 80
+                -
+                    oid: 'rvRaidTable'
+                    value: 'rvRaidSyncPct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.11.1.5.{{ $index }}'
+                    descr: 'RAID {{ $rvRaidName }}: synchronizacja'
+                    index: 'rvRaidSyncPct.{{ $index }}'
+                    group: 'RAID'
+                    low_limit: 100
+        temperature:
+            data:
+                -
+                    oid: 'rvDiskTable'
+                    value: 'rvDiskTemp'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.12.1.5.{{ $index }}'
+                    descr: 'Dysk {{ $rvDiskName }}'
+                    index: 'rvDiskTemp.{{ $index }}'
+                    group: 'Dyski'
+                    high_limit: 60
+                -
+                    oid: 'rvTempTable'
+                    value: 'rvTempValue'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.13.1.3.{{ $index }}'
+                    descr: 'CPU {{ $rvTempName }}'
+                    index: 'rvTempValue.{{ $index }}'
+                    group: 'CPU'
+                    high_limit: 85

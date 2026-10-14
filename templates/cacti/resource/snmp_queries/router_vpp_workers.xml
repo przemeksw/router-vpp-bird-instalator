@@ -1,0 +1,32 @@
+<!-- Generowany: tools/build-templates.py (instalator routera). Kopiuj do <cacti>/resource/snmp_queries/ -->
+<interface>
+	<name>Router VPP - workery (wektor)</name>
+	<description>Obciazenie workerow VPP</description>
+	<oid_index>.1.3.6.1.4.1.8072.9999.9999.630.3.1.1</oid_index>
+	<index_order>rvWorkerName:rvWorkerIndex</index_order>
+	<index_order_type>numeric</index_order_type>
+	<index_title_format>|chosen_order_field|</index_title_format>
+	<fields>
+		<rvWorkerIndex>
+			<name>Numer workera</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.3.1.1</oid>
+		</rvWorkerIndex>
+		<rvWorkerName>
+			<name>Worker i rdzen CPU</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.3.1.2</oid>
+		</rvWorkerName>
+		<rvWorkerVector>
+			<name>Sredni rozmiar wektora (1 = luz, 256 = nasycenie)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.3.1.3</oid>
+		</rvWorkerVector>
+	</fields>
+</interface>

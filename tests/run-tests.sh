@@ -174,5 +174,13 @@ echo
 echo "10. router-top"
 python3 tests/test_router_top.py || fail=$((fail + 1))
 
+echo
+echo "11. router-snmp i szablony (templates/)"
+python3 tests/test_router_snmp.py || fail=$((fail + 1))
+
+echo
+echo "12. router-rpki"
+python3 tests/test_router_rpki.py || fail=$((fail + 1))
+
 printf '\nWynik: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))

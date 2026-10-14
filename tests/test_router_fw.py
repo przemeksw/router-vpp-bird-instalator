@@ -778,6 +778,29 @@ class TestCounters(Cli):
         self.assertIn("12 000", out)
         self.assertIn("sieć prywatna C", out)
 
+    def test_json_for_snmp_sums_raw_counters_by_action(self):
+        self.fw("apply", "-y")
+        self.fw("block", "198.51.100.7")
+        self.stats({"0": [[5, 500], [1204551, 88200000], [9000, 1100000], [32, 3000], [10, 1000], [1, 100]],
+                    "1": [[41020, 2000000], [0, 0], [7812, 500000], [0, 0], [3, 300], [0, 0]]})
+        rc, out = self.fw("json")
+        self.assertEqual(rc, 0, out)
+        d = json.loads(out)
+        self.assertEqual((d["acls"], d["blocks"], d["drift"]), (2, 1, False))
+        self.assertEqual(d["deny_pkts"], 5 + 1204551 + 9000 + 32 + 7812)
+        self.assertEqual(d["permit_pkts"], 10 + 1 + 41020 + 3)
+        self.assertEqual(d["block_pkts"], 5)
+        self.assertEqual(d["deny_bytes"], 500 + 88200000 + 1100000 + 3000 + 500000)
+        self.assertNotIn("error", d)
+
+    def test_json_before_first_apply(self):
+        rc, out = self.fw("json")
+        self.assertEqual(rc, 0, out)
+        d = json.loads(out)
+        self.assertFalse(d["applied"])
+        self.assertIn("error", d)
+        self.assertNotIn("deny_pkts", d)
+
     def test_counters_when_acl_missing_in_vpp(self):
         self.fw("apply", "-y")
         os.remove(self.root + "/vpp.json")

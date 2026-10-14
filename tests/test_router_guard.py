@@ -248,6 +248,19 @@ class TestOn(Cli):
         self.assertIn("hu9.9", out)
 
 
+class TestJson(Cli):
+    def test_json_for_snmp(self):
+        rc, out = self.guard("json")
+        self.assertEqual(rc, 0, out)
+        d = json.loads(out)
+        self.assertEqual((d["active"], d["mode"], d["prefixes"]), (False, "off", 0))
+        self.guard("on", "203.0.113.0/24")
+        d = json.loads(self.guard("json")[1])
+        self.assertEqual((d["active"], d["mode"], d["prefixes"], d["loaded"]), (True, "monitor", 1, True))
+        self.assertIn("checked", d["counters"])
+        self.assertIn("size4", d)
+
+
 class TestSignature(Base):
     def test_author_footer_only_on_a_terminal(self):
         import io

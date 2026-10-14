@@ -1,0 +1,116 @@
+<!-- Generowany: tools/build-templates.py (instalator routera). Kopiuj do <cacti>/resource/snmp_queries/ -->
+<interface>
+	<name>Router VPP - sesje BGP</name>
+	<description>Sesje BGP z BIRD (IPv4 i IPv6)</description>
+	<oid_index>.1.3.6.1.4.1.8072.9999.9999.630.6.1.1</oid_index>
+	<index_order>rvBgpPeerName:rvBgpPeerIndex</index_order>
+	<index_order_type>numeric</index_order_type>
+	<index_title_format>|chosen_order_field|</index_title_format>
+	<fields>
+		<rvBgpPeerIndex>
+			<name>Indeks</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.1</oid>
+		</rvBgpPeerIndex>
+		<rvBgpPeerName>
+			<name>Nazwa protokolu w BIRD</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.2</oid>
+		</rvBgpPeerName>
+		<rvBgpPeerDescr>
+			<name>Opis sesji (description)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.3</oid>
+		</rvBgpPeerDescr>
+		<rvBgpPeerNeighbor>
+			<name>Adres sasiada</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.4</oid>
+		</rvBgpPeerNeighbor>
+		<rvBgpPeerRemoteAs>
+			<name>AS sasiada</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.5</oid>
+		</rvBgpPeerRemoteAs>
+		<rvBgpPeerState>
+			<name>1 idle, 2 connect, 3 active, 4 opensent, 5 openconfirm, 6 established</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.6</oid>
+		</rvBgpPeerState>
+		<rvBgpPeerEnabled>
+			<name>1 = sesja wlaczona, 0 = wylaczona (disable)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.7</oid>
+		</rvBgpPeerEnabled>
+		<rvBgpPeerUptime>
+			<name>Czas od zestawienia sesji, s (0 = nie zestawiona)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.8</oid>
+		</rvBgpPeerUptime>
+		<rvBgpPeerImported>
+			<name>Prefiksy przyjete</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.9</oid>
+		</rvBgpPeerImported>
+		<rvBgpPeerExported>
+			<name>Prefiksy wyslane</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.10</oid>
+		</rvBgpPeerExported>
+		<rvBgpPeerFiltered>
+			<name>Prefiksy odrzucone przez filtr</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.11</oid>
+		</rvBgpPeerFiltered>
+		<rvBgpPeerImportLimit>
+			<name>Limit prefiksow (0 = brak)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.12</oid>
+		</rvBgpPeerImportLimit>
+		<rvBgpPeerLastError>
+			<name>Ostatni blad sesji</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.13</oid>
+		</rvBgpPeerLastError>
+		<rvBgpPeerAfi>
+			<name>Kanaly: ipv4, ipv6</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.14</oid>
+		</rvBgpPeerAfi>
+		<rvBgpPeerFlaps>
+			<name>Upadki zestawionej sesji od startu kolektora</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.6.1.15</oid>
+		</rvBgpPeerFlaps>
+	</fields>
+</interface>

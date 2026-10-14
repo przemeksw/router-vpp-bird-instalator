@@ -1,0 +1,1948 @@
+zabbix_export:
+  version: '6.0'
+  date: '2026-10-13T00:00:00Z'
+  groups:
+    -
+      uuid: '36bff6c29af64692839d077febfc7079'
+      name: 'Templates/Network devices'
+  templates:
+    -
+      uuid: '58f68b50a7ce476dab9be9d5b4080900'
+      template: 'Router VPP BIRD by SNMP'
+      name: 'Router VPP BIRD by SNMP'
+      description: 'Router VPP + BIRD (install-router.sh): BGP, zdrowie VPP, FIB, firewall, guard, RPKI, usługi, RAID, dyski. Dane: router-snmp (ROUTER-VPP-MIB .1.3.6.1.4.1.8072.9999.9999.630). Interfejsy i system: dołącz też szablon Linux by SNMP. Generowany: tools/build-templates.py.'
+      groups:
+        -
+          name: 'Templates/Network devices'
+      items:
+        -
+          uuid: '753198e9442248dc95784b9a177f1ac4'
+          name: 'Router: wiek danych SNMP'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.1.1.0'
+          key: 'rvDataAge'
+          history: '7d'
+          units: 's'
+          description: 'Wiek danych w sekundach (router-snmp collect odswieza co 30 s) (1.3.6.1.4.1.8072.9999.9999.630.1.1)'
+          tags:
+            -
+              tag: 'component'
+              value: 'system'
+        -
+          uuid: 'c4db7bc8c5a74160873dc17cd3f772a0'
+          name: 'Router: wersja programów'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.1.2.0'
+          key: 'rvVersion'
+          history: '7d'
+          trends: '0'
+          value_type: 'CHAR'
+          description: 'Wersja programow routera (install-router.sh) (1.3.6.1.4.1.8072.9999.9999.630.1.2)'
+          tags:
+            -
+              tag: 'component'
+              value: 'system'
+        -
+          uuid: 'e887a7ac5e22429ca3ed3383ea27b630'
+          name: 'Router: alarmy (1-4) w ostatniej godzinie'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.1.3.0'
+          key: 'rvAlarmsHour'
+          history: '7d'
+          description: 'Alarmy poziomu 1-4 w alarmy.log w ostatniej godzinie (1.3.6.1.4.1.8072.9999.9999.630.1.3)'
+          tags:
+            -
+              tag: 'component'
+              value: 'system'
+        -
+          uuid: 'e0963dd335954a8cb338768e3a5c3b36'
+          name: 'Router: alarmy krytyczne (1-2) w ostatniej godzinie'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.1.4.0'
+          key: 'rvAlarmsCritHour'
+          history: '7d'
+          description: 'Alarmy poziomu 1-2 (krytyczne) w ostatniej godzinie (1.3.6.1.4.1.8072.9999.9999.630.1.4)'
+          tags:
+            -
+              tag: 'component'
+              value: 'system'
+        -
+          uuid: '860582ccdd964a72a6a6eddb5927fa04'
+          name: 'Router: ostatni alarm'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.1.5.0'
+          key: 'rvLastAlarm'
+          history: '7d'
+          trends: '0'
+          value_type: 'CHAR'
+          description: 'Ostatni alarm poziomu 1-4 z alarmy.log (1.3.6.1.4.1.8072.9999.9999.630.1.5)'
+          tags:
+            -
+              tag: 'component'
+              value: 'system'
+        -
+          uuid: '98253f6543314e4aafbeca71a6109615'
+          name: 'Router: niedziałające usługi'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.1.6.0'
+          key: 'rvServicesDown'
+          history: '7d'
+          description: 'Liczba uslug routera, ktore nie dzialaja (1.3.6.1.4.1.8072.9999.9999.630.1.6)'
+          tags:
+            -
+              tag: 'component'
+              value: 'services'
+        -
+          uuid: 'c9649b35c89147c4884ef620c2189fbc'
+          name: 'VPP: działa'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.1.0'
+          key: 'rvVppUp'
+          history: '7d'
+          description: '1 = VPP odpowiada, 0 = nie (1.3.6.1.4.1.8072.9999.9999.630.2.1)'
+          valuemap:
+            name: 'Router VPP: działa'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: 'dacc48b39581458ebfe94e8614f4b443'
+          name: 'VPP: największy wektor workera'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.2.0'
+          key: 'rvVppVectorMax'
+          history: '7d'
+          description: 'Najwiekszy sredni wektor workera (1 = luz, 256 = nasycenie) (1.3.6.1.4.1.8072.9999.9999.630.2.2)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '883bec6ce18347fc8d17f7526694107e'
+          name: 'VPP: liczba workerów'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.3.0'
+          key: 'rvVppWorkers'
+          history: '7d'
+          description: 'Liczba workerow VPP (1.3.6.1.4.1.8072.9999.9999.630.2.3)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '6ce95845a449405698763cfab82ea71d'
+          name: 'VPP: ruch do control plane (punt)'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.4.0'
+          key: 'rvVppPuntPps'
+          history: '7d'
+          units: 'pps'
+          description: 'Ruch do control plane (punt), pakiety/s (1.3.6.1.4.1.8072.9999.9999.630.2.4)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '2b65a705114746c7939aab59c4ecd0da'
+          name: 'VPP: straty na wejściu (rx-miss)'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.5.0'
+          key: 'rvVppRxMissPps'
+          history: '7d'
+          units: 'pps'
+          description: 'Pakiety gubione na wejsciu (rx-miss + rx-no-buf), pakiety/s (1.3.6.1.4.1.8072.9999.9999.630.2.5)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '802753b4e94d4af5b6345b12ae0cec75'
+          name: 'VPP: odrzucenia sprzętowe karty'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.6.0'
+          key: 'rvVppNicDiscardPps'
+          history: '7d'
+          units: 'pps'
+          description: 'Pakiety odrzucane sprzetowo przez karte, pakiety/s (1.3.6.1.4.1.8072.9999.9999.630.2.6)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: 'f515a30390ea4530827520855421615a'
+          name: 'System: najbardziej zajęty rdzeń systemowy'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.7.0'
+          key: 'rvVppHkCpuMax'
+          history: '7d'
+          units: '%'
+          description: 'Najbardziej zajety rdzen systemowy (BIRD, SNMP, system), % (1.3.6.1.4.1.8072.9999.9999.630.2.7)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '99034561a2394120bf2aa6e12a3f7316'
+          name: 'VPP: bufory wolne'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.8.0'
+          key: 'rvVppBufAvail'
+          history: '7d'
+          description: 'Bufory VPP wolne (1.3.6.1.4.1.8072.9999.9999.630.2.8)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '0d75dcdfa3e54d8c88defdb7046a037c'
+          name: 'VPP: bufory zajęte'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.9.0'
+          key: 'rvVppBufUsed'
+          history: '7d'
+          description: 'Bufory VPP zajete (1.3.6.1.4.1.8072.9999.9999.630.2.9)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: 'fc74afca41544549b84dfa5ed829c97b'
+          name: 'VPP: bufory w pamięci wątków'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.10.0'
+          key: 'rvVppBufCached'
+          history: '7d'
+          description: 'Bufory VPP w pamieci podrecznej watkow (1.3.6.1.4.1.8072.9999.9999.630.2.10)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '0e1e7465d0194670b6a87b40daa0fb3b'
+          name: 'VPP: bufory wolne, %'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.11.0'
+          key: 'rvVppBufFreePct'
+          history: '7d'
+          units: '%'
+          description: 'Bufory VPP wolne + podreczne, % puli (1.3.6.1.4.1.8072.9999.9999.630.2.11)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: 'be1f83b4d34447388e80d3cfa5f678f5'
+          name: 'VPP: drops (wszystkie interfejsy) /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.12.0'
+          key: 'rvVppDrops'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Suma licznikow drops interfejsow VPP (1.3.6.1.4.1.8072.9999.9999.630.2.12)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '7eb4a044adf743c4a01bc153abaf20f0'
+          name: 'VPP: rx-miss + rx-no-buf (porty) /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.13.0'
+          key: 'rvVppRxMiss'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Suma rx-miss i rx-no-buf portow (1.3.6.1.4.1.8072.9999.9999.630.2.13)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: 'fe6a3dee0450445ea9ceff54f06b2094'
+          name: 'VPP: punt (wszystkie interfejsy) /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.14.0'
+          key: 'rvVppPunt'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Suma pakietow punt (1.3.6.1.4.1.8072.9999.9999.630.2.14)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: '8dd40c43df2943fda7eff153cbabf774'
+          name: 'VPP: liczniki błędów (show errors, poziom error) /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.15.0'
+          key: 'rvVppErrors'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Suma licznikow show errors o poziomie error (1.3.6.1.4.1.8072.9999.9999.630.2.15)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
+          uuid: 'ee38f91b366c43819ad7bb27b447945b'
+          name: 'FIB VPP: trasy IPv4'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.16.0'
+          key: 'rvFib4Routes'
+          history: '7d'
+          description: 'Trasy IPv4 w FIB VPP (VRF 0) (1.3.6.1.4.1.8072.9999.9999.630.2.16)'
+          tags:
+            -
+              tag: 'component'
+              value: 'routing'
+        -
+          uuid: '1eba25a3f85f41e4bfbfcbe28f4f9702'
+          name: 'FIB VPP: trasy IPv6'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.17.0'
+          key: 'rvFib6Routes'
+          history: '7d'
+          description: 'Trasy IPv6 w FIB VPP (VRF 0) (1.3.6.1.4.1.8072.9999.9999.630.2.17)'
+          tags:
+            -
+              tag: 'component'
+              value: 'routing'
+        -
+          uuid: '920e03345e4545e08bbac16544953b7d'
+          name: 'BIRD: sieci IPv4 (master4)'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.18.0'
+          key: 'rvBird4Routes'
+          history: '7d'
+          description: 'Sieci IPv4 w tablicy master4 BIRD (1.3.6.1.4.1.8072.9999.9999.630.2.18)'
+          tags:
+            -
+              tag: 'component'
+              value: 'routing'
+        -
+          uuid: 'ae97639462b34d7d906ccc88de9e8296'
+          name: 'BIRD: sieci IPv6 (master6)'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.19.0'
+          key: 'rvBird6Routes'
+          history: '7d'
+          description: 'Sieci IPv6 w tablicy master6 BIRD (1.3.6.1.4.1.8072.9999.9999.630.2.19)'
+          tags:
+            -
+              tag: 'component'
+              value: 'routing'
+        -
+          uuid: 'ab6bb4eca3ef434c9af38054876a8da9'
+          name: 'FIB VPP vs BIRD: różnica, %'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.20.0'
+          key: 'rvFibDiffPct'
+          history: '7d'
+          units: '%'
+          description: 'Najwieksza roznica FIB VPP wzgledem BIRD (IPv4/IPv6), % (1.3.6.1.4.1.8072.9999.9999.630.2.20)'
+          tags:
+            -
+              tag: 'component'
+              value: 'routing'
+        -
+          uuid: 'fbb7e4de3da64e02a1a7dee99d91f2c2'
+          name: 'Interfejsy: rozjazd z ifaces.conf'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.21.0'
+          key: 'rvIfacesDrift'
+          history: '7d'
+          description: '1 = interfejsy VPP roznia sie od ifaces.conf (1.3.6.1.4.1.8072.9999.9999.630.2.21)'
+          valuemap:
+            name: 'Router VPP: rozjazd'
+          tags:
+            -
+              tag: 'component'
+              value: 'system'
+        -
+          uuid: '2de0a3c95d9443f58a6988b768d6d1e8'
+          name: 'Firewall: aktywny'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.1.0'
+          key: 'rvFwEnabled'
+          history: '7d'
+          description: '1 = firewall aktywny na stale (router-fw enable) (1.3.6.1.4.1.8072.9999.9999.630.8.1)'
+          valuemap:
+            name: 'Router VPP: włączone'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: 'aa06b9b3710044d0b7cf89fa49a201cd'
+          name: 'Firewall: rozjazd ACL w VPP'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.2.0'
+          key: 'rvFwDrift'
+          history: '7d'
+          description: '1 = ACL w VPP roznia sie od ostatnio zastosowanej konfiguracji (1.3.6.1.4.1.8072.9999.9999.630.8.2)'
+          valuemap:
+            name: 'Router VPP: rozjazd'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: 'dea023cfe9b747afbdd4089de6db1a17'
+          name: 'Firewall: listy ACL w VPP'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.3.0'
+          key: 'rvFwAcls'
+          history: '7d'
+          description: 'Listy ACL routera wgrane do VPP (1.3.6.1.4.1.8072.9999.9999.630.8.3)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: 'fb65c1dc957a486c8f5669537cbd5b60'
+          name: 'Firewall: reguły'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.4.0'
+          key: 'rvFwRules'
+          history: '7d'
+          description: 'Reguly w firewall.conf (ostatnio zastosowanym) (1.3.6.1.4.1.8072.9999.9999.630.8.4)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: '031ecb0048f948d0a0d1b90ff2469f3d'
+          name: 'Firewall: odrzucone pakiety /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.5.0'
+          key: 'rvFwDenyPkts'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Pakiety odrzucone przez reguly deny (z blokadami) (1.3.6.1.4.1.8072.9999.9999.630.8.5)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: '77cb7f952c184f54904757dfe8a83d69'
+          name: 'Firewall: odrzucone bajty /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.6.0'
+          key: 'rvFwDenyBytes'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'Bps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Bajty odrzucone przez reguly deny (1.3.6.1.4.1.8072.9999.9999.630.8.6)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: '1b18a6efe1934f509f525203c6a4caee'
+          name: 'Firewall: przepuszczone pakiety (permit) /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.7.0'
+          key: 'rvFwPermitPkts'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Pakiety przepuszczone przez reguly permit (1.3.6.1.4.1.8072.9999.9999.630.8.7)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: '1a31e9437f044e7882423c71d62d8ae8'
+          name: 'Firewall: pakiety z blokad doraźnych /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.8.0'
+          key: 'rvFwBlockPkts'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Pakiety odrzucone przez blokady dorazne (1.3.6.1.4.1.8072.9999.9999.630.8.8)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: '9786ae16cd444259881b044b2cd137cd'
+          name: 'Firewall: aktywne blokady doraźne'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.8.9.0'
+          key: 'rvFwBlocks'
+          history: '7d'
+          description: 'Aktywne blokady dorazne (router-fw block) (1.3.6.1.4.1.8072.9999.9999.630.8.9)'
+          tags:
+            -
+              tag: 'component'
+              value: 'firewall'
+        -
+          uuid: '46f1019a09524b578a94a19afd67a8fa'
+          name: 'Guard: ochrona włączona'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.1.0'
+          key: 'rvGuardActive'
+          history: '7d'
+          description: '1 = ochrona wlaczona (1.3.6.1.4.1.8072.9999.9999.630.9.1)'
+          valuemap:
+            name: 'Router VPP: włączone'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '247399c3cff04f78af300a5af6aa7645'
+          name: 'Guard: tryb'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.2.0'
+          key: 'rvGuardMode'
+          history: '7d'
+          description: '0 = off, 1 = monitor, 2 = enforce (1.3.6.1.4.1.8072.9999.9999.630.9.2)'
+          valuemap:
+            name: 'Router VPP: tryb guard'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: 'b2afab1fb65f41e08883a0ec61dadbb9'
+          name: 'Guard: chronione prefiksy'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.3.0'
+          key: 'rvGuardPrefixes'
+          history: '7d'
+          description: 'Chronione prefiksy (1.3.6.1.4.1.8072.9999.9999.630.9.3)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: 'e711b112aa4b4fc3b66448e577ed6ab3'
+          name: 'Guard: sprawdzone odpowiedzi /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.4.0'
+          key: 'rvGuardChecked'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Sprawdzone odpowiedzi (1.3.6.1.4.1.8072.9999.9999.630.9.4)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '6105419980ab4d5894e66705b6fe38c3'
+          name: 'Guard: przepuszczone /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.5.0'
+          key: 'rvGuardPassed'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Przepuszczone (jest wpis w tablicy) (1.3.6.1.4.1.8072.9999.9999.630.9.5)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '2cd161a954844d648262a7189f5ac14f'
+          name: 'Guard: naruszenia /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.6.0'
+          key: 'rvGuardViolations'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Naruszenia (brak wpisu, zly ISN) (1.3.6.1.4.1.8072.9999.9999.630.9.6)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: 'ba2496b576894e838cef1dec5dd2af42'
+          name: 'Guard: odrzucone /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.7.0'
+          key: 'rvGuardDropped'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Odrzucone (enforce) (1.3.6.1.4.1.8072.9999.9999.630.9.7)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '747d87d8749943d5ba790ef09e5c0866'
+          name: 'Guard: zapisane wpisy /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.8.0'
+          key: 'rvGuardRecorded'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Zapisane wpisy (SYN, UDP) (1.3.6.1.4.1.8072.9999.9999.630.9.8)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '67a967968e454155b47186169f904243'
+          name: 'Guard: błędy zapisu do tablicy /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.9.0'
+          key: 'rvGuardInsertFailed'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Bledy zapisu do tablicy (1.3.6.1.4.1.8072.9999.9999.630.9.9)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: 'be0a93d94eae42c0a030a8920cd29265'
+          name: 'Guard: wysłane RST /s'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.10.0'
+          key: 'rvGuardRstSent'
+          history: '7d'
+          value_type: 'FLOAT'
+          units: 'pps'
+          preprocessing:
+            -
+              type: 'CHANGE_PER_SECOND'
+              parameters:
+                - ''
+          description: 'Wyslane RST (reply-rst) (1.3.6.1.4.1.8072.9999.9999.630.9.10)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: 'e55f6e493deb41a3805724c237ea11f8'
+          name: 'Guard: zapełnienie tablicy IPv4'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.11.0'
+          key: 'rvGuardTable4Pct'
+          history: '7d'
+          units: '%'
+          description: 'Zapelnienie tablicy IPv4, % (1.3.6.1.4.1.8072.9999.9999.630.9.11)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '5711593222044f21b7c8b516b8b4d256'
+          name: 'Guard: zapełnienie tablicy IPv6'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.12.0'
+          key: 'rvGuardTable6Pct'
+          history: '7d'
+          units: '%'
+          description: 'Zapelnienie tablicy IPv6, % (1.3.6.1.4.1.8072.9999.9999.630.9.12)'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: 'c10c95552683411da2a8da1cb42e33c2'
+          name: 'Guard: rozjazd VPP ze stanem'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.9.13.0'
+          key: 'rvGuardDrift'
+          history: '7d'
+          description: '1 = VPP rozni sie od stanu router-guard (1.3.6.1.4.1.8072.9999.9999.630.9.13)'
+          valuemap:
+            name: 'Router VPP: rozjazd'
+          tags:
+            -
+              tag: 'component'
+              value: 'guard'
+        -
+          uuid: '60105c63c1e74fc2ad4ffbdd17f71a1b'
+          name: 'RPKI: odrzucanie INVALID'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.14.1.0'
+          key: 'rvRpkiEnforce'
+          history: '7d'
+          description: '1 = rpki_filter() odrzuca trasy INVALID, 0 = tylko podglad (domyslnie) (1.3.6.1.4.1.8072.9999.9999.630.14.1)'
+          valuemap:
+            name: 'Router VPP: tryb RPKI'
+          tags:
+            -
+              tag: 'component'
+              value: 'rpki'
+        -
+          uuid: 'df149825d4ea4496a05352d567815cba'
+          name: 'RPKI: trasy INVALID w BIRD'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.14.2.0'
+          key: 'rvRpkiInvalid'
+          history: '7d'
+          description: 'Trasy INVALID w tablicach BIRD (pomiar co 5 min) (1.3.6.1.4.1.8072.9999.9999.630.14.2)'
+          tags:
+            -
+              tag: 'component'
+              value: 'rpki'
+        -
+          uuid: '9e79781d1daa407891365b6fd6ac3204'
+          name: 'RPKI: Routinator działa'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.14.3.0'
+          key: 'rvRpkiValidatorUp'
+          history: '7d'
+          description: '1 = Routinator dziala (1.3.6.1.4.1.8072.9999.9999.630.14.3)'
+          valuemap:
+            name: 'Router VPP: działa'
+          tags:
+            -
+              tag: 'component'
+              value: 'rpki'
+        -
+          uuid: 'fc26823c75534847a8786acf80a6ef4e'
+          name: 'RPKI: wiek kontroli router-rpki'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.14.4.0'
+          key: 'rvRpkiCheckAge'
+          history: '7d'
+          units: 's'
+          description: 'Wiek ostatniej kontroli router-rpki check, s (1.3.6.1.4.1.8072.9999.9999.630.14.4)'
+          tags:
+            -
+              tag: 'component'
+              value: 'rpki'
+      discovery_rules:
+        -
+          uuid: 'c528c17d0df84ea28d3e6cdfd9261b1b'
+          name: 'Workery VPP'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.3.1.2]'
+          key: 'rv.worker.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: '3cc5905536064cd0b6529a93f7761481'
+              name: 'Worker {#RV.NAME}: wektor'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.3.1.3.{#SNMPINDEX}'
+              key: 'rvWorkerVector[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'Sredni rozmiar wektora (1 = luz, 256 = nasycenie) (1.3.6.1.4.1.8072.9999.9999.630.3.1.3)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+          graph_prototypes:
+            -
+              uuid: '9d398dab2d1244ba9a8f6e8a6a961f19'
+              name: 'Workery VPP: wektor {#RV.NAME}'
+              graph_items:
+                -
+                  sortorder: '0'
+                  color: '1A7C11'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvWorkerVector[{#SNMPINDEX}]'
+        -
+          uuid: '235924c918a946ce9e4fa7477dc8146f'
+          name: 'Porty VPP'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.4.1.2]'
+          key: 'rv.port.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: '470f5fa616fe4b82bd396e5fdcbd6ba8'
+              name: 'Port {#RV.NAME}: rx-miss /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.3.{#SNMPINDEX}'
+              key: 'rvPortRxMiss[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'rx-miss: karta zgubila pakiety, bo VPP nie nadazal (1.3.6.1.4.1.8072.9999.9999.630.4.1.3)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+            -
+              uuid: 'e25e159c036f4cb3b9e28993612ecfe2'
+              name: 'Port {#RV.NAME}: rx-no-buf /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.4.{#SNMPINDEX}'
+              key: 'rvPortRxNoBuf[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'rx-no-buf: brak buforow VPP (1.3.6.1.4.1.8072.9999.9999.630.4.1.4)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+            -
+              uuid: 'c6e522f6fa0f4e89a6f4d19ff83764c3'
+              name: 'Port {#RV.NAME}: rx-error /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.5.{#SNMPINDEX}'
+              key: 'rvPortRxErrors[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'rx-error (1.3.6.1.4.1.8072.9999.9999.630.4.1.5)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+            -
+              uuid: '9c03550d56c141eab823e5e8cfb2adc4'
+              name: 'Port {#RV.NAME}: tx-error /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.6.{#SNMPINDEX}'
+              key: 'rvPortTxErrors[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'tx-error (1.3.6.1.4.1.8072.9999.9999.630.4.1.6)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+            -
+              uuid: 'a080c9918008476fa9d7ace21b8e7a56'
+              name: 'Port {#RV.NAME}: drops /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.7.{#SNMPINDEX}'
+              key: 'rvPortDrops[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'drops (1.3.6.1.4.1.8072.9999.9999.630.4.1.7)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+            -
+              uuid: '6669fc5625b7428fb8ff258f98b665e7'
+              name: 'Port {#RV.NAME}: punt /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.8.{#SNMPINDEX}'
+              key: 'rvPortPunt[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'punt (ruch do control plane) (1.3.6.1.4.1.8072.9999.9999.630.4.1.8)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+            -
+              uuid: 'c88ea09cdc1e424fb74f074903cec4fb'
+              name: 'Port {#RV.NAME}: odrzucenia sprzętowe /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.4.1.9.{#SNMPINDEX}'
+              key: 'rvPortHwDiscards[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'Odrzucenia sprzetowe karty (xstats discard, out_of_buffer) (1.3.6.1.4.1.8072.9999.9999.630.4.1.9)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+          trigger_prototypes:
+            -
+              uuid: 'a6db438557964cd08aa1181c23bed437'
+              expression: 'min(/Router VPP BIRD by SNMP/rvPortRxMiss[{#SNMPINDEX}],5m)>{$RV.RXMISS.MAX}'
+              name: 'Port {#RV.NAME}: karta gubi pakiety (rx-miss)'
+              priority: 'HIGH'
+          graph_prototypes:
+            -
+              uuid: '3cbce3e9013744639c250d4973176d44'
+              name: 'Port {#RV.NAME}: straty i błędy'
+              graph_items:
+                -
+                  sortorder: '0'
+                  color: '1A7C11'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvPortRxMiss[{#SNMPINDEX}]'
+                -
+                  sortorder: '1'
+                  color: 'F63100'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvPortRxNoBuf[{#SNMPINDEX}]'
+                -
+                  sortorder: '2'
+                  color: '2774A4'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvPortDrops[{#SNMPINDEX}]'
+                -
+                  sortorder: '3'
+                  color: 'A54F10'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvPortHwDiscards[{#SNMPINDEX}]'
+        -
+          uuid: 'd9a5598cd1374cfb98a06bde874de623'
+          name: 'Liczniki błędów VPP'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NODE},1.3.6.1.4.1.8072.9999.9999.630.5.1.2,{#RV.REASON},1.3.6.1.4.1.8072.9999.9999.630.5.1.3,{#RV.SEV},1.3.6.1.4.1.8072.9999.9999.630.5.1.4]'
+          key: 'rv.error.discovery'
+          delay: '10m'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: '1c6fe4bcefce463e99f8de20e9674c4a'
+              name: 'VPP {#RV.NODE}: {#RV.REASON} ({#RV.SEV}): licznik /s'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.5.1.5.{#SNMPINDEX}'
+              key: 'rvErrorCount[{#SNMPINDEX}]'
+              history: '7d'
+              value_type: 'FLOAT'
+              units: 'pps'
+              preprocessing:
+                -
+                  type: 'CHANGE_PER_SECOND'
+                  parameters:
+                    - ''
+              description: 'Licznik (1.3.6.1.4.1.8072.9999.9999.630.5.1.5)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
+        -
+          uuid: '065c2abd7cff46ccbe828693cf7ebe2f'
+          name: 'Sesje BGP'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.6.1.2,{#RV.DESCR},1.3.6.1.4.1.8072.9999.9999.630.6.1.3,{#RV.NEIGHBOR},1.3.6.1.4.1.8072.9999.9999.630.6.1.4]'
+          key: 'rv.bgp.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: '63b360fe1db2470dbf3e40994e85f5eb'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): stan'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.6.{#SNMPINDEX}'
+              key: 'rvBgpPeerState[{#SNMPINDEX}]'
+              history: '7d'
+              description: '1 idle, 2 connect, 3 active, 4 opensent, 5 openconfirm, 6 established (1.3.6.1.4.1.8072.9999.9999.630.6.1.6)'
+              valuemap:
+                name: 'Router VPP: sesja BGP'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: 'a0690a3879424dcd8260e7540b1d30f3'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): włączona'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.7.{#SNMPINDEX}'
+              key: 'rvBgpPeerEnabled[{#SNMPINDEX}]'
+              history: '7d'
+              description: '1 = sesja wlaczona, 0 = wylaczona (disable) (1.3.6.1.4.1.8072.9999.9999.630.6.1.7)'
+              valuemap:
+                name: 'Router VPP: włączone'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: '9e33d1644e144a9cb7f9f372b42f8931'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): czas zestawienia'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.8.{#SNMPINDEX}'
+              key: 'rvBgpPeerUptime[{#SNMPINDEX}]'
+              history: '7d'
+              units: 'uptime'
+              description: 'Czas od zestawienia sesji, s (0 = nie zestawiona) (1.3.6.1.4.1.8072.9999.9999.630.6.1.8)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: 'c2ae1bb6377548cdb1d596b4a1c5b495'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): prefiksy przyjęte'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.9.{#SNMPINDEX}'
+              key: 'rvBgpPeerImported[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'Prefiksy przyjete (1.3.6.1.4.1.8072.9999.9999.630.6.1.9)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: '70a9a5fa7d924546af985924dfa83ae2'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): prefiksy wysłane'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.10.{#SNMPINDEX}'
+              key: 'rvBgpPeerExported[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'Prefiksy wyslane (1.3.6.1.4.1.8072.9999.9999.630.6.1.10)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: '4a7ff9337fe24e6ba04f8532291f664c'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): prefiksy odfiltrowane'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.11.{#SNMPINDEX}'
+              key: 'rvBgpPeerFiltered[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'Prefiksy odrzucone przez filtr (1.3.6.1.4.1.8072.9999.9999.630.6.1.11)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: '053c29a176ce4ec4be2ea3eeb5c54a19'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): limit prefiksów'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.12.{#SNMPINDEX}'
+              key: 'rvBgpPeerImportLimit[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'Limit prefiksow (0 = brak) (1.3.6.1.4.1.8072.9999.9999.630.6.1.12)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: 'f1372386b6104fb78e37faadcb2b6090'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): ostatni błąd'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.13.{#SNMPINDEX}'
+              key: 'rvBgpPeerLastError[{#SNMPINDEX}]'
+              history: '7d'
+              trends: '0'
+              value_type: 'CHAR'
+              description: 'Ostatni blad sesji (1.3.6.1.4.1.8072.9999.9999.630.6.1.13)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: 'dfee354c38f84c5a80ffcd72330da670'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): upadki sesji'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.15.{#SNMPINDEX}'
+              key: 'rvBgpPeerFlaps[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'Upadki zestawionej sesji od startu kolektora (1.3.6.1.4.1.8072.9999.9999.630.6.1.15)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+            -
+              uuid: '8b6a49654c96415f926d382a27fa8f2e'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): AS sąsiada'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.6.1.5.{#SNMPINDEX}'
+              key: 'rvBgpPeerRemoteAs[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'AS sasiada (1.3.6.1.4.1.8072.9999.9999.630.6.1.5)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'bgp'
+          trigger_prototypes:
+            -
+              uuid: '6c549bab45b14accbe78841ea6cd37e8'
+              expression: 'last(/Router VPP BIRD by SNMP/rvBgpPeerState[{#SNMPINDEX}])<>6 and last(/Router VPP BIRD by SNMP/rvBgpPeerEnabled[{#SNMPINDEX}])=1'
+              name: 'BGP {#RV.NAME} {#RV.DESCR} ({#RV.NEIGHBOR}): sesja nie jest zestawiona'
+              priority: 'HIGH'
+            -
+              uuid: 'ea989348d3b44a56b656ffc23f21ad44'
+              expression: '(max(/Router VPP BIRD by SNMP/rvBgpPeerFlaps[{#SNMPINDEX}],1h)-min(/Router VPP BIRD by SNMP/rvBgpPeerFlaps[{#SNMPINDEX}],1h))>{$RV.BGP.FLAPS.MAX}'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): sesja niestabilna (flapuje)'
+              priority: 'WARNING'
+            -
+              uuid: '3ce280efb6d042d1a0bf0c0712030b8a'
+              expression: 'last(/Router VPP BIRD by SNMP/rvBgpPeerImportLimit[{#SNMPINDEX}])>0 and last(/Router VPP BIRD by SNMP/rvBgpPeerImported[{#SNMPINDEX}])*100>last(/Router VPP BIRD by SNMP/rvBgpPeerImportLimit[{#SNMPINDEX}])*{$RV.BGP.LIMIT.PCT}'
+              name: 'BGP {#RV.NAME} ({#RV.NEIGHBOR}): prefiksy blisko limitu'
+              priority: 'WARNING'
+          graph_prototypes:
+            -
+              uuid: '0ec580e9593640fabd8a7b55dccb23c8'
+              name: 'BGP {#RV.NAME}: prefiksy'
+              graph_items:
+                -
+                  sortorder: '0'
+                  color: '1A7C11'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvBgpPeerImported[{#SNMPINDEX}]'
+                -
+                  sortorder: '1'
+                  color: 'F63100'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvBgpPeerExported[{#SNMPINDEX}]'
+                -
+                  sortorder: '2'
+                  color: '2774A4'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvBgpPeerFiltered[{#SNMPINDEX}]'
+        -
+          uuid: '5df6e668fd0c40a1935cd1bfeac685d5'
+          name: 'Usługi routera'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.7.1.2]'
+          key: 'rv.service.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: 'dd9a2fd41ac84786ae2dce295449e93c'
+              name: 'Usługa {#RV.NAME}: działa'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.7.1.3.{#SNMPINDEX}'
+              key: 'rvServiceUp[{#SNMPINDEX}]'
+              history: '7d'
+              description: '1 = dziala, 0 = nie (1.3.6.1.4.1.8072.9999.9999.630.7.1.3)'
+              valuemap:
+                name: 'Router VPP: działa'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'services'
+            -
+              uuid: '0d1538608be147cd8d039dd96c4b1523'
+              name: 'Usługa {#RV.NAME}: stan systemd'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.7.1.4.{#SNMPINDEX}'
+              key: 'rvServiceState[{#SNMPINDEX}]'
+              history: '7d'
+              trends: '0'
+              value_type: 'CHAR'
+              description: 'Stan systemd (ActiveState/SubState) (1.3.6.1.4.1.8072.9999.9999.630.7.1.4)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'services'
+          trigger_prototypes:
+            -
+              uuid: '06c4bb577a4540a9a9f4cf8b4dbc1696'
+              expression: 'last(/Router VPP BIRD by SNMP/rvServiceUp[{#SNMPINDEX}])=0'
+              name: 'Usługa {#RV.NAME} nie działa'
+              priority: 'HIGH'
+        -
+          uuid: 'b42aeaa0700f4a1f8a6b22005e8ce9c4'
+          name: 'RPKI'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.10.1.2]'
+          key: 'rv.rpki.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: '92f36a56418647f6846b747879fc0e5d'
+              name: 'RPKI {#RV.NAME}: połączenie'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.10.1.3.{#SNMPINDEX}'
+              key: 'rvRpkiUp[{#SNMPINDEX}]'
+              history: '7d'
+              description: '1 = polaczenie z walidatorem zestawione (1.3.6.1.4.1.8072.9999.9999.630.10.1.3)'
+              valuemap:
+                name: 'Router VPP: działa'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'rpki'
+            -
+              uuid: 'b9e94b9294774d21b5fcb1ba2b1509f0'
+              name: 'RPKI {#RV.NAME}: VRP IPv4'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.10.1.4.{#SNMPINDEX}'
+              key: 'rvRpkiVrp4[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'VRP IPv4 (1.3.6.1.4.1.8072.9999.9999.630.10.1.4)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'rpki'
+            -
+              uuid: '2d50cec603244eeca78994075c743960'
+              name: 'RPKI {#RV.NAME}: VRP IPv6'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.10.1.5.{#SNMPINDEX}'
+              key: 'rvRpkiVrp6[{#SNMPINDEX}]'
+              history: '7d'
+              description: 'VRP IPv6 (1.3.6.1.4.1.8072.9999.9999.630.10.1.5)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'rpki'
+          trigger_prototypes:
+            -
+              uuid: '66e93afbd8ad48548f4c5a7f2d06c48e'
+              expression: 'last(/Router VPP BIRD by SNMP/rvRpkiUp[{#SNMPINDEX}])=0'
+              name: 'RPKI {#RV.NAME}: brak połączenia z walidatorem'
+              priority: 'HIGH'
+          graph_prototypes:
+            -
+              uuid: 'd827aec8bf1747abb957cd6a16d2f306'
+              name: 'RPKI {#RV.NAME}: VRP'
+              graph_items:
+                -
+                  sortorder: '0'
+                  color: '1A7C11'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvRpkiVrp4[{#SNMPINDEX}]'
+                -
+                  sortorder: '1'
+                  color: 'F63100'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvRpkiVrp6[{#SNMPINDEX}]'
+        -
+          uuid: '37beaf347a2542ca9bf877e01d5e6dc9'
+          name: 'RAID mdadm'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.11.1.2,{#RV.LEVEL},1.3.6.1.4.1.8072.9999.9999.630.11.1.6]'
+          key: 'rv.raid.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: '6c99a3c0f33b491c9cd0d33ef81d5789'
+              name: 'RAID {#RV.NAME} ({#RV.LEVEL}): zdegradowana'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.11.1.3.{#SNMPINDEX}'
+              key: 'rvRaidDegraded[{#SNMPINDEX}]'
+              history: '7d'
+              description: '1 = zdegradowana (1.3.6.1.4.1.8072.9999.9999.630.11.1.3)'
+              valuemap:
+                name: 'Router VPP: RAID'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: '39ff6936ee9348da8d0fe8af30740315'
+              name: 'RAID {#RV.NAME} ({#RV.LEVEL}): dyski'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.11.1.4.{#SNMPINDEX}'
+              key: 'rvRaidState[{#SNMPINDEX}]'
+              history: '7d'
+              trends: '0'
+              value_type: 'CHAR'
+              description: 'Stan dyskow, np. UU (1.3.6.1.4.1.8072.9999.9999.630.11.1.4)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: '4f2c6e4971a541dd903d39c6e56fc31d'
+              name: 'RAID {#RV.NAME} ({#RV.LEVEL}): synchronizacja'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.11.1.5.{#SNMPINDEX}'
+              key: 'rvRaidSyncPct[{#SNMPINDEX}]'
+              history: '7d'
+              units: '%'
+              description: 'Postep odbudowy/synchronizacji (100 = brak) (1.3.6.1.4.1.8072.9999.9999.630.11.1.5)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+          trigger_prototypes:
+            -
+              uuid: 'd0f79521c049405fa33a1298f77dd9cc'
+              expression: 'last(/Router VPP BIRD by SNMP/rvRaidDegraded[{#SNMPINDEX}])=1'
+              name: 'RAID {#RV.NAME}: macierz zdegradowana'
+              priority: 'HIGH'
+        -
+          uuid: '869d48d7477445fa914351343a1d2a17'
+          name: 'Dyski (SMART)'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.12.1.2,{#RV.MODEL},1.3.6.1.4.1.8072.9999.9999.630.12.1.3]'
+          key: 'rv.disk.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: 'a64581951a9b480581826b95b36a9580'
+              name: 'Dysk {#RV.NAME}: SMART'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.12.1.4.{#SNMPINDEX}'
+              key: 'rvDiskHealthOk[{#SNMPINDEX}]'
+              history: '7d'
+              delay: '10m'
+              description: '1 = SMART PASSED, 0 = FAILED (1.3.6.1.4.1.8072.9999.9999.630.12.1.4)'
+              valuemap:
+                name: 'Router VPP: SMART'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: '6fdc9de8cd8d4655adde23cc8fcff45d'
+              name: 'Dysk {#RV.NAME}: temperatura'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.12.1.5.{#SNMPINDEX}'
+              key: 'rvDiskTemp[{#SNMPINDEX}]'
+              history: '7d'
+              delay: '10m'
+              units: '°C'
+              description: 'Temperatura, C (1.3.6.1.4.1.8072.9999.9999.630.12.1.5)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: '8ee7b64b14b44034a44d84aaeef8c086'
+              name: 'Dysk {#RV.NAME}: sektory realokowane'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.12.1.6.{#SNMPINDEX}'
+              key: 'rvDiskRealloc[{#SNMPINDEX}]'
+              history: '7d'
+              delay: '10m'
+              description: 'Sektory realokowane (1.3.6.1.4.1.8072.9999.9999.630.12.1.6)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: 'ef12300f2f6a4d268e828d45e526580d'
+              name: 'Dysk {#RV.NAME}: sektory oczekujące'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.12.1.7.{#SNMPINDEX}'
+              key: 'rvDiskPending[{#SNMPINDEX}]'
+              history: '7d'
+              delay: '10m'
+              description: 'Sektory oczekujace (1.3.6.1.4.1.8072.9999.9999.630.12.1.7)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: '8347c5262ca44ef0a02629cf0c5d4a4e'
+              name: 'Dysk {#RV.NAME}: czas pracy'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.12.1.8.{#SNMPINDEX}'
+              key: 'rvDiskPowerOnHours[{#SNMPINDEX}]'
+              history: '7d'
+              delay: '10m'
+              units: 'h'
+              description: 'Czas pracy, godziny (1.3.6.1.4.1.8072.9999.9999.630.12.1.8)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+            -
+              uuid: 'e74425b7d8504a4dbafb89fc4c9d031d'
+              name: 'Dysk {#RV.NAME}: zużycie SSD'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.12.1.9.{#SNMPINDEX}'
+              key: 'rvDiskWearPct[{#SNMPINDEX}]'
+              history: '7d'
+              delay: '10m'
+              units: '%'
+              description: 'Zuzycie SSD, % (0 = brak danych) (1.3.6.1.4.1.8072.9999.9999.630.12.1.9)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'storage'
+          trigger_prototypes:
+            -
+              uuid: '02d055d1449d4bc48d4656cf0c478b92'
+              expression: 'last(/Router VPP BIRD by SNMP/rvDiskHealthOk[{#SNMPINDEX}])=0'
+              name: 'Dysk {#RV.NAME} ({#RV.MODEL}): SMART FAILED'
+              priority: 'HIGH'
+            -
+              uuid: '00b90a3d01f347af876fd30095d777a4'
+              expression: 'min(/Router VPP BIRD by SNMP/rvDiskTemp[{#SNMPINDEX}],15m)>{$RV.DISK.TEMP.MAX}'
+              name: 'Dysk {#RV.NAME}: wysoka temperatura'
+              priority: 'WARNING'
+            -
+              uuid: '79d0372e415948fcb06e0d32dc04393f'
+              expression: 'last(/Router VPP BIRD by SNMP/rvDiskPending[{#SNMPINDEX}])>0'
+              name: 'Dysk {#RV.NAME}: sektory oczekujące na realokację'
+              priority: 'WARNING'
+            -
+              uuid: '122be1f834124daea4aaae46970c6e77'
+              expression: 'change(/Router VPP BIRD by SNMP/rvDiskRealloc[{#SNMPINDEX}])>0'
+              name: 'Dysk {#RV.NAME}: przybyło sektorów realokowanych'
+              priority: 'WARNING'
+            -
+              uuid: 'ed3113d81dfa48959ec2a4211bc8dff8'
+              expression: 'last(/Router VPP BIRD by SNMP/rvDiskWearPct[{#SNMPINDEX}])>{$RV.DISK.WEAR.MAX}'
+              name: 'Dysk {#RV.NAME}: SSD zużyty'
+              priority: 'WARNING'
+        -
+          uuid: '13459c9b76b1482982d5c82b525905b7'
+          name: 'Temperatury procesorów'
+          type: 'SNMP_AGENT'
+          snmp_oid: 'discovery[{#RV.NAME},1.3.6.1.4.1.8072.9999.9999.630.13.1.2]'
+          key: 'rv.temp.discovery'
+          delay: '1h'
+          lifetime: '7d'
+          item_prototypes:
+            -
+              uuid: 'ca968c88968f4e7286eed9108ff0c79c'
+              name: 'CPU {#RV.NAME}: temperatura'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.13.1.3.{#SNMPINDEX}'
+              key: 'rvTempValue[{#SNMPINDEX}]'
+              history: '7d'
+              units: '°C'
+              description: 'Temperatura, C (1.3.6.1.4.1.8072.9999.9999.630.13.1.3)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'temperature'
+            -
+              uuid: '7e654bf1d1944c7daab5fc36faa7db5f'
+              name: 'CPU {#RV.NAME}: próg krytyczny'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.13.1.4.{#SNMPINDEX}'
+              key: 'rvTempCrit[{#SNMPINDEX}]'
+              history: '7d'
+              units: '°C'
+              description: 'Prog krytyczny czujnika, C (0 = brak) (1.3.6.1.4.1.8072.9999.9999.630.13.1.4)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'temperature'
+          trigger_prototypes:
+            -
+              uuid: '7e9d88ac909043c89a9bfe7655bc1519'
+              expression: 'min(/Router VPP BIRD by SNMP/rvTempValue[{#SNMPINDEX}],5m)>{$RV.CPU.TEMP.MAX}'
+              name: 'CPU {#RV.NAME}: wysoka temperatura'
+              priority: 'WARNING'
+          graph_prototypes:
+            -
+              uuid: '4ac29f6eda084e679034594627641473'
+              name: 'CPU {#RV.NAME}: temperatura'
+              graph_items:
+                -
+                  sortorder: '0'
+                  color: '1A7C11'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvTempValue[{#SNMPINDEX}]'
+      macros:
+        -
+          macro: '{$RV.DATA.AGE.MAX}'
+          value: '300'
+          description: 'Po ilu sekundach dane router-snmp uznać za nieaktualne'
+        -
+          macro: '{$RV.VECTOR.WARN}'
+          value: '64'
+          description: 'Wektor workera VPP: ostrzeżenie'
+        -
+          macro: '{$RV.VECTOR.CRIT}'
+          value: '160'
+          description: 'Wektor workera VPP: przeciążenie'
+        -
+          macro: '{$RV.RXMISS.MAX}'
+          value: '1'
+          description: 'Straty rx-miss (pakiety/s) przez 5 minut'
+        -
+          macro: '{$RV.DISCARD.MAX}'
+          value: '1'
+          description: 'Odrzucenia sprzętowe karty (pakiety/s) przez 5 minut'
+        -
+          macro: '{$RV.PUNT.MAX}'
+          value: '20000'
+          description: 'Ruch do control plane (pakiety/s) przez 5 minut'
+        -
+          macro: '{$RV.HKCPU.MAX}'
+          value: '90'
+          description: 'Zajętość rdzenia systemowego (%) przez 5 minut'
+        -
+          macro: '{$RV.BUF.FREE.MIN}'
+          value: '20'
+          description: 'Najmniej wolnych buforów VPP (%)'
+        -
+          macro: '{$RV.FIB.DIFF.MAX}'
+          value: '2'
+          description: 'Największa różnica FIB VPP i BIRD (%) przez 15 minut'
+        -
+          macro: '{$RV.GUARD.TABLE.MAX}'
+          value: '90'
+          description: 'Zapełnienie tablicy guard (%)'
+        -
+          macro: '{$RV.BGP.FLAPS.MAX}'
+          value: '3'
+          description: 'Upadki sesji BGP w ciągu godziny'
+        -
+          macro: '{$RV.BGP.LIMIT.PCT}'
+          value: '90'
+          description: 'Prefiksy przyjęte jako % limitu sesji'
+        -
+          macro: '{$RV.DISK.TEMP.MAX}'
+          value: '60'
+          description: 'Temperatura dysku (°C)'
+        -
+          macro: '{$RV.DISK.WEAR.MAX}'
+          value: '80'
+          description: 'Zużycie SSD (%)'
+        -
+          macro: '{$RV.CPU.TEMP.MAX}'
+          value: '85'
+          description: 'Temperatura procesora (°C)'
+      valuemaps:
+        -
+          uuid: 'eede4704b1614fbf80be28955de58af7'
+          name: 'Router VPP: działa'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'nie działa'
+            -
+              value: '1'
+              newvalue: 'działa'
+        -
+          uuid: 'b8fd65e02ba5424796aff78e67fbdfe9'
+          name: 'Router VPP: rozjazd'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'zgodne'
+            -
+              value: '1'
+              newvalue: 'rozjazd'
+        -
+          uuid: '4a2b696b7b394202ae173fffe25a9f3e'
+          name: 'Router VPP: włączone'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'wyłączone'
+            -
+              value: '1'
+              newvalue: 'włączone'
+        -
+          uuid: 'ca03316adaad47e1ba229dfbfe66d58e'
+          name: 'Router VPP: sesja BGP'
+          mappings:
+            -
+              value: '1'
+              newvalue: 'idle'
+            -
+              value: '2'
+              newvalue: 'connect'
+            -
+              value: '3'
+              newvalue: 'active'
+            -
+              value: '4'
+              newvalue: 'opensent'
+            -
+              value: '5'
+              newvalue: 'openconfirm'
+            -
+              value: '6'
+              newvalue: 'established'
+        -
+          uuid: '588aa36e8d244b0787eda41b367b3dda'
+          name: 'Router VPP: tryb guard'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'off'
+            -
+              value: '1'
+              newvalue: 'monitor'
+            -
+              value: '2'
+              newvalue: 'enforce'
+        -
+          uuid: '9b5422a79b504fafaba4818551ad12cd'
+          name: 'Router VPP: RAID'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'sprawna'
+            -
+              value: '1'
+              newvalue: 'zdegradowana'
+        -
+          uuid: '9840d6d55ef54459a2625c1296ef1f63'
+          name: 'Router VPP: SMART'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'FAILED'
+            -
+              value: '1'
+              newvalue: 'PASSED'
+        -
+          uuid: 'd85b2cf9aed549969beb6bd2d1f2b0d9'
+          name: 'Router VPP: tryb RPKI'
+          mappings:
+            -
+              value: '0'
+              newvalue: 'tylko podgląd'
+            -
+              value: '1'
+              newvalue: 'odrzucanie'
+  triggers:
+    -
+      uuid: '2fbf784687fd4dfb944f34c37e338f17'
+      expression: 'last(/Router VPP BIRD by SNMP/rvDataAge)>{$RV.DATA.AGE.MAX}'
+      name: 'Router: brak świeżych danych router-snmp (usługa router-snmp)'
+      priority: 'WARNING'
+    -
+      uuid: '3afcbf4f6f5541b6a169e6f16f4d7d04'
+      expression: 'last(/Router VPP BIRD by SNMP/rvVppUp)=0'
+      name: 'VPP nie odpowiada'
+      priority: 'DISASTER'
+    -
+      uuid: '1b41246a154b4defbfdb875abae793aa'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppVectorMax,5m)>={$RV.VECTOR.CRIT}'
+      name: 'VPP: worker przeciążony (wektor {ITEM.LASTVALUE1})'
+      priority: 'HIGH'
+    -
+      uuid: '605ac493368b4fbbb313b2ef33dd952a'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppVectorMax,5m)>={$RV.VECTOR.WARN} and max(/Router VPP BIRD by SNMP/rvVppVectorMax,5m)<{$RV.VECTOR.CRIT}'
+      name: 'VPP: wysokie obciążenie workera (wektor {ITEM.LASTVALUE1})'
+      priority: 'WARNING'
+    -
+      uuid: 'f1e225c5c98a4a8a8629c1d10b79741b'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppRxMissPps,5m)>{$RV.RXMISS.MAX}'
+      name: 'VPP: karta gubi pakiety na wejściu (rx-miss {ITEM.LASTVALUE1})'
+      priority: 'HIGH'
+    -
+      uuid: '4f5e8e270a9b4d0b87499fe03a636796'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppNicDiscardPps,5m)>{$RV.DISCARD.MAX}'
+      name: 'VPP: karta odrzuca pakiety sprzętowo ({ITEM.LASTVALUE1})'
+      priority: 'AVERAGE'
+    -
+      uuid: '41deffb074de4f2a8aa4e7095ce92a7f'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppPuntPps,5m)>{$RV.PUNT.MAX}'
+      name: 'VPP: duży ruch do control plane ({ITEM.LASTVALUE1})'
+      priority: 'WARNING'
+    -
+      uuid: 'ec259c74497f430ebad0a75067e830fd'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppHkCpuMax,5m)>{$RV.HKCPU.MAX}'
+      name: 'System: przeciążony rdzeń systemowy (BIRD/SNMP)'
+      priority: 'WARNING'
+    -
+      uuid: '805b67a4ef8b4837b6cdb33ee0b153f3'
+      expression: 'last(/Router VPP BIRD by SNMP/rvVppBufFreePct)<{$RV.BUF.FREE.MIN}'
+      name: 'VPP: kończą się bufory ({ITEM.LASTVALUE1} wolnych)'
+      priority: 'HIGH'
+    -
+      uuid: '8fa9fcb6b0a24777b4acd2b0a35a3b89'
+      expression: 'min(/Router VPP BIRD by SNMP/rvFibDiffPct,15m)>{$RV.FIB.DIFF.MAX}'
+      name: 'FIB VPP różni się od tablicy BIRD ({ITEM.LASTVALUE1})'
+      priority: 'AVERAGE'
+    -
+      uuid: '9e29073a2d184ea4a30df0e29e551a10'
+      expression: 'last(/Router VPP BIRD by SNMP/rvIfacesDrift)=1'
+      name: 'Interfejsy VPP różnią się od ifaces.conf (router-ifaces check)'
+      priority: 'WARNING'
+    -
+      uuid: '94244be9392b4dce8aeeb072ed2768b4'
+      expression: 'last(/Router VPP BIRD by SNMP/rvFwDrift)=1'
+      name: 'Firewall: ACL w VPP różnią się od konfiguracji (router-fw check)'
+      priority: 'HIGH'
+    -
+      uuid: '096f11df012d4e0eb798f121775c3a8a'
+      expression: 'last(/Router VPP BIRD by SNMP/rvGuardDrift)=1'
+      name: 'Guard: VPP różni się od stanu router-guard'
+      priority: 'WARNING'
+    -
+      uuid: '61108e3f88614a18938bdc665a97b8ad'
+      expression: 'last(/Router VPP BIRD by SNMP/rvGuardTable4Pct)>{$RV.GUARD.TABLE.MAX} or last(/Router VPP BIRD by SNMP/rvGuardTable6Pct)>{$RV.GUARD.TABLE.MAX}'
+      name: 'Guard: tablica prawie pełna'
+      priority: 'WARNING'
+    -
+      uuid: 'e3c1004c46cd4389be40bf1e83687c2b'
+      expression: 'last(/Router VPP BIRD by SNMP/rvRpkiValidatorUp)=0'
+      name: 'RPKI: Routinator nie działa (po 1 h bez danych BIRD przestaje odrzucać INVALID)'
+      priority: 'HIGH'
+    -
+      uuid: 'f72ce07ebf9f4150b883d97b727b07db'
+      expression: 'last(/Router VPP BIRD by SNMP/rvRpkiCheckAge)>900'
+      name: 'RPKI: kontrola router-rpki nie działa (timer router-rpki-check)'
+      priority: 'WARNING'
+    -
+      uuid: '825b7a512c3447f1900816c1828d458c'
+      expression: 'last(/Router VPP BIRD by SNMP/rvAlarmsCritHour)>0'
+      name: 'Router: alarm krytyczny w alarmy.log w ostatniej godzinie'
+      priority: 'AVERAGE'
+  graphs:
+    -
+      uuid: 'bd6e1b0bc5684962aac28589e87d3c69'
+      name: 'VPP: straty i odrzucenia'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppRxMissPps'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppNicDiscardPps'
+        -
+          sortorder: '2'
+          color: '2774A4'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppDrops'
+        -
+          sortorder: '3'
+          color: 'A54F10'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppErrors'
+    -
+      uuid: '7c1a447a22c14f3d890a0caf39c98fdc'
+      name: 'VPP: obciążenie'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppVectorMax'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppHkCpuMax'
+    -
+      uuid: 'd160717bf24a4ccab9385950c23c26ab'
+      name: 'VPP: ruch do control plane'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppPuntPps'
+    -
+      uuid: 'bf7139dde9d7474f9a5aa400f279fb56'
+      name: 'VPP: bufory'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppBufAvail'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppBufUsed'
+        -
+          sortorder: '2'
+          color: '2774A4'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppBufCached'
+    -
+      uuid: '31e17e8001cf4d05aa93ac7103c3b853'
+      name: 'Trasy: FIB VPP i BIRD (IPv4)'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvFib4Routes'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvBird4Routes'
+    -
+      uuid: 'acd1e006bfcb4447947559db25087d99'
+      name: 'Trasy: FIB VPP i BIRD (IPv6)'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvFib6Routes'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvBird6Routes'
+    -
+      uuid: '0e5662d36ebc49b792b22784e41702ad'
+      name: 'Firewall: odrzucone i przepuszczone'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvFwDenyPkts'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvFwPermitPkts'
+        -
+          sortorder: '2'
+          color: '2774A4'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvFwBlockPkts'
+    -
+      uuid: 'a195ee4b102b4a02a8a395e3219b06b6'
+      name: 'Guard: liczniki'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvGuardChecked'
+        -
+          sortorder: '1'
+          color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvGuardViolations'
+        -
+          sortorder: '2'
+          color: '2774A4'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvGuardDropped'
+    -
+      uuid: '81a5d0ff09a24c5b9bbf9d038d0326a8'
+      name: 'RPKI: trasy INVALID'
+      graph_items:
+        -
+          sortorder: '0'
+          color: '1A7C11'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvRpkiInvalid'

@@ -21,6 +21,11 @@ Instalator routera BGP (Debian 13): VPP 26.06 budowany ze źródeł (DPDK mlx5, 
 | `tests/test_router_guard.py`, `tests/test-guard-core.sh`, `tests/guard_core_test.c` | testy router-guard (symulator VPP) i rdzenia modułu C (kompilator na hoście, ASan/UBSan) |
 | `docs/synack-guard-design.md`, `docs/synack-guard-lab-checklist.md` | skrót projektu i lista kontrolna do labu |
 | `docs/router-fw-design.md`, `docs/router-fw-lab-checklist.md` | skrót projektu firewalla i lista kontrolna do labu |
+| `templates/` | **szablony monitoringu: LibreNMS, Zabbix, Cacti**, plik MIB i lista OID (instrukcja: `templates/README.md`) |
+| `tools/build-templates.py` | generuje `templates/` ze schematu OID programu `router-snmp` (`--check` = tylko kontrola) |
+| `docs/rpki.md` | RPKI: Routinator, filtry `rpki_filter()`/`rpki_invalid()`, przełącznik `router-rpki`, zachowanie przy awarii walidatora |
+| `tests/test_router_rpki.py` | testy `router-rpki`: przełącznik z wycofaniem przy błędzie, alarmy walidatora, liczba INVALID |
+| `tests/test_router_snmp.py` | testy `router-snmp`: parsery, kolektor na atrapach, pass_persist, prawdziwy snmpd (jeśli jest), aktualność szablonów |
 
 Programy `router-ifaces`, `router-monitor`, `router-notify` i pozostałe narzędzia są osadzone w `install-router.sh` (heredoc). **Edytuj je w `install-router.sh`**, a `build/` traktuj jako podgląd — jest generowany i nie trafia do gita.
 
@@ -201,6 +206,25 @@ router-ifaces           # stan interfejsów
 ```
 
 Zmiany w `/etc` są automatycznie wersjonowane na routerze przez etckeeper (`git -C /etc log -p router/ifaces.conf`).
+
+## Monitoring SNMP (`router-snmp`)
+
+Oprócz liczników portów z `vpp-snmp-agent` router oddaje przez SNMP stan sesji BGP (IPv4 i IPv6, prefiksy, upadki),
+zdrowie VPP (wektor workerów, bufory, rx-miss, odrzucenia karty, punt, `show errors`), porównanie FIB VPP z BIRD,
+firewall, guard, RPKI, usługi, RAID, SMART, temperatury CPU i alarmy z `alarmy.log`. Sesje IPv4 trafiają też do
+standardowego BGP4-MIB. Dane zbiera `router-snmp.service` co 30 s, a snmpd czyta je przez `pass_persist`
+(gałąź `.1.3.6.1.4.1.8072.9999.9999.630`). Podgląd na routerze: `router-snmp walk`.
+
+Szablony dla **LibreNMS, Zabbix i Cacti** są w katalogu [`templates/`](templates/README.md).
+
+## RPKI (Routinator, `router-rpki`, etap 27)
+
+Routinator działa w przestrzeni głównej (dane przez port zarządzający) i podaje VRP do BIRD w netns `dataplane`
+przez łącze veth (`169.254.31.1` ↔ `169.254.31.2`). **Domyślnie nic nie jest odrzucane.** BIRD tylko sprawdza
+trasy, a `router-rpki invalid` pokazuje, co by odrzucił. Gdzie RPKI działa, decydujesz w filtrach BGP
+(`rpki_filter();` w filtrze importu, np. tylko T1), a kiedy zaczyna odrzucać, poleceniem `router-rpki enable` /
+`disable` (bez zrywania sesji). Gdy walidator padnie, BIRD po najwyżej godzinie przestaje cokolwiek odrzucać.
+Pełny opis: [`docs/rpki.md`](docs/rpki.md).
 
 ## Status
 

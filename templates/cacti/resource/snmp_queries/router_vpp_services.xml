@@ -1,0 +1,39 @@
+<!-- Generowany: tools/build-templates.py (instalator routera). Kopiuj do <cacti>/resource/snmp_queries/ -->
+<interface>
+	<name>Router VPP - uslugi</name>
+	<description>Uslugi systemd routera</description>
+	<oid_index>.1.3.6.1.4.1.8072.9999.9999.630.7.1.1</oid_index>
+	<index_order>rvServiceName:rvServiceIndex</index_order>
+	<index_order_type>numeric</index_order_type>
+	<index_title_format>|chosen_order_field|</index_title_format>
+	<fields>
+		<rvServiceIndex>
+			<name>Indeks</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.7.1.1</oid>
+		</rvServiceIndex>
+		<rvServiceName>
+			<name>Jednostka systemd</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.7.1.2</oid>
+		</rvServiceName>
+		<rvServiceUp>
+			<name>1 = dziala, 0 = nie</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.7.1.3</oid>
+		</rvServiceUp>
+		<rvServiceState>
+			<name>Stan systemd (ActiveState/SubState)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.7.1.4</oid>
+		</rvServiceState>
+	</fields>
+</interface>

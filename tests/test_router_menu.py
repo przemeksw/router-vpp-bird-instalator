@@ -6,9 +6,11 @@
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -211,6 +213,44 @@ class TestFilesAndCli(Base):
         self.assertEqual(rc, 0, out)
         self.assertNotIn("Traceback", out)
         self.assertIn("nie znaleziono", out)
+
+
+@unittest.skipUnless(hasattr(os, "fork") and shutil.which("less"), "brak pty / less")
+class TestTerminal(unittest.TestCase):
+    """Na prawdziwym terminalu: każdy ekran od czystej strony, długi wynik przez less, błąd wyboru nie znika."""
+
+    def test_screens_pager_and_messages(self):
+        import pty
+        import select
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, "router-ifaces")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\nfor i in $(seq 1 80); do echo linia $i; done\n")
+        os.chmod(fake, 0o755)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ.update(ROUTER_MENU_BIN=d, TERM="xterm")
+            os.execv(sys.executable, [sys.executable, SRC])
+        out = b""
+        for keys in ["1\n", "1\n", "q", "\n", "x\n", "0\n", "q\n", ""]:
+            end = time.time() + 0.8
+            while time.time() < end:
+                r, _w, _x = select.select([fd], [], [], 0.1)
+                if r:
+                    try:
+                        out += os.read(fd, 65536)
+                    except OSError:
+                        break
+            if keys:
+                os.write(fd, keys.encode())
+        os.waitpid(pid, 0)
+        txt = out.decode("utf-8", "replace")
+        self.assertGreaterEqual(txt.count("\x1b[2J"), 4, txt[-500:])           # ekran czyszczony przed menu i czynnością
+        self.assertIn("ROUTER › Interfejsy › ", txt)                               # gdzie jestem
+        self.assertIn("q = koniec", txt)                                           # długi wynik przez less
+        self.assertIn("[koniec, kod 0]", txt)
+        self.assertIn("Nieprawidłowy wybór: x", txt)
+        self.assertNotIn("Traceback", txt)
 
 
 if __name__ == "__main__":

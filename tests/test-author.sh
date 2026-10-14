@@ -28,6 +28,10 @@ chk "router --version"                  python3 build/router --version
 chk "router help"                       python3 build/router help
 chk "router-notify --version"           python3 build/router-notify --version
 chk "router-monitor --version"          python3 build/router-monitor --version
+chk "router-snmp --help"               python3 build/router-snmp --help
+chk "router-snmp --version"            python3 build/router-snmp --version
+chk "router-rpki --help"               python3 build/router-rpki --help
+chk "router-rpki --version"            python3 build/router-rpki --version
 chk "install-uefi-mdadm.sh --help"      bash install-uefi-mdadm.sh --help
 printf '\nWynik: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))

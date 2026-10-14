@@ -1,0 +1,46 @@
+<!-- Generowany: tools/build-templates.py (instalator routera). Kopiuj do <cacti>/resource/snmp_queries/ -->
+<interface>
+	<name>Router VPP - RPKI</name>
+	<description>Polaczenia RPKI w BIRD</description>
+	<oid_index>.1.3.6.1.4.1.8072.9999.9999.630.10.1.1</oid_index>
+	<index_order>rvRpkiName:rvRpkiIndex</index_order>
+	<index_order_type>numeric</index_order_type>
+	<index_title_format>|chosen_order_field|</index_title_format>
+	<fields>
+		<rvRpkiIndex>
+			<name>Indeks</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.10.1.1</oid>
+		</rvRpkiIndex>
+		<rvRpkiName>
+			<name>Nazwa protokolu RPKI w BIRD</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.10.1.2</oid>
+		</rvRpkiName>
+		<rvRpkiUp>
+			<name>1 = polaczenie z walidatorem zestawione</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.10.1.3</oid>
+		</rvRpkiUp>
+		<rvRpkiVrp4>
+			<name>VRP IPv4</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.10.1.4</oid>
+		</rvRpkiVrp4>
+		<rvRpkiVrp6>
+			<name>VRP IPv6</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.10.1.5</oid>
+		</rvRpkiVrp6>
+	</fields>
+</interface>

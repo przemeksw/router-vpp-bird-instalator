@@ -1,0 +1,53 @@
+<!-- Generowany: tools/build-templates.py (instalator routera). Kopiuj do <cacti>/resource/snmp_queries/ -->
+<interface>
+	<name>Router VPP - RAID mdadm</name>
+	<description>Macierze mdadm</description>
+	<oid_index>.1.3.6.1.4.1.8072.9999.9999.630.11.1.1</oid_index>
+	<index_order>rvRaidName:rvRaidIndex</index_order>
+	<index_order_type>numeric</index_order_type>
+	<index_title_format>|chosen_order_field|</index_title_format>
+	<fields>
+		<rvRaidIndex>
+			<name>Indeks</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.11.1.1</oid>
+		</rvRaidIndex>
+		<rvRaidName>
+			<name>Macierz (md0)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.11.1.2</oid>
+		</rvRaidName>
+		<rvRaidDegraded>
+			<name>1 = zdegradowana</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.11.1.3</oid>
+		</rvRaidDegraded>
+		<rvRaidState>
+			<name>Stan dyskow, np. UU</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.11.1.4</oid>
+		</rvRaidState>
+		<rvRaidSyncPct>
+			<name>Postep odbudowy/synchronizacji (100 = brak)</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>output</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.11.1.5</oid>
+		</rvRaidSyncPct>
+		<rvRaidLevel>
+			<name>Poziom RAID</name>
+			<method>walk</method>
+			<source>value</source>
+			<direction>input</direction>
+			<oid>.1.3.6.1.4.1.8072.9999.9999.630.11.1.6</oid>
+		</rvRaidLevel>
+	</fields>
+</interface>

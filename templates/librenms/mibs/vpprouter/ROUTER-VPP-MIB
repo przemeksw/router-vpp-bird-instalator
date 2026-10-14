@@ -1,0 +1,1062 @@
+ROUTER-VPP-MIB DEFINITIONS ::= BEGIN
+
+-- Generowany: tools/build-templates.py (instalator routera). Agent: /opt/router/bin/router-snmp (pass_persist).
+-- Galaz netSnmpPlaypen (NET-SNMP-MIB) jest przeznaczona na lokalne rozszerzenia.
+
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Gauge32, Counter32, Counter64 FROM SNMPv2-SMI
+    DisplayString FROM SNMPv2-TC
+    netSnmpPlaypen FROM NET-SNMP-MIB;
+
+routerVppMIB MODULE-IDENTITY
+    LAST-UPDATED "202610130000Z"
+    ORGANIZATION "PHU VIPHOST"
+    CONTACT-INFO "PHU VIPHOST Przemyslaw Swiderski, biuro@viphost.it"
+    DESCRIPTION "Router VPP + BIRD (install-router.sh): BGP, zdrowie VPP, FIB, firewall, guard,
+        RPKI, uslugi, RAID, dyski, temperatury."
+    REVISION "202610130000Z"
+    DESCRIPTION "Pierwsza wersja."
+    ::= { netSnmpPlaypen 630 }
+
+rvSystem OBJECT IDENTIFIER ::= { routerVppMIB 1 }
+
+rvDataAge OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "s"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wiek danych w sekundach (router-snmp collect odswieza co 30 s)"
+    ::= { rvSystem 1 }
+
+rvVersion OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wersja programow routera (install-router.sh)"
+    ::= { rvSystem 2 }
+
+rvAlarmsHour OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Alarmy poziomu 1-4 w alarmy.log w ostatniej godzinie"
+    ::= { rvSystem 3 }
+
+rvAlarmsCritHour OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Alarmy poziomu 1-2 (krytyczne) w ostatniej godzinie"
+    ::= { rvSystem 4 }
+
+rvLastAlarm OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Ostatni alarm poziomu 1-4 z alarmy.log"
+    ::= { rvSystem 5 }
+
+rvServicesDown OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Liczba uslug routera, ktore nie dzialaja"
+    ::= { rvSystem 6 }
+
+rvVpp OBJECT IDENTIFIER ::= { routerVppMIB 2 }
+
+rvVppUp OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = VPP odpowiada, 0 = nie"
+    ::= { rvVpp 1 }
+
+rvVppVectorMax OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Najwiekszy sredni wektor workera (1 = luz, 256 = nasycenie)"
+    ::= { rvVpp 2 }
+
+rvVppWorkers OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Liczba workerow VPP"
+    ::= { rvVpp 3 }
+
+rvVppPuntPps OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "pps"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Ruch do control plane (punt), pakiety/s"
+    ::= { rvVpp 4 }
+
+rvVppRxMissPps OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "pps"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Pakiety gubione na wejsciu (rx-miss + rx-no-buf), pakiety/s"
+    ::= { rvVpp 5 }
+
+rvVppNicDiscardPps OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "pps"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Pakiety odrzucane sprzetowo przez karte, pakiety/s"
+    ::= { rvVpp 6 }
+
+rvVppHkCpuMax OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Najbardziej zajety rdzen systemowy (BIRD, SNMP, system), %"
+    ::= { rvVpp 7 }
+
+rvVppBufAvail OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Bufory VPP wolne"
+    ::= { rvVpp 8 }
+
+rvVppBufUsed OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Bufory VPP zajete"
+    ::= { rvVpp 9 }
+
+rvVppBufCached OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Bufory VPP w pamieci podrecznej watkow"
+    ::= { rvVpp 10 }
+
+rvVppBufFreePct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Bufory VPP wolne + podreczne, % puli"
+    ::= { rvVpp 11 }
+
+rvVppDrops OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Suma licznikow drops interfejsow VPP"
+    ::= { rvVpp 12 }
+
+rvVppRxMiss OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Suma rx-miss i rx-no-buf portow"
+    ::= { rvVpp 13 }
+
+rvVppPunt OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Suma pakietow punt"
+    ::= { rvVpp 14 }
+
+rvVppErrors OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Suma licznikow show errors o poziomie error"
+    ::= { rvVpp 15 }
+
+rvFib4Routes OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Trasy IPv4 w FIB VPP (VRF 0)"
+    ::= { rvVpp 16 }
+
+rvFib6Routes OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Trasy IPv6 w FIB VPP (VRF 0)"
+    ::= { rvVpp 17 }
+
+rvBird4Routes OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Sieci IPv4 w tablicy master4 BIRD"
+    ::= { rvVpp 18 }
+
+rvBird6Routes OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Sieci IPv6 w tablicy master6 BIRD"
+    ::= { rvVpp 19 }
+
+rvFibDiffPct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Najwieksza roznica FIB VPP wzgledem BIRD (IPv4/IPv6), %"
+    ::= { rvVpp 20 }
+
+rvIfacesDrift OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = interfejsy VPP roznia sie od ifaces.conf"
+    ::= { rvVpp 21 }
+
+rvFirewall OBJECT IDENTIFIER ::= { routerVppMIB 8 }
+
+rvFwEnabled OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = firewall aktywny na stale (router-fw enable)"
+    ::= { rvFirewall 1 }
+
+rvFwDrift OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = ACL w VPP roznia sie od ostatnio zastosowanej konfiguracji"
+    ::= { rvFirewall 2 }
+
+rvFwAcls OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Listy ACL routera wgrane do VPP"
+    ::= { rvFirewall 3 }
+
+rvFwRules OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Reguly w firewall.conf (ostatnio zastosowanym)"
+    ::= { rvFirewall 4 }
+
+rvFwDenyPkts OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Pakiety odrzucone przez reguly deny (z blokadami)"
+    ::= { rvFirewall 5 }
+
+rvFwDenyBytes OBJECT-TYPE
+    SYNTAX      Counter64
+    UNITS       "B"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Bajty odrzucone przez reguly deny"
+    ::= { rvFirewall 6 }
+
+rvFwPermitPkts OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Pakiety przepuszczone przez reguly permit"
+    ::= { rvFirewall 7 }
+
+rvFwBlockPkts OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Pakiety odrzucone przez blokady dorazne"
+    ::= { rvFirewall 8 }
+
+rvFwBlocks OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Aktywne blokady dorazne (router-fw block)"
+    ::= { rvFirewall 9 }
+
+rvGuard OBJECT IDENTIFIER ::= { routerVppMIB 9 }
+
+rvGuardActive OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = ochrona wlaczona"
+    ::= { rvGuard 1 }
+
+rvGuardMode OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "0 = off, 1 = monitor, 2 = enforce"
+    ::= { rvGuard 2 }
+
+rvGuardPrefixes OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Chronione prefiksy"
+    ::= { rvGuard 3 }
+
+rvGuardChecked OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Sprawdzone odpowiedzi"
+    ::= { rvGuard 4 }
+
+rvGuardPassed OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Przepuszczone (jest wpis w tablicy)"
+    ::= { rvGuard 5 }
+
+rvGuardViolations OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Naruszenia (brak wpisu, zly ISN)"
+    ::= { rvGuard 6 }
+
+rvGuardDropped OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Odrzucone (enforce)"
+    ::= { rvGuard 7 }
+
+rvGuardRecorded OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Zapisane wpisy (SYN, UDP)"
+    ::= { rvGuard 8 }
+
+rvGuardInsertFailed OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Bledy zapisu do tablicy"
+    ::= { rvGuard 9 }
+
+rvGuardRstSent OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wyslane RST (reply-rst)"
+    ::= { rvGuard 10 }
+
+rvGuardTable4Pct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Zapelnienie tablicy IPv4, %"
+    ::= { rvGuard 11 }
+
+rvGuardTable6Pct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Zapelnienie tablicy IPv6, %"
+    ::= { rvGuard 12 }
+
+rvGuardDrift OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = VPP rozni sie od stanu router-guard"
+    ::= { rvGuard 13 }
+
+rvRpkiStatus OBJECT IDENTIFIER ::= { routerVppMIB 14 }
+
+rvRpkiEnforce OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = rpki_filter() odrzuca trasy INVALID, 0 = tylko podglad (domyslnie)"
+    ::= { rvRpkiStatus 1 }
+
+rvRpkiInvalid OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Trasy INVALID w tablicach BIRD (pomiar co 5 min)"
+    ::= { rvRpkiStatus 2 }
+
+rvRpkiValidatorUp OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = Routinator dziala"
+    ::= { rvRpkiStatus 3 }
+
+rvRpkiCheckAge OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "s"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wiek ostatniej kontroli router-rpki check, s"
+    ::= { rvRpkiStatus 4 }
+
+rvWorkerTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvWorkerEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Obciazenie workerow VPP"
+    ::= { routerVppMIB 3 }
+
+rvWorkerEntry OBJECT-TYPE
+    SYNTAX      RvWorkerEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Obciazenie workerow VPP"
+    INDEX       { rvWorkerIndex }
+    ::= { rvWorkerTable 1 }
+
+RvWorkerEntry ::= SEQUENCE {
+    rvWorkerIndex                Integer32,
+    rvWorkerName                 DisplayString,
+    rvWorkerVector               Gauge32
+}
+
+rvWorkerIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Numer workera"
+    ::= { rvWorkerEntry 1 }
+
+rvWorkerName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Worker i rdzen CPU"
+    ::= { rvWorkerEntry 2 }
+
+rvWorkerVector OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Sredni rozmiar wektora (1 = luz, 256 = nasycenie)"
+    ::= { rvWorkerEntry 3 }
+
+rvPortTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvPortEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Porty fizyczne VPP: straty i bledy"
+    ::= { routerVppMIB 4 }
+
+rvPortEntry OBJECT-TYPE
+    SYNTAX      RvPortEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Porty fizyczne VPP: straty i bledy"
+    INDEX       { rvPortIndex }
+    ::= { rvPortTable 1 }
+
+RvPortEntry ::= SEQUENCE {
+    rvPortIndex                  Integer32,
+    rvPortName                   DisplayString,
+    rvPortRxMiss                 Counter64,
+    rvPortRxNoBuf                Counter64,
+    rvPortRxErrors               Counter64,
+    rvPortTxErrors               Counter64,
+    rvPortDrops                  Counter64,
+    rvPortPunt                   Counter64,
+    rvPortHwDiscards             Counter64
+}
+
+rvPortIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvPortEntry 1 }
+
+rvPortName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Nazwa portu w VPP"
+    ::= { rvPortEntry 2 }
+
+rvPortRxMiss OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "rx-miss: karta zgubila pakiety, bo VPP nie nadazal"
+    ::= { rvPortEntry 3 }
+
+rvPortRxNoBuf OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "rx-no-buf: brak buforow VPP"
+    ::= { rvPortEntry 4 }
+
+rvPortRxErrors OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "rx-error"
+    ::= { rvPortEntry 5 }
+
+rvPortTxErrors OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "tx-error"
+    ::= { rvPortEntry 6 }
+
+rvPortDrops OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "drops"
+    ::= { rvPortEntry 7 }
+
+rvPortPunt OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "punt (ruch do control plane)"
+    ::= { rvPortEntry 8 }
+
+rvPortHwDiscards OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Odrzucenia sprzetowe karty (xstats discard, out_of_buffer)"
+    ::= { rvPortEntry 9 }
+
+rvErrorTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvErrorEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Liczniki show errors VPP (tylko niezerowe)"
+    ::= { routerVppMIB 5 }
+
+rvErrorEntry OBJECT-TYPE
+    SYNTAX      RvErrorEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Liczniki show errors VPP (tylko niezerowe)"
+    INDEX       { rvErrorIndex }
+    ::= { rvErrorTable 1 }
+
+RvErrorEntry ::= SEQUENCE {
+    rvErrorIndex                 Integer32,
+    rvErrorNode                  DisplayString,
+    rvErrorReason                DisplayString,
+    rvErrorSeverity              DisplayString,
+    rvErrorCount                 Counter64
+}
+
+rvErrorIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvErrorEntry 1 }
+
+rvErrorNode OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wezel grafu VPP"
+    ::= { rvErrorEntry 2 }
+
+rvErrorReason OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Powod"
+    ::= { rvErrorEntry 3 }
+
+rvErrorSeverity OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Poziom: error, warn, info"
+    ::= { rvErrorEntry 4 }
+
+rvErrorCount OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Licznik"
+    ::= { rvErrorEntry 5 }
+
+rvBgpPeerTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvBgpPeerEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Sesje BGP z BIRD (IPv4 i IPv6)"
+    ::= { routerVppMIB 6 }
+
+rvBgpPeerEntry OBJECT-TYPE
+    SYNTAX      RvBgpPeerEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Sesje BGP z BIRD (IPv4 i IPv6)"
+    INDEX       { rvBgpPeerIndex }
+    ::= { rvBgpPeerTable 1 }
+
+RvBgpPeerEntry ::= SEQUENCE {
+    rvBgpPeerIndex               Integer32,
+    rvBgpPeerName                DisplayString,
+    rvBgpPeerDescr               DisplayString,
+    rvBgpPeerNeighbor            DisplayString,
+    rvBgpPeerRemoteAs            Gauge32,
+    rvBgpPeerState               Integer32,
+    rvBgpPeerEnabled             Integer32,
+    rvBgpPeerUptime              Gauge32,
+    rvBgpPeerImported            Gauge32,
+    rvBgpPeerExported            Gauge32,
+    rvBgpPeerFiltered            Gauge32,
+    rvBgpPeerImportLimit         Gauge32,
+    rvBgpPeerLastError           DisplayString,
+    rvBgpPeerAfi                 DisplayString,
+    rvBgpPeerFlaps               Counter32
+}
+
+rvBgpPeerIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvBgpPeerEntry 1 }
+
+rvBgpPeerName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Nazwa protokolu w BIRD"
+    ::= { rvBgpPeerEntry 2 }
+
+rvBgpPeerDescr OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Opis sesji (description)"
+    ::= { rvBgpPeerEntry 3 }
+
+rvBgpPeerNeighbor OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Adres sasiada"
+    ::= { rvBgpPeerEntry 4 }
+
+rvBgpPeerRemoteAs OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "AS sasiada"
+    ::= { rvBgpPeerEntry 5 }
+
+rvBgpPeerState OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 idle, 2 connect, 3 active, 4 opensent, 5 openconfirm, 6 established"
+    ::= { rvBgpPeerEntry 6 }
+
+rvBgpPeerEnabled OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = sesja wlaczona, 0 = wylaczona (disable)"
+    ::= { rvBgpPeerEntry 7 }
+
+rvBgpPeerUptime OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "s"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Czas od zestawienia sesji, s (0 = nie zestawiona)"
+    ::= { rvBgpPeerEntry 8 }
+
+rvBgpPeerImported OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Prefiksy przyjete"
+    ::= { rvBgpPeerEntry 9 }
+
+rvBgpPeerExported OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Prefiksy wyslane"
+    ::= { rvBgpPeerEntry 10 }
+
+rvBgpPeerFiltered OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Prefiksy odrzucone przez filtr"
+    ::= { rvBgpPeerEntry 11 }
+
+rvBgpPeerImportLimit OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Limit prefiksow (0 = brak)"
+    ::= { rvBgpPeerEntry 12 }
+
+rvBgpPeerLastError OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Ostatni blad sesji"
+    ::= { rvBgpPeerEntry 13 }
+
+rvBgpPeerAfi OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Kanaly: ipv4, ipv6"
+    ::= { rvBgpPeerEntry 14 }
+
+rvBgpPeerFlaps OBJECT-TYPE
+    SYNTAX      Counter32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Upadki zestawionej sesji od startu kolektora"
+    ::= { rvBgpPeerEntry 15 }
+
+rvServiceTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvServiceEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Uslugi systemd routera"
+    ::= { routerVppMIB 7 }
+
+rvServiceEntry OBJECT-TYPE
+    SYNTAX      RvServiceEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Uslugi systemd routera"
+    INDEX       { rvServiceIndex }
+    ::= { rvServiceTable 1 }
+
+RvServiceEntry ::= SEQUENCE {
+    rvServiceIndex               Integer32,
+    rvServiceName                DisplayString,
+    rvServiceUp                  Integer32,
+    rvServiceState               DisplayString
+}
+
+rvServiceIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvServiceEntry 1 }
+
+rvServiceName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Jednostka systemd"
+    ::= { rvServiceEntry 2 }
+
+rvServiceUp OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = dziala, 0 = nie"
+    ::= { rvServiceEntry 3 }
+
+rvServiceState OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Stan systemd (ActiveState/SubState)"
+    ::= { rvServiceEntry 4 }
+
+rvRpkiTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvRpkiEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Polaczenia RPKI w BIRD"
+    ::= { routerVppMIB 10 }
+
+rvRpkiEntry OBJECT-TYPE
+    SYNTAX      RvRpkiEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Polaczenia RPKI w BIRD"
+    INDEX       { rvRpkiIndex }
+    ::= { rvRpkiTable 1 }
+
+RvRpkiEntry ::= SEQUENCE {
+    rvRpkiIndex                  Integer32,
+    rvRpkiName                   DisplayString,
+    rvRpkiUp                     Integer32,
+    rvRpkiVrp4                   Gauge32,
+    rvRpkiVrp6                   Gauge32
+}
+
+rvRpkiIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvRpkiEntry 1 }
+
+rvRpkiName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Nazwa protokolu RPKI w BIRD"
+    ::= { rvRpkiEntry 2 }
+
+rvRpkiUp OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = polaczenie z walidatorem zestawione"
+    ::= { rvRpkiEntry 3 }
+
+rvRpkiVrp4 OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VRP IPv4"
+    ::= { rvRpkiEntry 4 }
+
+rvRpkiVrp6 OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VRP IPv6"
+    ::= { rvRpkiEntry 5 }
+
+rvRaidTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvRaidEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Macierze mdadm"
+    ::= { routerVppMIB 11 }
+
+rvRaidEntry OBJECT-TYPE
+    SYNTAX      RvRaidEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Macierze mdadm"
+    INDEX       { rvRaidIndex }
+    ::= { rvRaidTable 1 }
+
+RvRaidEntry ::= SEQUENCE {
+    rvRaidIndex                  Integer32,
+    rvRaidName                   DisplayString,
+    rvRaidDegraded               Integer32,
+    rvRaidState                  DisplayString,
+    rvRaidSyncPct                Gauge32,
+    rvRaidLevel                  DisplayString
+}
+
+rvRaidIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvRaidEntry 1 }
+
+rvRaidName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Macierz (md0)"
+    ::= { rvRaidEntry 2 }
+
+rvRaidDegraded OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = zdegradowana"
+    ::= { rvRaidEntry 3 }
+
+rvRaidState OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Stan dyskow, np. UU"
+    ::= { rvRaidEntry 4 }
+
+rvRaidSyncPct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Postep odbudowy/synchronizacji (100 = brak)"
+    ::= { rvRaidEntry 5 }
+
+rvRaidLevel OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Poziom RAID"
+    ::= { rvRaidEntry 6 }
+
+rvDiskTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvDiskEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Dyski (SMART)"
+    ::= { routerVppMIB 12 }
+
+rvDiskEntry OBJECT-TYPE
+    SYNTAX      RvDiskEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Dyski (SMART)"
+    INDEX       { rvDiskIndex }
+    ::= { rvDiskTable 1 }
+
+RvDiskEntry ::= SEQUENCE {
+    rvDiskIndex                  Integer32,
+    rvDiskName                   DisplayString,
+    rvDiskModel                  DisplayString,
+    rvDiskHealthOk               Integer32,
+    rvDiskTemp                   Gauge32,
+    rvDiskRealloc                Gauge32,
+    rvDiskPending                Gauge32,
+    rvDiskPowerOnHours           Gauge32,
+    rvDiskWearPct                Gauge32
+}
+
+rvDiskIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvDiskEntry 1 }
+
+rvDiskName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Urzadzenie"
+    ::= { rvDiskEntry 2 }
+
+rvDiskModel OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Model i numer seryjny"
+    ::= { rvDiskEntry 3 }
+
+rvDiskHealthOk OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1 = SMART PASSED, 0 = FAILED"
+    ::= { rvDiskEntry 4 }
+
+rvDiskTemp OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "C"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Temperatura, C"
+    ::= { rvDiskEntry 5 }
+
+rvDiskRealloc OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Sektory realokowane"
+    ::= { rvDiskEntry 6 }
+
+rvDiskPending OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Sektory oczekujace"
+    ::= { rvDiskEntry 7 }
+
+rvDiskPowerOnHours OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "h"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Czas pracy, godziny"
+    ::= { rvDiskEntry 8 }
+
+rvDiskWearPct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Zuzycie SSD, % (0 = brak danych)"
+    ::= { rvDiskEntry 9 }
+
+rvTempTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF RvTempEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Temperatury procesorow"
+    ::= { routerVppMIB 13 }
+
+rvTempEntry OBJECT-TYPE
+    SYNTAX      RvTempEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Wiersz: Temperatury procesorow"
+    INDEX       { rvTempIndex }
+    ::= { rvTempTable 1 }
+
+RvTempEntry ::= SEQUENCE {
+    rvTempIndex                  Integer32,
+    rvTempName                   DisplayString,
+    rvTempValue                  Gauge32,
+    rvTempCrit                   Gauge32
+}
+
+rvTempIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Indeks"
+    ::= { rvTempEntry 1 }
+
+rvTempName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Czujnik"
+    ::= { rvTempEntry 2 }
+
+rvTempValue OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "C"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Temperatura, C"
+    ::= { rvTempEntry 3 }
+
+rvTempCrit OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "C"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Prog krytyczny czujnika, C (0 = brak)"
+    ::= { rvTempEntry 4 }
+
+END

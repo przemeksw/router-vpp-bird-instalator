@@ -11,10 +11,10 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.4.0"                     '^SCRIPT_VERSION="1\.4\.0"' 1
+chk "wersja skryptu 1.5.0"                     '^SCRIPT_VERSION="1\.5\.0"' 1
 chk "router-guard w UPGRADE_PROGRAMS"          '"router-guard\|/opt/router/bin/router-guard\|755\|prog_router_guard\|"' 1
 chk "router-fw w UPGRADE_PROGRAMS"            '"router-fw\|/opt/router/bin/router-fw\|755\|prog_router_fw\|"' 1
-chk "TOTAL_STAGES=26"                         '^TOTAL_STAGES=26$' 1
+chk "TOTAL_STAGES=27"                         '^TOTAL_STAGES=27$' 1
 chk "etap 22 uruchamia st_fw"                 '^run_stage 22 .*st_fw$' 1
 chk "funkcja st_fw"                           '^st_fw\(\) \{' 1
 chk "program router-fw instalowany"           'prog_router_fw \| put_file /opt/router/bin/router-fw ' 1
@@ -29,7 +29,7 @@ chk "drop-in VPP uruchamia firewall"          'vpp.service.d/50-fw.conf' 1
 chk "router-fw w do_check (usługi)"           'router-ifaces router-fw router-guard "\$\(bird_unit\)"' 1
 chk "sekcja Firewall w do_check"              'Firewall \(/etc/router/firewall.conf\)' 1
 chk "kategoria FIREWALL w router-notify"      '\("FIREWALL", ' 1
-chk "FIREWALL w domyślnym MAIL_SEND (3 miejsca + instrukcja)" 'SYS_CPU IFACES FIREWALL OTHER' 4
+chk "FIREWALL w domyślnym MAIL_SEND (3 miejsca + instrukcja)" 'SYS_CPU IFACES FIREWALL RPKI OTHER' 4
 chk "rozdział 10a w README routera"           '^## 10a\. Firewall tranzytu' 1
 chk "etap 23 uruchamia st_guard"              '^run_stage 23 .*st_guard$' 1
 chk "instrukcja instalowana w etapie 20"     'router_manual \| put_file /etc/router/INSTRUKCJA.md' 1
@@ -61,7 +61,12 @@ chk "iptables-persistent bez pytań"           'iptables-persistent/autosave_v4 
 chk "conntrack zablokowany w modprobe"        '^install nf_conntrack /bin/false$' 1
 chk "router-check sprawdza conntrack"         'conntrack wyłączony"; fi' 1
 chk "ochrona przed odcięciem SSH"             'NIE jest w TRUSTED_NETS' 1
+chk "SSH_CLIENT bez set -u (sudo, konsola)"    '\$\{SSH_CLIENT[^:]' 0
 chk "snmpd: blok zaufanych sieci (dataplane i mgmt)" '^\$\(snmp_trusted_block\)$' 2
+chk "snmpd: pass_persist router-snmp (dataplane i mgmt)" '^\$\(snmp_ext_block\)$' 2
+chk "snmpd-dataplane: IF-MIB tylko z vpp-snmp-agent" 'mteTriggerConf,interfaces,ifTable,ifXTable -f -p /run/snmpd-dataplane\.pid$' 1
+chk "router-snmp: etap SNMP i upgrade_script"      '^  snmp_router_ext$' 2
+chk "router-snmp w upgrade_script"                 '^  "router-snmp\|/opt/router/bin/router-snmp\|755\|prog_router_snmp\|router-snmp\.service"$' 1
 chk "etap 24 uruchamia st_logs"               '^run_stage 24 .*st_logs$' 1
 chk "rsyslog: reguły /var/log/router"         'file="/var/log/router/(vpp|bird)\.log"' 2
 chk "migracja /var/log/router-monitor"     '^  migrate_logdir$' 3
@@ -106,6 +111,12 @@ fwt "reguły: nic w filter INPUT"           4 '^-A INPUT' 0
 fwt "reguły: bez conntrack/state"          4 '(-m (state|conntrack)|-j CT)' 0
 chk "hsflowd: tymczasowy kolektor, gdy SFLOW_COLLECTOR puste" 'echo "  collector \{ ip=127\.0\.0\.1 udpport=6343 \}' 1
 chk "etap 26 uruchamia st_loop0_access"       '^run_stage 26 .*st_loop0_access$' 1
+chk "etap 27 uruchamia st_rpki"               '^run_stage 27 .*st_rpki$' 1
+chk "RPKI: domyślnie bez odrzucania"          'define RPKI_ENFORCE = 0;' 1
+chk "RPKI: tryb nie nadpisywany przy powtórce" '^  if \[\[ ! -f /etc/bird/rpki-mode.conf \]\]; then$' 1
+chk "RPKI: krótki expire (fail-open po 1 h)"  '^  expire keep 3600; ' 1
+chk "RPKI: kategoria e-mail"                  '\("RPKI", "RPKI: ' 1
+chk "RPKI: MAIL_SEND zawiera RPKI"            'FIREWALL RPKI OTHER' 4
 chk "funkcja st_loop0_access"                 '^st_loop0_access\(\) \{' 1
 chk "LOOP0_ADDR domyślnie 10.10.10.10/32"     '^LOOP0_ADDR="10\.10\.10\.10/32"' 1
 chk "DATAPLANE_SSH i MGMT_SNMP w ustawieniach" '^(DATAPLANE_SSH|MGMT_SNMP)=yes' 2

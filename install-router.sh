@@ -53,7 +53,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.4.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -88,7 +88,7 @@ SMTP_USER=""                   # login SMTP
 SMTP_PASS=""                   # hasło SMTP (trafi tylko do /etc/router/notify.conf, tryb 600)
 SMTP_FROM=""                   # nadawca, np. router-lodz2@firma.pl
 MAIL_MAX_SEV=5                 # wysyłaj poziomy 1..N (1 = krytyczne ... 5 = zakończenia zdarzeń)
-MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"  # co wysyłać (router-notify categories)
+MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL RPKI OTHER"  # co wysyłać (router-notify categories)
 LOG_KEEP_DAYS=20               # logi w /var/log/router: rotacja codziennie, tyle dni wstecz
 # --- system: czas, DNS, ochrona CPU routera (iptables; etap 25) ---
 TIMEZONE="Europe/Warsaw"
@@ -128,7 +128,7 @@ MAIN_LOG=$LOG_DIR/install.log
 MANIFEST=$DATA_DIR/MANIFEST.txt
 MAN_DB=$STATE_DIR/manifest.tsv
 ENV_FILE=$DATA_DIR/router-install.env
-TOTAL_STAGES=26
+TOTAL_STAGES=27
 
 MODE=install
 ASSUME_YES=0
@@ -517,6 +517,10 @@ import signal
 import subprocess
 import sys
 import time
+try:
+    import readline  # noqa: F401 — edycja linii w input(): Backspace, strzałki, Delete, historia
+except ImportError:
+    pass
 
 ROOT = os.environ.get("ROUTER_IFACES_ROOT", "")      # tylko do testów
 CONF = ROOT + "/etc/router/ifaces.conf"
@@ -1768,9 +1772,40 @@ def read_proc_stat():
             if line.startswith("cpu") and line[3:4].isdigit():
                 p = line.split()
                 vals = list(map(int, p[1:]))
-                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
-                out[int(p[0][3:])] = (sum(vals), idle)
+                # nice (np. Routinator z Nice=15) liczymy jak wolny czas: ustępuje BIRD i SNMP
+                idle = vals[1] + vals[3] + (vals[4] if len(vals) > 4 else 0)
+                out[int(p[0][3:])] = (sum(vals[:8]), idle)
     return out
+
+
+def read_proc_cpu():
+    """Czas CPU procesów: {pid: (nazwa, ticki user+system)}; czytane tylko przy przeciążeniu rdzenia."""
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % pid) as f:
+                data = f.read()
+        except OSError:
+            continue
+        i = data.rfind(")")
+        p = data[i + 2:].split()
+        out[int(pid)] = (data[data.find("(") + 1:i], int(p[11]) + int(p[12]))
+    return out
+
+
+def top_procs(prev, now, dt, n=3):
+    """Najwięcej CPU między dwoma odczytami: 'nazwa(pid) 98%, ...'."""
+    hz = os.sysconf("SC_CLK_TCK")
+    rows = []
+    for pid, (name, t) in now.items():
+        if pid in prev and dt > 0:
+            pct = 100.0 * (t - prev[pid][1]) / hz / dt
+            if pct >= 1:
+                rows.append((pct, name, pid))
+    rows.sort(reverse=True)
+    return ", ".join("%s(%d) %.0f%%" % (name, pid, pct) for pct, name, pid in rows[:n])
 
 
 def cpulist(text):
@@ -1839,6 +1874,7 @@ def main():
     last_restart = 0.0
     hk_prev = read_proc_stat()
     hk_over = 0
+    hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
     md_t = 0.0
     sum_t = time.time()
@@ -1987,10 +2023,19 @@ def main():
                     hk_max, hk_core = busy, c
         hk_prev = hk_now
         hk_over = hk_over + 1 if hk_max >= CFG["HK_CPU_PCT"] else 0
+        # przy przeciążeniu: które procesy zjadają CPU (różnica czasu CPU z ostatniej sekundy)
+        if hk_over:
+            procs = read_proc_cpu()
+            if hk_procs is not None:
+                hk_top = top_procs(hk_procs, procs, t0 - hk_procs_t) or hk_top
+            hk_procs, hk_procs_t = procs, t0
+        else:
+            hk_procs, hk_top = None, ""
         state["hk_cpu_max"] = hk_max
         win["hk"] = max(win["hk"], hk_max)
         a_hk.update(t0, hk_over >= CFG["HK_CPU_SECONDS"], hk_max,
-                    "rdzeń systemowy cpu %s zajęty %.0f%% (BIRD/SNMP/system)" % (hk_core, hk_max))
+                    "rdzeń systemowy cpu %s zajęty %.0f%%%s" % (hk_core, hk_max,
+                                                            " — " + hk_top if hk_top else ""))
 
         # ---------------------------------------------------------- RAID
         if t0 - md_t >= CFG["MD_EVERY"]:
@@ -2079,7 +2124,7 @@ CFG = {
     "ALERT_EMAILS": "", "SMTP_HOST": "", "SMTP_PORT": "587", "SMTP_SECURITY": "starttls",
     "SMTP_USER": "", "SMTP_PASS": "", "SMTP_FROM": "",
     "MAIL_MAX_SEV": "5", "MAIL_MIN_INTERVAL": "60", "MAIL_MAX_PER_HOUR": "30",
-    "MAIL_SEND": "CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER",
+    "MAIL_SEND": "CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL RPKI OTHER",
     "MAIL_SEND_CLEAR": "yes",
 }
 # kategorie zdarzeń: (nazwa, opis, wzorzec na "OBSZAR-ZDARZENIE")
@@ -2097,6 +2142,7 @@ CATEGORIES = [
     ("SYS_CPU", "przeciążenie rdzeni systemowych (BIRD, SNMP)", r"^SYS-CPU_"),
     ("IFACES", "interfejsy: zmiany z ifaces.conf, rozjazd VPP, błędy pliku", r"^IFACE-"),
     ("FIREWALL", "firewall i router-guard: zmiany, rozjazd VPP, blokady, naruszenia", r"^(FW|GUARD)-"),
+    ("RPKI", "RPKI: walidator / połączenie BIRD padło lub wróciło, włączenie i wyłączenie odrzucania", r"^RPKI-"),
     ("STATS", "minutowe podsumowanie szczytów (dużo maili!)", r"^VPP-STATS$"),
     ("MAIL", "test wysyłki", r"^SYS-MAIL_"),
     ("OTHER", "pozostałe zdarzenia", r".*"),
@@ -2409,6 +2455,7 @@ prog_router_fw() {
   router-fw disable [-y]               dezaktywuj: zdejmij reguły z VPP, po restarcie firewall nie wraca
   router-fw boot                       (systemd) po starcie VPP odtwórz reguły — tylko gdy aktywowany (enable)
   router-fw expire                     (systemd, timer) zdejmij wygasłe blokady
+  router-fw json                       (router-snmp) stan i sumy liczników jako JSON
 
 Plik firewall.conf jest jedynym źródłem prawdy dla stref i reguł. Reguły działają tylko na ruch
 przechodzący przez VPP (acl-plugin, tryb bezstanowy). Ruchu do samego routera nie filtruje —
@@ -2426,6 +2473,10 @@ import subprocess
 import sys
 import textwrap
 import time
+try:
+    import readline  # noqa: F401 — edycja linii w input(): Backspace, strzałki, Delete, historia
+except ImportError:
+    pass
 
 ROOT = os.environ.get("ROUTER_FW_ROOT", "")      # tylko do testów
 CONF = ROOT + "/etc/router/firewall.conf"
@@ -3830,6 +3881,36 @@ def cmd_counters(args):
                     % (type(ex).__name__, ex), "31"))
         return 3
 
+
+@command("json")
+def cmd_json(args):
+    """(router-snmp) stan firewalla i sumy liczników ACL (surowe, rosnące) jako jedna linia JSON."""
+    out = {"enabled": os.path.exists(ENABLED), "applied": os.path.exists(LASTGOOD),
+           "drift": bool(load_json(STATE, {}).get("drift")), "blocks": len(load_blocks()), "acls": 0, "rules": 0}
+    ctx, err = counters_snapshot()
+    if ctx is None:
+        out["error"] = err
+    else:
+        conf, groups, act = ctx
+        out["rules"] = len(conf.rules)
+        live = {k: g for k, g in groups.items() if k in act.acls and act.acls[k][1] == g.tag}
+        out["acls"] = len(live)
+        if conf.settings["counters"] == "on":
+            sums = dict.fromkeys(("deny_pkts", "deny_bytes", "permit_pkts", "permit_bytes", "block_pkts"), 0)
+            try:
+                for g, _idx, vals in raw_counters(live, act).values():
+                    for f, (p, b) in zip(g.flat, vals):
+                        kind = "deny" if f.action == "deny" else "permit"
+                        sums[kind + "_pkts"] += p
+                        sums[kind + "_bytes"] += b
+                        if f.parent == "block":
+                            sums["block_pkts"] += p
+                out.update(sums)
+            except Exception as ex:     # noqa: BLE001 — brak vpp_papi / segmentu statystyk
+                out["error"] = "%s: %s" % (type(ex).__name__, ex)
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
 # --- KONIEC MODUŁÓW (nowe funkcje wstawiaj powyżej tej linii) ---
 
 def main():
@@ -3875,6 +3956,7 @@ prog_router_guard() {
   router-guard check [--log]               kontrola pliku i zgodności VPP ze stanem; alarmy (--log: timer systemd)
   router-guard boot                        (systemd) po starcie VPP odtwórz ochronę
   router-guard expire                      (systemd, timer) wyłącz po upływie --for oraz przejdź na enforce po rozgrzewce
+  router-guard json                        (router-snmp) stan, liczniki i zapełnienie tablic jako JSON
 
 Tryb monitor liczy, co zostałoby odrzucone, i niczego nie blokuje. "on --enforce" włącza najpierw monitor na czas
 rozgrzewki (warmup), żeby tablica zdążyła nauczyć się wychodzących SYN, i dopiero potem enforce.
@@ -4663,8 +4745,25 @@ def cmd_expire(args):
     return 0
 
 
+def cmd_json(args):
+    """(router-snmp) stan ochrony, liczniki i zapełnienie tablic jako jedna linia JSON."""
+    st = load_state()
+    out = {"active": bool(st["active"]), "mode": st["mode"], "prefixes": len(st["prefixes"]),
+           "drift": bool(st.get("drift")), "loaded": False}
+    try:
+        v = read_vpp()
+        out.update(loaded=True, vpp_mode=v.mode, used4=v.used4, size4=v.size4, used6=v.used6, size6=v.size6,
+                   counters=counters_summary(read_errors()))
+    except GuardMissing:
+        pass
+    except VppError as ex:
+        out["error"] = str(ex)
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
 COMMANDS = {"on": cmd_on, "off": cmd_off, "enforce": cmd_enforce, "monitor": cmd_monitor, "status": cmd_status,
-            "check": cmd_check, "boot": cmd_boot, "expire": cmd_expire}
+            "check": cmd_check, "boot": cmd_boot, "expire": cmd_expire, "json": cmd_json}
 
 
 def main():
@@ -4694,6 +4793,1390 @@ def main():
 if __name__ == "__main__":
     main()
 ROUTER_GUARD_PY
+}
+
+# router-rpki: walidacja RPKI w BIRD — stan, podgląd tras INVALID, przełącznik odrzucania (domyślnie wyłączone)
+prog_router_rpki() {
+  cat <<'ROUTER_RPKI_PY'
+#!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+"""router-rpki — walidacja RPKI w BIRD (Routinator): stan, podgląd tras INVALID, przełącznik odrzucania
+
+  router-rpki                      stan: walidator, połączenie BIRD (RTR), VRP, tryb, trasy INVALID
+  router-rpki invalid [SESJA]      trasy INVALID w tablicach BIRD (wszystkie albo z jednej sesji BGP)
+  router-rpki invalid --count      tylko liczba tras INVALID
+  router-rpki enable               WŁĄCZ odrzucanie tras INVALID (w sesjach, których filtr woła rpki_filter())
+  router-rpki disable              WYŁĄCZ odrzucanie — trasy INVALID znów przechodzą (stan domyślny)
+  router-rpki check [--log]        (timer co 5 min) kontrola walidatora i połączenia, alarmy, liczba INVALID
+  router-rpki json                 (router-snmp) stan jako JSON
+
+Domyślnie odrzucanie jest WYŁĄCZONE: BIRD tylko sprawdza trasy, a router-rpki invalid pokazuje, co by odrzucił.
+Gdzie RPKI działa, decydujesz w filtrach BGP: rpki_filter() w filtrze importu sesji (np. tylko globalne T1).
+Gdy walidator padnie, BIRD trzyma ostatnie dane najwyżej 1 h (expire), potem tablice ROA są puste, każda trasa
+jest NOT FOUND i nic nie jest odrzucane. Dokumentacja: /etc/router/INSTRUKCJA.md (rozdział RPKI).
+"""
+import calendar
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = os.environ.get("ROUTER_RPKI_ROOT", "")      # tylko do testów
+MODEF = ROOT + "/etc/bird/rpki-mode.conf"
+BIRDCONF = ROOT + "/etc/bird/bird.conf"
+STATE = ROOT + "/var/lib/router/rpki.state.json"
+LOGDIR = ROOT + "/var/log/router"
+MONLOG = LOGDIR + "/alarmy.log"
+NOTIFY = ROOT + "/opt/router/bin/router-notify"
+BIRDC = os.environ.get("ROUTER_RPKI_BIRDC", "birdc")
+BIRD = os.environ.get("ROUTER_RPKI_BIRD", "bird")
+SYSTEMCTL = os.environ.get("ROUTER_RPKI_SYSTEMCTL", "systemctl")
+STATUS_URL = os.environ.get("ROUTER_RPKI_STATUS_URL", "http://127.0.0.1:8323/api/v1/status")
+PROTO = "rpki_routinator"
+VALIDATOR = "routinator.service"
+EXPIRE = 3600
+TTY = sys.stdout.isatty()
+
+
+def color(s, c):
+    return "\033[%sm%s\033[0m" % (c, s) if TTY else s
+
+
+def run(cmd, timeout=120):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return p.returncode, p.stdout + p.stderr
+    except OSError as ex:
+        return 127, str(ex)
+    except subprocess.TimeoutExpired:
+        return 124, "przekroczony czas"
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, sort_keys=True)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def event(sev, mnem, text, mail=True):
+    line = "%%RPKI-%d-%s: %s" % (sev, mnem, text)
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(MONLOG, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%F %T"), line))
+    except OSError:
+        pass
+    prio = {1: "alert", 2: "crit", 3: "err", 4: "warning", 5: "notice"}.get(sev, "info")
+    subprocess.run(["logger", "-t", "router-rpki", "-p", "local0." + prio, line],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if mail and os.access(NOTIFY, os.X_OK):
+        subprocess.run([NOTIFY, "queue", line], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return line
+
+
+# --------------------------------------------------------------------------- tryb (plik dołączany przez BIRD)
+def mode_text(enforce):
+    return ("# router-rpki — NIE edytuj ręcznie, przełączaj: router-rpki enable | router-rpki disable\n"
+            "# 0 = trasy INVALID przechodzą (tylko podgląd: router-rpki invalid), 1 = rpki_filter() je odrzuca\n"
+            "define RPKI_ENFORCE = %d;\n" % (1 if enforce else 0))
+
+
+def read_enforce():
+    try:
+        with open(MODEF) as f:
+            m = re.search(r"^\s*define\s+RPKI_ENFORCE\s*=\s*(\d+)\s*;", f.read(), re.M)
+            return bool(m and m.group(1) == "1")
+    except OSError:
+        return False
+
+
+def write_file(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    try:
+        st = os.stat(path)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.chmod(tmp, st.st_mode & 0o777)
+    except OSError:
+        os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+
+
+def set_mode(enforce):
+    if read_enforce() == enforce and os.path.exists(MODEF):
+        print("Odrzucanie tras RPKI INVALID jest już %s." % ("WŁĄCZONE" if enforce else "WYŁĄCZONE"))
+        return 0
+    try:
+        with open(MODEF) as f:
+            old = f.read()
+    except OSError:
+        old = mode_text(False)
+    write_file(MODEF, mode_text(enforce))
+    rc, out = run([BIRD, "-p", "-c", BIRDCONF])
+    if rc != 0:
+        write_file(MODEF, old)
+        print(color("Konfiguracja BIRD nie przechodzi kontroli (bird -p) — nic nie zmieniono:\n%s" % out.strip(), "31"))
+        return 2
+    rc, out = run([BIRDC, "configure"])
+    if rc != 0 or not re.search(r"Reconfigur", out):
+        write_file(MODEF, old)
+        run([BIRDC, "configure"])
+        print(color("birdc configure nie powiódł się — przywrócono poprzedni tryb:\n%s" % out.strip(), "31"))
+        return 3
+    st = load_json(STATE, {})
+    st.update(enforce=enforce, mode_changed=int(time.time()))
+    save_json(STATE, st)
+    if enforce:
+        event(5, "ENFORCE_ON", "odrzucanie tras RPKI INVALID WŁĄCZONE (sesje z rpki_filter() w filtrze importu)")
+        print("Odrzucanie tras RPKI INVALID WŁĄCZONE. Działa w sesjach, których filtr importu woła rpki_filter().")
+        if not rtr_state()[0]:
+            print(color("UWAGA: BIRD nie ma teraz połączenia z walidatorem — odrzucanie zacznie działać, gdy dane wrócą.",
+                        "33"))
+    else:
+        event(5, "ENFORCE_OFF", "odrzucanie tras RPKI INVALID wyłączone — trasy INVALID przechodzą")
+        print("Odrzucanie tras RPKI INVALID WYŁĄCZONE. Trasy INVALID przechodzą (podgląd: router-rpki invalid).")
+    print("BIRD przeliczył filtry bez zrywania sesji (birdc configure).")
+    return 0
+
+
+# --------------------------------------------------------------------------- stan
+def rtr_state():
+    """(połączenie BIRD z walidatorem zestawione, VRP IPv4, VRP IPv6, opis stanu)."""
+    rc, out = run([BIRDC, "show", "protocols", "all", PROTO], timeout=30)
+    if rc != 0:
+        return False, 0, 0, "BIRD nie odpowiada"
+    up, vrp, chan, info = False, {4: 0, 6: 0}, None, "brak protokołu %s w BIRD" % PROTO
+    for line in out.splitlines():
+        p = line.split()
+        if p and p[0] == PROTO and len(p) >= 4:
+            up = p[3] == "up"
+            info = " ".join(p[6:]) or p[3]
+        elif line.strip().startswith("Channel "):
+            chan = 6 if "6" in line else 4
+        m = re.search(r"Routes:\s+(\d+) imported", line)
+        if m and chan:
+            vrp[chan] = int(m.group(1))
+    return up, vrp[4], vrp[6], info
+
+
+def validator_active():
+    rc, out = run([SYSTEMCTL, "is-active", VALIDATOR], timeout=15)
+    return out.strip() == "active"
+
+
+def validator_last_update():
+    """Czas ostatniego zakończonego odświeżenia danych przez Routinator (znacznik czasu) albo None."""
+    try:
+        with urllib.request.urlopen(STATUS_URL, timeout=3) as r:
+            data = json.loads(r.read().decode())
+    except (OSError, ValueError):
+        return None
+    val = data.get("lastUpdateDone") or data.get("last_update_done")
+    if not val:
+        return None
+    try:
+        return calendar.timegm(time.strptime(val[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def count_invalid(proto=None):
+    cmd = [BIRDC, "show", "route"] + (["protocol", proto] if proto else []) + ["count", "where", "rpki_invalid()"]
+    rc, out = run(cmd)
+    if rc != 0:
+        return None
+    nums = [int(x) for x in re.findall(r"(\d+) of \d+ routes", out)]
+    return sum(nums) if nums else None
+
+
+def ago(ts):
+    s = max(0, int(time.time() - ts))
+    return "%d s" % s if s < 120 else "%d min" % (s // 60) if s < 7200 else "%d h" % (s // 3600)
+
+
+def cmd_status(args):
+    st = load_json(STATE, {})
+    val = validator_active()
+    up, v4, v6, info = rtr_state()
+    last = validator_last_update()
+    print(color("Walidator (Routinator): %s" % ("działa" if val else "NIE DZIAŁA"), "1" if val else "31"))
+    if last:
+        print("  ostatnie odświeżenie danych: %s temu" % ago(last))
+    conn = color("połączony (%s)" % info, "32") if up else color("BRAK POŁĄCZENIA (%s)" % info, "31")
+    print("BIRD %s: %s" % (PROTO, conn))
+    print("  VRP: IPv4 %d, IPv6 %d" % (v4, v6))
+    if not up:
+        print("  Bez połączenia BIRD trzyma ostatnie dane najwyżej %d min, potem nic nie jest odrzucane." % (EXPIRE // 60))
+    enf = read_enforce()
+    print("Odrzucanie tras INVALID: %s" % (color("WŁĄCZONE", "33") if enf else "WYŁĄCZONE (tylko podgląd)"))
+    if st.get("mode_changed"):
+        print("  zmienione: %s" % time.strftime("%F %T", time.localtime(st["mode_changed"])))
+    if "invalid" in st and st.get("checked"):
+        print("Trasy INVALID w tablicach: %d (pomiar %s temu; teraz: router-rpki invalid --count)"
+              % (st["invalid"], ago(st["checked"])))
+    return 0
+
+
+def cmd_invalid(args):
+    count = "--count" in args
+    rest = [a for a in args if not a.startswith("-")]
+    proto = rest[0] if rest else None
+    if proto and not re.match(r"^[A-Za-z0-9_.-]+$", proto):
+        print("zła nazwa sesji: %s" % proto)
+        return 2
+    if count:
+        n = count_invalid(proto)
+        if n is None:
+            print(color("BIRD nie odpowiada albo brak funkcji rpki_invalid() (etap RPKI instalatora)", "31"))
+            return 3
+        print(n)
+        return 0
+    cmd = [BIRDC, "show", "route"] + (["protocol", proto] if proto else []) + ["where", "rpki_invalid()"]
+    rc, out = run(cmd)
+    print(out.rstrip())
+    if read_enforce():
+        print(color("Odrzucanie jest WŁĄCZONE: w sesjach z rpki_filter() trasy INVALID są odrzucane i nie ma ich "
+                    "w tablicy; widać je tylko przy 'import keep filtered on' (birdc show route filtered).", "33"))
+    return 0 if rc == 0 else 3
+
+
+def cmd_check(args):
+    log = "--log" in args
+    st = load_json(STATE, {})
+    val = validator_active()
+    up, v4, v6, info = rtr_state()
+    problems = []
+    if not val:
+        problems.append("Routinator nie działa (systemctl status routinator)")
+    if not up:
+        problems.append("BIRD bez połączenia z walidatorem (%s)" % info)
+    elif v4 + v6 == 0 and st.get("seen_vrp"):
+        problems.append("BIRD połączony, ale bez VRP (walidator stracił dane?)")
+    first = up and v4 + v6 == 0 and not st.get("seen_vrp")     # pierwsze pobieranie po instalacji: bez alarmu
+    if first and not log:
+        print("Walidator pobiera dane pierwszy raz (5–15 min) — do tego czasu nic nie jest odrzucane.")
+    if v4 + v6 > 0:
+        st["seen_vrp"] = True
+    ok = not problems
+    if log:
+        if not ok and st.get("ok", True):
+            event(3, "DOWN", "%s — BIRD trzyma ostatnie dane najwyżej %d min, potem przepuszcza wszystko"
+                  % ("; ".join(problems), EXPIRE // 60))
+        elif ok and not st.get("ok", True):
+            event(5, "UP", "walidator i połączenie BIRD działają (VRP IPv4 %d, IPv6 %d)" % (v4, v6))
+    else:
+        for p in problems:
+            print(color("  " + p, "31"))
+        if ok:
+            print("RPKI w porządku: walidator działa, BIRD połączony, VRP IPv4 %d, IPv6 %d." % (v4, v6))
+    st.update(ok=ok, validator=val, rtr=up, vrp4=v4, vrp6=v6, enforce=read_enforce(), checked=int(time.time()))
+    n = count_invalid()
+    if n is not None:
+        st["invalid"] = n
+    save_json(STATE, st)
+    return 0 if ok else 1
+
+
+def cmd_json(args):
+    st = load_json(STATE, {})
+    st["enforce"] = read_enforce()
+    print(json.dumps(st, sort_keys=True))
+    return 0
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip() + "\n\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return 0
+    if argv and argv[0] in ("-V", "--version"):
+        print("router-rpki — walidacja RPKI w BIRD\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return 0
+    cmds = {"status": cmd_status, "invalid": cmd_invalid, "check": cmd_check, "json": cmd_json,
+            "enable": lambda a: set_mode(True), "disable": lambda a: set_mode(False)}
+    name = argv[0] if argv else "status"
+    if name not in cmds:
+        print("nieznane polecenie: %s (router-rpki --help)" % name, file=sys.stderr)
+        return 2
+    if name in ("enable", "disable", "check") and os.geteuid() != 0 and not ROOT:
+        print("Uruchom jako root.", file=sys.stderr)
+        return 1
+    return cmds[name](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ROUTER_RPKI_PY
+}
+
+# router-snmp: kolektor danych (BGP, VPP, firewall, guard, RPKI, RAID, dyski) i pass_persist dla snmpd
+prog_router_snmp() {
+  cat <<'ROUTER_SNMP_PY'
+#!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+"""router-snmp — dane routera dla SNMP (LibreNMS, Zabbix, Cacti): BGP, zdrowie VPP, firewall, guard, RPKI, RAID, dyski
+
+  router-snmp collect          (systemd: router-snmp.service) co 30 s zbiera dane do /run/router-snmp/cache.json
+  router-snmp collect --once   jeden przebieg i koniec (test)
+  router-snmp pass             (snmpd: pass_persist) odpowiada na zapytania SNMP z pliku cache
+  router-snmp walk [OID]       wszystkie wartości jak snmpwalk, bez SNMP (kontrola na routerze)
+  router-snmp oids             lista obiektów: OID, nazwa, typ, opis
+
+Gałęzie SNMP: 1.3.6.1.4.1.8072.9999.9999.630 (ROUTER-VPP-MIB) i 1.3.6.1.2.1.15 (BGP4-MIB, sesje IPv4).
+Kolektor działa jako root i sam pyta VPP, BIRD i system; snmpd tylko czyta gotowy plik, więc zapytanie SNMP
+nigdy nie czeka na vppctl ani birdc. Szablony LibreNMS / Zabbix / Cacti i plik MIB: katalog templates/ instalatora.
+"""
+import bisect
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("ROUTER_SNMP_ROOT", "")      # tylko do testów
+CACHE = ROOT + "/run/router-snmp/cache.json"
+INDEXF = ROOT + "/var/lib/router/snmp-index.json"
+MONSTATE = ROOT + "/run/router-monitor/state.json"
+ENVF = ROOT + "/etc/router/router.env"
+VERSIONF = ROOT + "/etc/router/version"
+ALARMLOG = ROOT + "/var/log/router/alarmy.log"
+IFSTATE = ROOT + "/var/lib/router/ifaces.state.json"
+RPKISTATE = ROOT + "/var/lib/router/rpki.state.json"
+RPKIMODE = ROOT + "/etc/bird/rpki-mode.conf"
+MDSTAT = ROOT + "/proc/mdstat"
+HWMON = ROOT + "/sys/class/hwmon"
+VPPCTL = os.environ.get("ROUTER_SNMP_VPPCTL", "vppctl")
+BIRDC = os.environ.get("ROUTER_SNMP_BIRDC", "birdc")
+SYSTEMCTL = os.environ.get("ROUTER_SNMP_SYSTEMCTL", "systemctl")
+SMARTCTL = os.environ.get("ROUTER_SNMP_SMARTCTL", "smartctl")
+ROUTER_FW = os.environ.get("ROUTER_SNMP_FW", "/opt/router/bin/router-fw")
+ROUTER_GUARD = os.environ.get("ROUTER_SNMP_GUARD", "/opt/router/bin/router-guard")
+
+INTERVAL = 30            # s, dane VPP, BIRD, usługi, alarmy
+SLOW_EVERY = 60          # s, router-fw / router-guard (vppctl w barierze — rzadziej)
+SMART_EVERY = 600        # s, SMART dysków
+STALE_AFTER = 300        # s, po tylu sekundach bez odświeżenia pass przestaje oddawać dane (zostaje rvDataAge)
+MAX_ERRORS = 400         # najwięcej wierszy w tablicy liczników błędów VPP
+SERVICES = ["vpp", "bird", "bird3", "netns-dataplane", "router-ifaces", "router-fw", "router-guard", "router-monitor",
+            "router-notify", "snmpd-dataplane", "vpp-snmp-agent", "snmpd-mgmt", "sshd-dataplane", "hsflowd", "chrony",
+            "smartd", "mdmonitor", "router-snmp", "routinator", "router-rpki-link"]
+
+BASE = "1.3.6.1.4.1.8072.9999.9999.630"
+BGP4 = "1.3.6.1.2.1.15"
+
+# --------------------------------------------------------------------------- schemat (źródło dla MIB i szablonów)
+# Typy: int (Integer32), gauge (Gauge32), counter (Counter32), counter64 (Counter64), string (DisplayString).
+# Gałąź skalarna: (nr, nazwa, opis, [(nr, obiekt, typ, jednostka, opis)]); OID wartości: BASE.nr.obiekt.0
+# Tablica: (nr, nazwa, wpis, opis, [kolumny]); OID wartości: BASE.nr.1.kolumna.indeks; kolumna 1 = indeks.
+SCALARS = [
+    (1, "rvSystem", "Stan zbierania danych i alarmy routera", [
+        (1, "rvDataAge", "gauge", "s", "Wiek danych w sekundach (router-snmp collect odswieza co 30 s)"),
+        (2, "rvVersion", "string", "", "Wersja programow routera (install-router.sh)"),
+        (3, "rvAlarmsHour", "gauge", "", "Alarmy poziomu 1-4 w alarmy.log w ostatniej godzinie"),
+        (4, "rvAlarmsCritHour", "gauge", "", "Alarmy poziomu 1-2 (krytyczne) w ostatniej godzinie"),
+        (5, "rvLastAlarm", "string", "", "Ostatni alarm poziomu 1-4 z alarmy.log"),
+        (6, "rvServicesDown", "gauge", "", "Liczba uslug routera, ktore nie dzialaja"),
+    ]),
+    (2, "rvVpp", "Zdrowie VPP i tablica tras", [
+        (1, "rvVppUp", "int", "", "1 = VPP odpowiada, 0 = nie"),
+        (2, "rvVppVectorMax", "gauge", "", "Najwiekszy sredni wektor workera (1 = luz, 256 = nasycenie)"),
+        (3, "rvVppWorkers", "gauge", "", "Liczba workerow VPP"),
+        (4, "rvVppPuntPps", "gauge", "pps", "Ruch do control plane (punt), pakiety/s"),
+        (5, "rvVppRxMissPps", "gauge", "pps", "Pakiety gubione na wejsciu (rx-miss + rx-no-buf), pakiety/s"),
+        (6, "rvVppNicDiscardPps", "gauge", "pps", "Pakiety odrzucane sprzetowo przez karte, pakiety/s"),
+        (7, "rvVppHkCpuMax", "gauge", "%", "Najbardziej zajety rdzen systemowy (BIRD, SNMP, system), %"),
+        (8, "rvVppBufAvail", "gauge", "", "Bufory VPP wolne"),
+        (9, "rvVppBufUsed", "gauge", "", "Bufory VPP zajete"),
+        (10, "rvVppBufCached", "gauge", "", "Bufory VPP w pamieci podrecznej watkow"),
+        (11, "rvVppBufFreePct", "gauge", "%", "Bufory VPP wolne + podreczne, % puli"),
+        (12, "rvVppDrops", "counter64", "", "Suma licznikow drops interfejsow VPP"),
+        (13, "rvVppRxMiss", "counter64", "", "Suma rx-miss i rx-no-buf portow"),
+        (14, "rvVppPunt", "counter64", "", "Suma pakietow punt"),
+        (15, "rvVppErrors", "counter64", "", "Suma licznikow show errors o poziomie error"),
+        (16, "rvFib4Routes", "gauge", "", "Trasy IPv4 w FIB VPP (VRF 0)"),
+        (17, "rvFib6Routes", "gauge", "", "Trasy IPv6 w FIB VPP (VRF 0)"),
+        (18, "rvBird4Routes", "gauge", "", "Sieci IPv4 w tablicy master4 BIRD"),
+        (19, "rvBird6Routes", "gauge", "", "Sieci IPv6 w tablicy master6 BIRD"),
+        (20, "rvFibDiffPct", "gauge", "%", "Najwieksza roznica FIB VPP wzgledem BIRD (IPv4/IPv6), %"),
+        (21, "rvIfacesDrift", "int", "", "1 = interfejsy VPP roznia sie od ifaces.conf"),
+    ]),
+    (8, "rvFirewall", "Firewall tranzytu (router-fw)", [
+        (1, "rvFwEnabled", "int", "", "1 = firewall aktywny na stale (router-fw enable)"),
+        (2, "rvFwDrift", "int", "", "1 = ACL w VPP roznia sie od ostatnio zastosowanej konfiguracji"),
+        (3, "rvFwAcls", "gauge", "", "Listy ACL routera wgrane do VPP"),
+        (4, "rvFwRules", "gauge", "", "Reguly w firewall.conf (ostatnio zastosowanym)"),
+        (5, "rvFwDenyPkts", "counter64", "", "Pakiety odrzucone przez reguly deny (z blokadami)"),
+        (6, "rvFwDenyBytes", "counter64", "B", "Bajty odrzucone przez reguly deny"),
+        (7, "rvFwPermitPkts", "counter64", "", "Pakiety przepuszczone przez reguly permit"),
+        (8, "rvFwBlockPkts", "counter64", "", "Pakiety odrzucone przez blokady dorazne"),
+        (9, "rvFwBlocks", "gauge", "", "Aktywne blokady dorazne (router-fw block)"),
+    ]),
+    (9, "rvGuard", "Ochrona przed odbiciami (router-guard, synack_guard)", [
+        (1, "rvGuardActive", "int", "", "1 = ochrona wlaczona"),
+        (2, "rvGuardMode", "int", "", "0 = off, 1 = monitor, 2 = enforce"),
+        (3, "rvGuardPrefixes", "gauge", "", "Chronione prefiksy"),
+        (4, "rvGuardChecked", "counter64", "", "Sprawdzone odpowiedzi"),
+        (5, "rvGuardPassed", "counter64", "", "Przepuszczone (jest wpis w tablicy)"),
+        (6, "rvGuardViolations", "counter64", "", "Naruszenia (brak wpisu, zly ISN)"),
+        (7, "rvGuardDropped", "counter64", "", "Odrzucone (enforce)"),
+        (8, "rvGuardRecorded", "counter64", "", "Zapisane wpisy (SYN, UDP)"),
+        (9, "rvGuardInsertFailed", "counter64", "", "Bledy zapisu do tablicy"),
+        (10, "rvGuardRstSent", "counter64", "", "Wyslane RST (reply-rst)"),
+        (11, "rvGuardTable4Pct", "gauge", "%", "Zapelnienie tablicy IPv4, %"),
+        (12, "rvGuardTable6Pct", "gauge", "%", "Zapelnienie tablicy IPv6, %"),
+        (13, "rvGuardDrift", "int", "", "1 = VPP rozni sie od stanu router-guard"),
+    ]),
+    (14, "rvRpkiStatus", "Walidacja RPKI (Routinator, router-rpki)", [
+        (1, "rvRpkiEnforce", "int", "", "1 = rpki_filter() odrzuca trasy INVALID, 0 = tylko podglad (domyslnie)"),
+        (2, "rvRpkiInvalid", "gauge", "", "Trasy INVALID w tablicach BIRD (pomiar co 5 min)"),
+        (3, "rvRpkiValidatorUp", "int", "", "1 = Routinator dziala"),
+        (4, "rvRpkiCheckAge", "gauge", "s", "Wiek ostatniej kontroli router-rpki check, s"),
+    ]),
+]
+TABLES = [
+    (3, "rvWorkerTable", "rvWorkerEntry", "Obciazenie workerow VPP", [
+        (1, "rvWorkerIndex", "int", "", "Numer workera"),
+        (2, "rvWorkerName", "string", "", "Worker i rdzen CPU"),
+        (3, "rvWorkerVector", "gauge", "", "Sredni rozmiar wektora (1 = luz, 256 = nasycenie)"),
+    ]),
+    (4, "rvPortTable", "rvPortEntry", "Porty fizyczne VPP: straty i bledy", [
+        (1, "rvPortIndex", "int", "", "Indeks"),
+        (2, "rvPortName", "string", "", "Nazwa portu w VPP"),
+        (3, "rvPortRxMiss", "counter64", "", "rx-miss: karta zgubila pakiety, bo VPP nie nadazal"),
+        (4, "rvPortRxNoBuf", "counter64", "", "rx-no-buf: brak buforow VPP"),
+        (5, "rvPortRxErrors", "counter64", "", "rx-error"),
+        (6, "rvPortTxErrors", "counter64", "", "tx-error"),
+        (7, "rvPortDrops", "counter64", "", "drops"),
+        (8, "rvPortPunt", "counter64", "", "punt (ruch do control plane)"),
+        (9, "rvPortHwDiscards", "counter64", "", "Odrzucenia sprzetowe karty (xstats discard, out_of_buffer)"),
+    ]),
+    (5, "rvErrorTable", "rvErrorEntry", "Liczniki show errors VPP (tylko niezerowe)", [
+        (1, "rvErrorIndex", "int", "", "Indeks"),
+        (2, "rvErrorNode", "string", "", "Wezel grafu VPP"),
+        (3, "rvErrorReason", "string", "", "Powod"),
+        (4, "rvErrorSeverity", "string", "", "Poziom: error, warn, info"),
+        (5, "rvErrorCount", "counter64", "", "Licznik"),
+    ]),
+    (6, "rvBgpPeerTable", "rvBgpPeerEntry", "Sesje BGP z BIRD (IPv4 i IPv6)", [
+        (1, "rvBgpPeerIndex", "int", "", "Indeks"),
+        (2, "rvBgpPeerName", "string", "", "Nazwa protokolu w BIRD"),
+        (3, "rvBgpPeerDescr", "string", "", "Opis sesji (description)"),
+        (4, "rvBgpPeerNeighbor", "string", "", "Adres sasiada"),
+        (5, "rvBgpPeerRemoteAs", "gauge", "", "AS sasiada"),
+        (6, "rvBgpPeerState", "int", "", "1 idle, 2 connect, 3 active, 4 opensent, 5 openconfirm, 6 established"),
+        (7, "rvBgpPeerEnabled", "int", "", "1 = sesja wlaczona, 0 = wylaczona (disable)"),
+        (8, "rvBgpPeerUptime", "gauge", "s", "Czas od zestawienia sesji, s (0 = nie zestawiona)"),
+        (9, "rvBgpPeerImported", "gauge", "", "Prefiksy przyjete"),
+        (10, "rvBgpPeerExported", "gauge", "", "Prefiksy wyslane"),
+        (11, "rvBgpPeerFiltered", "gauge", "", "Prefiksy odrzucone przez filtr"),
+        (12, "rvBgpPeerImportLimit", "gauge", "", "Limit prefiksow (0 = brak)"),
+        (13, "rvBgpPeerLastError", "string", "", "Ostatni blad sesji"),
+        (14, "rvBgpPeerAfi", "string", "", "Kanaly: ipv4, ipv6"),
+        (15, "rvBgpPeerFlaps", "counter", "", "Upadki zestawionej sesji od startu kolektora"),
+    ]),
+    (7, "rvServiceTable", "rvServiceEntry", "Uslugi systemd routera", [
+        (1, "rvServiceIndex", "int", "", "Indeks"),
+        (2, "rvServiceName", "string", "", "Jednostka systemd"),
+        (3, "rvServiceUp", "int", "", "1 = dziala, 0 = nie"),
+        (4, "rvServiceState", "string", "", "Stan systemd (ActiveState/SubState)"),
+    ]),
+    (10, "rvRpkiTable", "rvRpkiEntry", "Polaczenia RPKI w BIRD", [
+        (1, "rvRpkiIndex", "int", "", "Indeks"),
+        (2, "rvRpkiName", "string", "", "Nazwa protokolu RPKI w BIRD"),
+        (3, "rvRpkiUp", "int", "", "1 = polaczenie z walidatorem zestawione"),
+        (4, "rvRpkiVrp4", "gauge", "", "VRP IPv4"),
+        (5, "rvRpkiVrp6", "gauge", "", "VRP IPv6"),
+    ]),
+    (11, "rvRaidTable", "rvRaidEntry", "Macierze mdadm", [
+        (1, "rvRaidIndex", "int", "", "Indeks"),
+        (2, "rvRaidName", "string", "", "Macierz (md0)"),
+        (3, "rvRaidDegraded", "int", "", "1 = zdegradowana"),
+        (4, "rvRaidState", "string", "", "Stan dyskow, np. UU"),
+        (5, "rvRaidSyncPct", "gauge", "%", "Postep odbudowy/synchronizacji (100 = brak)"),
+        (6, "rvRaidLevel", "string", "", "Poziom RAID"),
+    ]),
+    (12, "rvDiskTable", "rvDiskEntry", "Dyski (SMART)", [
+        (1, "rvDiskIndex", "int", "", "Indeks"),
+        (2, "rvDiskName", "string", "", "Urzadzenie"),
+        (3, "rvDiskModel", "string", "", "Model i numer seryjny"),
+        (4, "rvDiskHealthOk", "int", "", "1 = SMART PASSED, 0 = FAILED"),
+        (5, "rvDiskTemp", "gauge", "C", "Temperatura, C"),
+        (6, "rvDiskRealloc", "gauge", "", "Sektory realokowane"),
+        (7, "rvDiskPending", "gauge", "", "Sektory oczekujace"),
+        (8, "rvDiskPowerOnHours", "gauge", "h", "Czas pracy, godziny"),
+        (9, "rvDiskWearPct", "gauge", "%", "Zuzycie SSD, % (0 = brak danych)"),
+    ]),
+    (13, "rvTempTable", "rvTempEntry", "Temperatury procesorow", [
+        (1, "rvTempIndex", "int", "", "Indeks"),
+        (2, "rvTempName", "string", "", "Czujnik"),
+        (3, "rvTempValue", "gauge", "C", "Temperatura, C"),
+        (4, "rvTempCrit", "gauge", "C", "Prog krytyczny czujnika, C (0 = brak)"),
+    ]),
+]
+
+BGP_STATES = {"idle": 1, "connect": 2, "active": 3, "opensent": 4, "openconfirm": 5, "established": 6}
+CLOSING_RE = re.compile(r"(_NORMAL|_END|RECOVERED)$|^UP$")
+ALARM_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) .*?%([A-Z0-9_]+)-(\d)-([A-Z0-9_]+):")
+
+
+def objects():
+    """[(oid, nazwa, typ, jednostka, opis, gałąź)] — wszystkie obiekty ROUTER-VPP-MIB w kolejności OID."""
+    out = []
+    for g, _gname, _d, objs in SCALARS:
+        out += [("%s.%d.%d.0" % (BASE, g, n), name, typ, unit, desc, g) for n, name, typ, unit, desc in objs]
+    for t, _tname, _e, _d, cols in TABLES:
+        out += [("%s.%d.1.%d" % (BASE, t, n), name, typ, unit, desc, t) for n, name, typ, unit, desc in cols]
+    return sorted(out, key=lambda x: oid_key(x[0]))
+
+
+def oid_key(oid):
+    return tuple(int(x) for x in oid.strip(".").split(".") if x != "")
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, sort_keys=True)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def run(cmd, timeout=15):
+    """(kod, stdout) — kod 127, gdy programu nie ma; 124 po przekroczeniu czasu."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return p.returncode, p.stdout
+    except OSError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+
+
+def vppctl(*args):
+    return run([VPPCTL] + list(args))
+
+
+def birdc(*args):
+    return run([BIRDC] + list(args))
+
+
+# --------------------------------------------------------------------------- parsery VPP
+IF_HDR = re.compile(r"^(\S+)\s+(\d+)\s+(up|down)\s+\S+\s*(.*)$")
+COUNTER = re.compile(r"^\s*(\S(?:.*?\S)?)\s+(\d+)\s*$")
+
+
+def phys_if(name):
+    return not (name.startswith(("local", "tap", "loop", "lcp", "tun", "host-", "memif", "vxlan", "gre", "ipip"))
+                or "." in name or name == "")
+
+
+def parse_show_interface(text):
+    """'vppctl show interface' → {nazwa: {licznik: wartość}} (liczniki o nazwach ze spacjami też)."""
+    res, cur = {}, None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("Name "):
+            continue
+        m = IF_HDR.match(line)
+        if m:
+            cur = m.group(1)
+            res[cur] = {}
+            rest = m.group(4)
+        elif cur is not None and line[:1].isspace():
+            rest = line
+        else:
+            cur = None
+            continue
+        c = COUNTER.match(rest)
+        if c and cur is not None:
+            res[cur][c.group(1)] = res[cur].get(c.group(1), 0) + int(c.group(2))
+    return res
+
+
+HW_IF = re.compile(r"^(\S+)\s+\d+\s+(up|down)\b")
+HW_X = re.compile(r"^\s+([A-Za-z0-9_\[\]]*(?:discard|out_of_buffer)[A-Za-z0-9_\[\]]*)\s+(\d+)\s*$")
+
+
+def parse_hw_xstats(text):
+    """'vppctl show hardware-interfaces' → {port: suma liczników *discard*/*out_of_buffer* (bez tx_)}."""
+    res, cur = {}, None
+    for line in text.splitlines():
+        m = HW_IF.match(line)
+        if m:
+            cur = m.group(1)
+            res.setdefault(cur, 0)
+            continue
+        if cur:
+            m = HW_X.match(line)
+            if m and not m.group(1).startswith("tx_"):
+                res[cur] += int(m.group(2))
+    return res
+
+
+ERR_LINE = re.compile(r"^\s*(\d+)\s+(\S+)\s+(.+?)(?:\s+(error|warn|info|debug|unknown))?\s*$")
+
+
+def parse_show_errors(text):
+    """'vppctl show errors' → [(licznik, węzeł, powód, poziom)] zsumowane po wątkach."""
+    tot = {}
+    for line in text.splitlines():
+        if not line.strip() or line.strip().startswith("Count"):
+            continue
+        m = ERR_LINE.match(line)
+        if m:
+            key = (m.group(2), m.group(3), m.group(4) or "")
+            tot[key] = tot.get(key, 0) + int(m.group(1))
+    return [(v, k[0], k[1], k[2]) for k, v in tot.items()]
+
+
+def parse_show_buffers(text):
+    """'vppctl show buffers' → (total, avail, cached, used) zsumowane po pulach; None, gdy brak tabeli."""
+    sums, found = [0, 0, 0, 0], False
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) >= 9 and all(x.isdigit() for x in p[-8:]):
+            found = True
+            for i, v in enumerate(p[-4:]):
+                sums[i] += int(v)
+    return tuple(sums) if found else None
+
+
+def parse_fib_summary(text):
+    """'vppctl show ip[6] fib summary' → liczba tras w VRF 0."""
+    total, in0 = 0, False
+    for line in text.splitlines():
+        if re.match(r"^ipv[46]-VRF:", line):
+            in0 = bool(re.match(r"^ipv[46]-VRF:0,", line))
+            continue
+        m = re.match(r"^\s+(\d+)\s+(\d+)\s*$", line)
+        if in0 and m:
+            total += int(m.group(2))
+    return total
+
+
+# --------------------------------------------------------------------------- parsery BIRD
+PROTO_HDR = re.compile(r"^(\S+)\s+(\S+)\s+(\S+)\s+(up|down|start|stop|flush)\s+"
+                       r"(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?|\d{4}-\d\d-\d\d|\d\d:\d\d:\d\d(?:\.\d+)?)\s*(.*)$")
+
+
+def parse_since(text, now):
+    """Czas 'Since' z BIRD (różne formaty timeformat) → znacznik czasu albo None."""
+    text = text.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(text.split(".")[0], fmt))
+        except ValueError:
+            pass
+    try:
+        hms = time.strptime(text.split(".")[0], "%H:%M:%S")
+    except ValueError:
+        return None
+    lt = time.localtime(now)
+    ts = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hms.tm_hour, hms.tm_min, hms.tm_sec, 0, 0, -1))
+    return ts - 86400 if ts > now + 60 else ts
+
+
+def parse_bird_protocols(text, now):
+    """'birdc show protocols all' → [{name, proto, state, since, info, desc, bgp_state, neighbor, remote_as, local_as,
+    neighbor_id, source, last_error, channels: {nazwa: {imported, exported, filtered, limit}}}]."""
+    res, cur, chan = [], None, None
+    for line in text.splitlines():
+        m = PROTO_HDR.match(line)
+        if m:
+            cur = {"name": m.group(1), "proto": m.group(2).upper(), "state": m.group(4),
+                   "since": parse_since(m.group(5), now), "info": m.group(6).strip(), "desc": "", "bgp_state": "",
+                   "neighbor": "", "remote_as": 0, "local_as": 0, "neighbor_id": "", "source": "", "last_error": "",
+                   "channels": {}}
+            res.append(cur)
+            chan = None
+            continue
+        if cur is None or not line[:1].isspace():
+            if not line.strip():
+                chan = None
+            continue
+        s = line.strip()
+        if s.startswith("Channel "):
+            empty = {"imported": 0, "exported": 0, "filtered": 0, "limit": 0, "up": False}
+            chan = cur["channels"].setdefault(s.split(None, 1)[1], empty)
+            continue
+        key, _, val = s.partition(":")
+        val = val.strip()
+        if chan is not None:
+            if key == "Routes":
+                for num, kind in re.findall(r"(\d+) (imported|exported|filtered)", val):
+                    chan[kind] = int(num)
+            elif key == "Import limit" and val.split()[0].isdigit():
+                chan["limit"] = int(val.split()[0])
+            elif key == "State":
+                chan["up"] = val.upper() == "UP"
+            continue
+        if key == "Description":
+            cur["desc"] = val
+        elif key in ("BGP state", "Status"):
+            cur["bgp_state"] = val
+        elif key == "Neighbor address":
+            cur["neighbor"] = val.split("%")[0]
+        elif key == "Neighbor AS" and val.isdigit():
+            cur["remote_as"] = int(val)
+        elif key == "Local AS" and val.isdigit():
+            cur["local_as"] = int(val)
+        elif key == "Neighbor ID":
+            cur["neighbor_id"] = val
+        elif key == "Source address":
+            cur["source"] = val
+        elif key == "Last error":
+            cur["last_error"] = val
+    return res
+
+
+def parse_route_count(text):
+    """'birdc show route count table X' → liczba sieci (najlepszych tras) albo None."""
+    m = re.search(r"(\d+) of (\d+) routes for (\d+) networks", text)
+    return int(m.group(3)) if m else None
+
+
+def parse_router_id(text):
+    m = re.search(r"Router ID is (\S+)", text)
+    return m.group(1) if m else ""
+
+
+# --------------------------------------------------------------------------- system
+MD_HDR = re.compile(r"^(md\d+)\s*:\s*(\S+)\s+(?:\(\S+\)\s+)?(raid\d+|linear|multipath)?")
+MD_STAT = re.compile(r"\[(\d+)/(\d+)\]\s*\[([U_]+)\]")
+MD_PROG = re.compile(r"(recovery|resync|reshape|check)\s*=\s*([\d.]+)%")
+
+
+def parse_mdstat(text):
+    res, cur = [], None
+    for line in text.splitlines():
+        m = MD_HDR.match(line)
+        if m:
+            cur = {"name": m.group(1), "level": m.group(3) or m.group(2), "state": "", "degraded": "(F)" in line,
+                   "sync": 100}
+            res.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = MD_STAT.search(line)
+        if m:
+            cur["state"] = m.group(3)
+            cur["degraded"] = cur["degraded"] or "_" in m.group(3) or m.group(1) != m.group(2)
+        m = MD_PROG.search(line)
+        if m:
+            cur["sync"] = int(float(m.group(2)))
+    return res
+
+
+def parse_alarms(lines, now):
+    """Linie alarmy.log → (alarmy 1-4 z ostatniej godziny, w tym krytyczne 1-2, ostatni alarm 1-4)."""
+    warn = crit = 0
+    last = ""
+    for line in lines:
+        m = ALARM_RE.match(line)
+        if not m:
+            continue
+        sev, mnem = int(m.group(3)), m.group(4)
+        if sev > 4 or CLOSING_RE.search(mnem):
+            continue
+        last = line.strip()
+        try:
+            ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        if now - ts <= 3600:
+            warn += 1
+            crit += sev <= 2
+    return warn, crit, last
+
+
+def tail_lines(path, size=262144):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            n = f.tell()
+            f.seek(max(0, n - size))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = data.splitlines()
+    return lines[1:] if n > size else lines
+
+
+def parse_systemctl_show(text):
+    """'systemctl show -p ... u1 u2' → [{Id, LoadState, ...}] (bloki rozdzielone pustą linią)."""
+    res, cur = [], {}
+    for line in text.splitlines() + [""]:
+        if not line.strip():
+            if cur:
+                res.append(cur)
+            cur = {}
+            continue
+        k, _, v = line.partition("=")
+        cur[k] = v
+    return res
+
+
+def service_up(u):
+    if u.get("ActiveState") == "active" or u.get("ConditionResult") == "no":
+        return 1
+    if u.get("Type") == "oneshot" and u.get("Result") == "success" and u.get("ActiveState") != "failed":
+        return 1
+    return 0
+
+
+def smart_row(d):
+    """Wynik 'smartctl -j -a' → wiersz rvDiskTable (bez nazwy)."""
+    row = {"rvDiskModel": " ".join(x for x in (d.get("model_name") or d.get("model_family", ""),
+                                               d.get("serial_number", "")) if x)}
+    st = d.get("smart_status", {})
+    if "passed" in st:
+        row["rvDiskHealthOk"] = 1 if st["passed"] else 0
+    t = d.get("temperature", {}).get("current")
+    if isinstance(t, int):
+        row["rvDiskTemp"] = t
+    h = d.get("power_on_time", {}).get("hours")
+    if isinstance(h, int):
+        row["rvDiskPowerOnHours"] = h
+    attrs = {a.get("id"): a for a in d.get("ata_smart_attributes", {}).get("table", [])}
+    for aid, col in ((5, "rvDiskRealloc"), (197, "rvDiskPending")):
+        if aid in attrs:
+            row[col] = int(attrs[aid].get("raw", {}).get("value", 0)) & 0xFFFFFFFF
+    nv = d.get("nvme_smart_health_information_log", {})
+    if "percentage_used" in nv:
+        row["rvDiskWearPct"] = nv["percentage_used"]
+    else:
+        for page in d.get("ata_device_statistics", {}).get("pages", []):
+            for e in page.get("table", []):
+                if "Percentage Used" in e.get("name", "") and isinstance(e.get("value"), int):
+                    row["rvDiskWearPct"] = e["value"]
+    if "rvDiskWearPct" not in row:
+        row["rvDiskWearPct"] = 0
+    return row
+
+
+def read_temps():
+    """coretemp / k10temp → [(nazwa, °C, próg krytyczny)] — tylko czujniki całych procesorów."""
+    res = []
+    for hw in sorted(glob.glob(HWMON + "/hwmon*")):
+        try:
+            with open(hw + "/name") as f:
+                chip = f.read().strip()
+        except OSError:
+            continue
+        if chip not in ("coretemp", "k10temp"):
+            continue
+        for lab in sorted(glob.glob(hw + "/temp*_label")):
+            try:
+                with open(lab) as f:
+                    label = f.read().strip()
+                if not label.startswith(("Package", "Tctl", "Tdie")):
+                    continue
+                with open(lab.replace("_label", "_input")) as f:
+                    val = int(f.read().strip()) // 1000
+                crit = 0
+                if os.path.exists(lab.replace("_label", "_crit")):
+                    with open(lab.replace("_label", "_crit")) as f:
+                        crit = int(f.read().strip()) // 1000
+            except (OSError, ValueError):
+                continue
+            res.append((label, val, crit))
+    return res
+
+
+def env_value(path, key):
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
+# --------------------------------------------------------------------------- kolektor
+class Indexes:
+    """Stałe indeksy wierszy (nazwa → numer) i pamięć sesji BGP; przeżywają restart kolektora."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_json(path, {})
+        self.data.setdefault("idx", {})
+        self.data.setdefault("bgp", {})
+        self.dirty = False
+
+    def get(self, table, key):
+        t = self.data["idx"].setdefault(table, {})
+        if key not in t:
+            t[key] = max(t.values(), default=0) + 1
+            self.dirty = True
+        return t[key]
+
+    def save(self):
+        if self.dirty:
+            save_json(self.path, self.data, 0o600)
+            self.dirty = False
+
+
+class Collector:
+    def __init__(self):
+        self.ix = Indexes(INDEXF)
+        self.slow_t = self.smart_t = 0.0
+        self.fw = self.guard = None
+        self.disks = []
+
+    def add_row(self, tables, table, key, row):
+        i = self.ix.get(table, key)
+        row[table.replace("Table", "Index")] = i
+        tables.setdefault(table, {})[str(i)] = row
+
+    # ---------------------------------------------------------------- VPP
+    def vpp(self, s, t):
+        rc, _ = vppctl("show", "version")
+        s["rvVppUp"] = 1 if rc == 0 else 0
+        mon = load_json(MONSTATE, {})
+        if s["rvVppUp"] and time.time() - mon.get("time", 0) < 15:
+            for key, name in (("vector_max", "rvVppVectorMax"), ("punt_pps", "rvVppPuntPps"),
+                              ("rx_miss_pps", "rvVppRxMissPps"), ("nic_discard_pps", "rvVppNicDiscardPps")):
+                if key in mon:
+                    s[name] = int(round(mon[key]))
+            cores = [c for c in env_value(ENVF, "INST_WORKERS").split(",") if c]
+            vec = mon.get("vector_per_worker", [])
+            s["rvVppWorkers"] = len(vec)
+            for i, v in enumerate(vec, 1):
+                t.setdefault("rvWorkerTable", {})[str(i)] = {
+                    "rvWorkerIndex": i, "rvWorkerVector": int(round(v)),
+                    "rvWorkerName": "worker %d cpu %s" % (i, cores[i - 1] if i <= len(cores) else "?")}
+        if "hk_cpu_max" in mon and time.time() - mon.get("time", 0) < 15:
+            s["rvVppHkCpuMax"] = int(round(mon["hk_cpu_max"]))
+        if not s["rvVppUp"]:
+            return
+        _, out = vppctl("show", "interface")
+        ifs = parse_show_interface(out)
+        _, out = vppctl("show", "hardware-interfaces")
+        hw = parse_hw_xstats(out)
+        drops = miss = punt = 0
+        for name, c in ifs.items():
+            drops += c.get("drops", 0)
+            punt += c.get("punt", 0)
+            if not phys_if(name):
+                continue
+            miss += c.get("rx-miss", 0) + c.get("rx-no-buf", 0)
+            self.add_row(t, "rvPortTable", name, {
+                "rvPortName": name, "rvPortRxMiss": c.get("rx-miss", 0), "rvPortRxNoBuf": c.get("rx-no-buf", 0),
+                "rvPortRxErrors": c.get("rx-error", 0), "rvPortTxErrors": c.get("tx-error", 0),
+                "rvPortDrops": c.get("drops", 0), "rvPortPunt": c.get("punt", 0), "rvPortHwDiscards": hw.get(name, 0)})
+        if ifs:
+            s.update(rvVppDrops=drops, rvVppRxMiss=miss, rvVppPunt=punt)
+        _, out = vppctl("show", "errors")
+        errs = sorted(parse_show_errors(out), key=lambda e: -e[0])
+        if out:
+            s["rvVppErrors"] = sum(e[0] for e in errs if e[3] == "error")
+        for count, node, reason, sev in errs[:MAX_ERRORS]:
+            if count > 0:
+                self.add_row(t, "rvErrorTable", "%s|%s" % (node, reason), {
+                    "rvErrorNode": node, "rvErrorReason": reason, "rvErrorSeverity": sev or "?", "rvErrorCount": count})
+        _, out = vppctl("show", "buffers")
+        b = parse_show_buffers(out)
+        if b:
+            total, avail, cached, used = b
+            s.update(rvVppBufAvail=avail, rvVppBufUsed=used, rvVppBufCached=cached,
+                     rvVppBufFreePct=int(100 * (avail + cached) / total) if total else 0)
+        for fam, cmd in ((4, "ip"), (6, "ip6")):
+            rc, out = vppctl("show", cmd, "fib", "summary")
+            if rc == 0 and out:
+                s["rvFib%dRoutes" % fam] = parse_fib_summary(out)
+
+    # ---------------------------------------------------------------- BIRD
+    def bird(self, s, t, b4, now):
+        rc, out = birdc("show", "protocols", "all")
+        if rc != 0:
+            return
+        mem = self.ix.data["bgp"]
+        for p in parse_bird_protocols(out, now):
+            if p["proto"] == "RPKI":
+                vrp = {4: 0, 6: 0}
+                for cname, ch in p["channels"].items():
+                    vrp[6 if "6" in cname else 4] += ch["imported"]
+                self.add_row(t, "rvRpkiTable", p["name"], {
+                    "rvRpkiName": p["name"], "rvRpkiVrp4": vrp[4], "rvRpkiVrp6": vrp[6],
+                    "rvRpkiUp": 1 if p["state"] == "up" else 0})
+                continue
+            if p["proto"] != "BGP":
+                continue
+            st = BGP_STATES.get(p["bgp_state"].lower().split()[0] if p["bgp_state"] else "", 1)
+            if p["state"] == "up":
+                st = 6
+            m = mem.setdefault(p["name"], {"state": st, "flaps": 0, "est": 0, "since": now})
+            if m["state"] != st:
+                if m["state"] == 6:
+                    m["flaps"] += 1
+                if st == 6:
+                    m["est"] += 1
+                m["state"], m["since"] = st, now
+                self.ix.dirty = True
+            since = p["since"] if p["since"] is not None else m["since"]
+            uptime = int(max(0, now - since)) if st == 6 else 0
+            ch = p["channels"].values()
+            self.add_row(t, "rvBgpPeerTable", p["name"], {
+                "rvBgpPeerName": p["name"], "rvBgpPeerDescr": p["desc"], "rvBgpPeerNeighbor": p["neighbor"],
+                "rvBgpPeerRemoteAs": p["remote_as"], "rvBgpPeerState": st,
+                "rvBgpPeerEnabled": 0 if p["state"] == "down" else 1, "rvBgpPeerUptime": uptime,
+                "rvBgpPeerImported": sum(c["imported"] for c in ch), "rvBgpPeerExported": sum(c["exported"] for c in ch),
+                "rvBgpPeerFiltered": sum(c["filtered"] for c in ch),
+                "rvBgpPeerImportLimit": max([c["limit"] for c in ch] or [0]),
+                "rvBgpPeerLastError": p["last_error"] or ("" if st == 6 else p["info"]),
+                "rvBgpPeerAfi": ",".join(sorted(p["channels"])), "rvBgpPeerFlaps": m["flaps"]})
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", p["neighbor"]):
+                b4["local_as"] = b4.get("local_as") or p["local_as"]
+                b4.setdefault("peers", []).append({
+                    "addr": p["neighbor"], "id": p["neighbor_id"] if st == 6 else "0.0.0.0",
+                    "state": st, "admin": 1 if p["state"] == "down" else 2,
+                    "local": p["source"] if re.match(r"^\d+\.\d+\.\d+\.\d+$", p["source"]) else "0.0.0.0",
+                    "remote_as": p["remote_as"], "est": m["est"], "uptime": uptime})
+        _, out = birdc("show", "status")
+        b4["router_id"] = parse_router_id(out)
+        for fam in (4, 6):
+            _, out = birdc("show", "route", "count", "table", "master%d" % fam)
+            n = parse_route_count(out)
+            if n is not None:
+                s["rvBird%dRoutes" % fam] = n
+        diffs = [abs(s["rvFib%dRoutes" % f] - s["rvBird%dRoutes" % f]) * 100 // s["rvBird%dRoutes" % f]
+                 for f in (4, 6) if s.get("rvBird%dRoutes" % f) and "rvFib%dRoutes" % f in s]
+        if diffs:
+            s["rvFibDiffPct"] = max(diffs)
+
+    # ---------------------------------------------------------------- usługi i stan narzędzi
+    def services(self, s, t):
+        rc, out = run([SYSTEMCTL, "show", "-p", "Id,LoadState,ActiveState,SubState,Type,Result,UnitFileState,"
+                       "ConditionResult"] + ["%s.service" % u for u in SERVICES])
+        if rc != 0 and not out:
+            return
+        down, seen = 0, set()
+        for u in parse_systemctl_show(out):
+            uid = u.get("Id", "")
+            if u.get("LoadState") != "loaded" or uid in seen or uid == "router-snmp.service":
+                continue
+            seen.add(uid)
+            if u.get("UnitFileState") not in ("enabled", "enabled-runtime", "static", "alias", "indirect") \
+                    and u.get("ActiveState") != "active":
+                continue
+            up = service_up(u)
+            down += 1 - up
+            self.add_row(t, "rvServiceTable", uid, {"rvServiceName": uid, "rvServiceUp": up,
+                                                    "rvServiceState": "%s/%s" % (u.get("ActiveState"), u.get("SubState"))})
+        s["rvServicesDown"] = down
+
+    def tools(self, s, now):
+        if now - self.slow_t >= SLOW_EVERY:
+            self.slow_t = now
+            for attr, prog in (("fw", ROUTER_FW), ("guard", ROUTER_GUARD)):
+                rc, out = run([prog, "json"], timeout=30)
+                try:
+                    setattr(self, attr, json.loads(out) if out.strip() else None)
+                except ValueError:
+                    setattr(self, attr, None)
+        fw = self.fw or {}
+        if fw:
+            s.update(rvFwEnabled=int(bool(fw.get("enabled"))), rvFwDrift=int(bool(fw.get("drift"))),
+                     rvFwBlocks=fw.get("blocks", 0), rvFwRules=fw.get("rules", 0), rvFwAcls=fw.get("acls", 0))
+            if "deny_pkts" in fw and not fw.get("error"):
+                s.update(rvFwDenyPkts=fw["deny_pkts"], rvFwDenyBytes=fw["deny_bytes"],
+                         rvFwPermitPkts=fw["permit_pkts"], rvFwBlockPkts=fw["block_pkts"])
+        g = self.guard or {}
+        if g:
+            s.update(rvGuardActive=int(bool(g.get("active"))), rvGuardDrift=int(bool(g.get("drift"))),
+                     rvGuardMode={"monitor": 1, "enforce": 2}.get(g.get("mode"), 0),
+                     rvGuardPrefixes=g.get("prefixes", 0))
+            for key, name in (("checked", "Checked"), ("passed", "Passed"), ("violations", "Violations"),
+                              ("dropped", "Dropped"), ("recorded", "Recorded"), ("insert_failed", "InsertFailed"),
+                              ("rst_sent", "RstSent")):
+                if key in g.get("counters", {}):
+                    s["rvGuard" + name] = g["counters"][key]
+            for fam in (4, 6):
+                if g.get("size%d" % fam):
+                    s["rvGuardTable%dPct" % fam] = int(100 * g.get("used%d" % fam, 0) / g["size%d" % fam])
+        s["rvIfacesDrift"] = int(bool(load_json(IFSTATE, {}).get("drift")))
+        if os.path.exists(RPKIMODE):
+            try:
+                with open(RPKIMODE) as f:
+                    s["rvRpkiEnforce"] = int(bool(re.search(r"^\s*define\s+RPKI_ENFORCE\s*=\s*1\s*;", f.read(), re.M)))
+            except OSError:
+                pass
+            rk = load_json(RPKISTATE, {})
+            if rk.get("checked"):
+                s["rvRpkiCheckAge"] = int(max(0, now - rk["checked"]))
+                s["rvRpkiValidatorUp"] = int(bool(rk.get("validator")))
+                if "invalid" in rk:
+                    s["rvRpkiInvalid"] = rk["invalid"]
+
+    # ---------------------------------------------------------------- sprzęt
+    def hardware(self, t, now):
+        try:
+            with open(MDSTAT) as f:
+                for md in parse_mdstat(f.read()):
+                    self.add_row(t, "rvRaidTable", md["name"], {
+                        "rvRaidName": md["name"], "rvRaidDegraded": int(md["degraded"]), "rvRaidState": md["state"],
+                        "rvRaidSyncPct": md["sync"], "rvRaidLevel": md["level"]})
+        except OSError:
+            pass
+        if now - self.smart_t >= SMART_EVERY:
+            self.smart_t, self.disks = now, []
+            _, out = run([SMARTCTL, "--scan", "-j"], timeout=30)
+            try:
+                devs = json.loads(out).get("devices", []) if out.strip() else []
+            except ValueError:
+                devs = []
+            for d in devs:
+                cmd = [SMARTCTL, "-j", "-a", d["name"]] + (["-d", d["type"]] if d.get("type") else [])
+                _, out = run(cmd, timeout=60)
+                try:
+                    row = smart_row(json.loads(out))
+                except ValueError:
+                    continue
+                name = os.path.basename(d["name"]) + ("" if d.get("type") in (None, "sat", "nvme", "scsi", "ata")
+                                                      else ":" + d["type"])
+                row["rvDiskName"] = name
+                self.disks.append((name, row))
+        for name, row in self.disks:
+            self.add_row(t, "rvDiskTable", name, dict(row))
+        for label, val, crit in read_temps():
+            self.add_row(t, "rvTempTable", label, {"rvTempName": label, "rvTempValue": val, "rvTempCrit": crit})
+
+    def collect(self):
+        now = time.time()
+        s, t, b4 = {}, {}, {}
+        s["rvVersion"] = env_value(VERSIONF, "SCRIPT_VERSION")
+        warn, crit, last = parse_alarms(tail_lines(ALARMLOG), now)
+        s.update(rvAlarmsHour=warn, rvAlarmsCritHour=crit, rvLastAlarm=last)
+        for step in (lambda: self.vpp(s, t), lambda: self.bird(s, t, b4, now), lambda: self.services(s, t),
+                     lambda: self.tools(s, now), lambda: self.hardware(t, now)):
+            try:
+                step()
+            except Exception as ex:      # noqa: BLE001 — jeden zepsuty element nie może zatrzymać reszty danych
+                print("router-snmp: %s: %s" % (type(ex).__name__, ex), file=sys.stderr)
+        self.ix.save()
+        data = {"time": now, "s": s, "t": t, "bgp4": b4}
+        save_json(CACHE, data)
+        return data
+
+
+def cmd_collect(args):
+    c = Collector()
+    if "--once" in args:
+        c.collect()
+        return 0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    while True:
+        t0 = time.time()
+        c.collect()
+        time.sleep(max(1.0, INTERVAL - (time.time() - t0)))
+
+
+# --------------------------------------------------------------------------- drzewo OID i pass_persist
+def clamp(typ, v):
+    if typ == "string":
+        s = re.sub(r"[\x00-\x1f\x7f]", " ", str(v))
+        return s.encode("utf-8")[:255].decode("utf-8", "ignore")
+    v = int(v)
+    if typ == "int":
+        return max(-2 ** 31, min(2 ** 31 - 1, v))
+    if typ == "gauge":
+        return max(0, min(2 ** 32 - 1, v))
+    if typ == "counter":
+        return v % 2 ** 32
+    if typ == "counter64":
+        return v % 2 ** 64
+    return v
+
+
+PASS_TYPE = {"int": "integer", "gauge": "gauge", "counter": "counter", "counter64": "counter64", "string": "string",
+             "ip": "ipaddress", "octet": "octet"}
+
+
+def as16(asn):
+    return asn if 0 <= asn <= 65535 else 23456      # BGP4-MIB zna tylko 2-bajtowe AS; 4-bajtowe jako AS_TRANS
+
+
+def build_tree(data, now):
+    """Dane z cache → {krotka OID: (typ, wartość)} dla obu gałęzi."""
+    tree = {}
+    age = int(now - data["time"]) if data else 999999
+    tree[oid_key(BASE + ".1.1.0")] = ("gauge", clamp("gauge", age))
+    if not data or age > STALE_AFTER:
+        return tree
+    s, tabs = data.get("s", {}), data.get("t", {})
+    for g, _gn, _d, objs in SCALARS:
+        for n, name, typ, _u, _desc in objs:
+            if name in s and name != "rvDataAge":
+                tree[oid_key("%s.%d.%d.0" % (BASE, g, n))] = (typ, clamp(typ, s[name]))
+    for tn, tname, _e, _d, cols in TABLES:
+        for idx, row in tabs.get(tname, {}).items():
+            for n, name, typ, _u, _desc in cols:
+                if name in row:
+                    tree[oid_key("%s.%d.1.%d.%s" % (BASE, tn, n, idx))] = (typ, clamp(typ, row[name]))
+    b4 = data.get("bgp4", {})
+    if b4.get("peers"):
+        tree[oid_key(BGP4 + ".1.0")] = ("octet", "10")                   # bgpVersion: obsługiwana wersja 4
+        tree[oid_key(BGP4 + ".2.0")] = ("int", as16(b4.get("local_as", 0)))
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", b4.get("router_id", "")):
+            tree[oid_key(BGP4 + ".4.0")] = ("ip", b4["router_id"])
+        for p in b4["peers"]:
+            ix = p["addr"]
+            for col, typ, val in ((1, "ip", p["id"] or "0.0.0.0"), (2, "int", p["state"]), (3, "int", p["admin"]),
+                                  (4, "int", 4), (5, "ip", p["local"]), (6, "int", 0), (7, "ip", p["addr"]),
+                                  (8, "int", 179), (9, "int", as16(p["remote_as"])), (10, "counter", 0),
+                                  (11, "counter", 0), (12, "counter", 0), (13, "counter", 0), (14, "octet", "00 00"),
+                                  (15, "counter", p["est"]), (16, "gauge", p["uptime"]), (24, "gauge", 0)):
+                tree[oid_key("%s.3.1.%d.%s" % (BGP4, col, ix))] = (typ, val if typ in ("ip", "octet") else clamp(typ, val))
+    return tree
+
+
+class Tree:
+    def __init__(self, path=CACHE):
+        self.path, self.mtime, self.data = path, None, None
+        self.keys, self.tree, self.built = [], {}, 0.0
+
+    def refresh(self):
+        now = time.time()
+        try:
+            mt = os.stat(self.path).st_mtime
+        except OSError:
+            mt = None
+        if mt != self.mtime:
+            self.mtime = mt
+            self.data = load_json(self.path, None) if mt else None
+            self.built = 0.0
+        if now - self.built >= 1.0:          # wiek danych (rvDataAge) i STALE_AFTER liczone na bieżąco
+            self.tree = build_tree(self.data, now)
+            self.keys = sorted(self.tree)
+            self.built = now
+
+    def get(self, oid):
+        k = oid_key(oid)
+        return (k,) + self.tree[k] if k in self.tree else None
+
+    def getnext(self, oid):
+        k = oid_key(oid)
+        i = bisect.bisect_right(self.keys, k)
+        if i < len(self.keys):
+            nk = self.keys[i]
+            return (nk,) + self.tree[nk]
+        return None
+
+
+def fmt_oid(k):
+    return "." + ".".join(str(x) for x in k)
+
+
+def cmd_pass(args, stdin=None, stdout=None):
+    """pass_persist; argument = gałąź zarejestrowana w snmpd — getnext nie wychodzi poza nią."""
+    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+    prefix = oid_key(args[0]) if args else ()
+    tree = Tree()
+    while True:
+        line = stdin.readline()
+        if not line:
+            return 0
+        cmd = line.strip().lower()
+        if cmd == "ping":
+            stdout.write("PONG\n")
+        elif cmd in ("get", "getnext"):
+            oid = stdin.readline().strip()
+            try:
+                tree.refresh()
+                r = tree.get(oid) if cmd == "get" else tree.getnext(oid)
+            except ValueError:
+                r = None
+            if r is not None and r[0][:len(prefix)] != prefix:
+                r = None
+            if r is None:
+                stdout.write("NONE\n")
+            else:
+                stdout.write("%s\n%s\n%s\n" % (fmt_oid(r[0]), PASS_TYPE[r[1]], r[2]))
+        elif cmd == "set":
+            stdin.readline()
+            stdin.readline()
+            stdout.write("not-writable\n")
+        elif cmd:
+            stdout.write("NONE\n")
+        stdout.flush()
+
+
+def cmd_walk(args):
+    tree = Tree()
+    tree.refresh()
+    names = {oid_key(o): name for o, name, *_ in objects()}
+    prefix = oid_key(args[0]) if args else ()
+    for k in tree.keys:
+        if k[:len(prefix)] != prefix:
+            continue
+        typ, val = tree.tree[k]
+        name = ""
+        for n in range(len(k), 0, -1):
+            if k[:n] in names:
+                name = names[k[:n]]
+                break
+        print("%s = %s: %s%s" % (fmt_oid(k), PASS_TYPE[typ].upper(), val, ("   (%s)" % name) if name else ""))
+    if not tree.data:
+        print("brak danych w %s — czy działa router-snmp.service?" % CACHE)
+        return 1
+    return 0
+
+
+def cmd_oids(args):
+    for oid, name, typ, unit, desc, _g in objects():
+        print("%-42s %-24s %-9s %-4s %s" % (oid, name, typ, unit, desc))
+    return 0
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip() + "\n\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return 0
+    if argv[0] in ("-V", "--version"):
+        print("router-snmp — dane routera dla SNMP\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return 0
+    fn = {"collect": cmd_collect, "pass": cmd_pass, "walk": cmd_walk, "oids": cmd_oids}.get(argv[0])
+    if fn is None:
+        print("nieznane polecenie: %s (router-snmp --help)" % argv[0], file=sys.stderr)
+        return 2
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ROUTER_SNMP_PY
 }
 
 # router-top: podgląd na żywo (obciążenie VPP, interfejsy, liczniki ACL, guard) — tylko odczyt
@@ -5294,15 +6777,25 @@ Czynności zmieniające stan pokazują podgląd i pytają o potwierdzenie; zawsz
 W menu: numer = wybór, 0 = powrót, f = pliki konfiguracyjne, q = wyjście.
 """
 import os
+import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import textwrap
+import time
+try:
+    import readline  # noqa: F401 — edycja linii w input(): Backspace, strzałki, Delete, historia
+except ImportError:
+    pass
 
 AUTOR = "PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
 BIN_DIRS = ("/opt/router/bin", "/usr/local/sbin")
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+TTY = sys.stdout.isatty() and sys.stdin.isatty()          # ekran: czyszczenie i przewijanie tylko na terminalu
+LIVE_ARGS = {"-w", "-f", "--watch", "--follow"}           # czynności na żywo: bez przewijania (less), Ctrl+C wraca
+LIVE_CMDS = {"router-top", "tail", "watch", "less", "vi", "vim", "nano"}
 
 
 def c(text, code):
@@ -5447,6 +6940,9 @@ AREAS = [
          A("Szczegóły protokołu", "pełne informacje o jednej sesji", ["birdc", "show", "protocols", "all"],
            params=[P("nazwa", "Nazwa protokołu (z listy sesji)", True)]),
          A("Liczba tras", "ile tras w tablicach", ["birdc", "show", "route", "count"]),
+         A("RPKI: stan", "walidator Routinator, połączenie BIRD, VRP, tryb odrzucania", ["/opt/router/bin/router-rpki"]),
+         A("RPKI: trasy INVALID", "ile tras jest INVALID (co odrzuciłby filtr RPKI)",
+           ["/opt/router/bin/router-rpki", "invalid", "--count"]),
          A("Trasa do adresu", "którą trasą pójdzie ruch do adresu", ["birdc", "show", "route", "for"],
            params=[P("adres", "Adres IP", True)]),
          A("Sprawdź konfigurację BIRD", "składnia bez przeładowania", ["birdc", "configure", "check"]),
@@ -5469,8 +6965,10 @@ AREAS = [
          F("/etc/iptables/rules.v4", "netfilter-persistent", "ochrona SSH/SNMP na porcie zarządzającym (IPv4)",
            "netfilter-persistent reload")],
      "actions": [
-         A("Stan SNMP", "snmpd w dataplane, snmpd na porcie zarządzającym, agent VPP",
-           ["systemctl", "status", "snmpd-dataplane", "snmpd-mgmt", "vpp-snmp-agent", "--no-pager"]),
+         A("Stan SNMP", "snmpd w dataplane, snmpd na porcie zarządzającym, agent VPP, kolektor router-snmp",
+           ["systemctl", "status", "snmpd-dataplane", "snmpd-mgmt", "vpp-snmp-agent", "router-snmp", "--no-pager"]),
+         A("Dane SNMP routera", "BGP, zdrowie VPP, firewall, guard, RPKI, RAID, dyski — to, co widzi LibreNMS/Zabbix/Cacti",
+           ["/opt/router/bin/router-snmp", "walk"]),
          A("Stan sFlow", "hsflowd i wtyczka sFlow w VPP", ["systemctl", "status", "hsflowd", "--no-pager"]),
          A("Stan SSH w dataplane", "sshd na adresie loop0", ["systemctl", "status", "sshd-dataplane", "--no-pager"]),
          A("Gniazda nasłuchu w dataplane", "kto słucha na SSH (22) i SNMP (161) w namespace dataplane",
@@ -5532,17 +7030,139 @@ def resolve(argv0):
     return shutil.which(argv0)
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+ALARMLOG = os.environ.get("ROUTER_MENU_ROOT", "") + "/var/log/router/alarmy.log"
+B = {"tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│", "t": "┬", "b": "┴", "l": "├", "r": "┤", "x": "┼"}
+
+
+def vlen(text):
+    return len(ANSI.sub("", text))
+
+
+def cell(parts, w):
+    """Zawartość komórki: [(tekst, kolor)] → linie zawinięte do szerokości w (kolor na każdej linii)."""
+    out = []
+    for text, style in parts:
+        for line in textwrap.wrap(text, w, break_on_hyphens=False) or [""]:
+            out.append(c(line, style) if style else line)
+    return out
+
+
+def table(headers, rows, widths, flex):
+    """Tabela z ramką: nagłówek, wiersze rozdzielone cienką linią; kolumna flex dostaje resztę szerokości ekranu."""
+    widths = list(widths)
+    widths[flex] = max(14, width() - sum(widths) + widths[flex] - 3 * len(widths) - 1)
+    edge = lambda left, mid, right: c(left + mid.join(B["h"] * (w + 2) for w in widths) + right, "2")   # noqa: E731
+    bar = c(B["v"], "2")
+
+    def line(cells):
+        cols = [cell(x, w) for x, w in zip(cells, widths)]
+        for i in range(max(len(x) for x in cols)):
+            print(bar + bar.join(" %s " % (x[i] + " " * (w - vlen(x[i])) if i < len(x) else " " * w)
+                                 for x, w in zip(cols, widths)) + bar)
+
+    print(edge(B["tl"], B["t"], B["tr"]))
+    line([[(h, "1;36")] for h in headers])
+    print(edge(B["l"], B["x"], B["r"]))
+    for i, r in enumerate(rows):
+        if i:
+            print(edge(B["l"], B["x"], B["r"]))
+        line(r)
+    print(edge(B["bl"], B["b"], B["br"]))
+
+
+def unit_states(units):
+    try:
+        out = subprocess.run(["systemctl", "is-active"] + units, capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return dict(zip(units, out.split()))
+
+
+def alarms_last_hour():
+    try:
+        with open(ALARMLOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    n, now = 0, time.time()
+    for ln in lines:
+        m = re.match(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) .*?%[A-Z0-9_]+-([1-4])-([A-Z0-9_]+):", ln)
+        if not m or re.search(r"(_NORMAL|_END|RECOVERED|UP)$", m.group(3)):
+            continue
+        try:
+            if now - time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")) <= 3600:
+                n += 1
+        except ValueError:
+            pass
+    return n
+
+
+def status_bar():
+    """Pasek stanu w menu głównym: najważniejsze usługi i alarmy z ostatniej godziny (tylko na terminalu)."""
+    st = unit_states(["vpp", "bird", "bird3", "router-snmp", "routinator"])
+    if not st:
+        return
+    items = [("VPP", st.get("vpp")), ("BIRD", "active" if "active" in (st.get("bird"), st.get("bird3")) else "inactive"),
+             ("SNMP", st.get("router-snmp"))]
+    if st.get("routinator") in ("active", "failed", "activating"):
+        items.append(("RPKI", st.get("routinator")))
+    parts = ["%s %s" % (c("●", "32" if v == "active" else "31"), name) for name, v in items]
+    n = alarms_last_hour()
+    if n is not None:
+        parts.append(c("alarmy (1 h): %d" % n, "33" if n else "32"))
+    print("  " + "    ".join(parts))
+    rule()
+
+
+def width():
+    return max(40, min(shutil.get_terminal_size((100, 24)).columns, 110))
+
+
+def rule():
+    print(c("─" * width(), "2"))
+
+
+def screen(*crumbs):
+    """Nowy ekran: czyści terminal i pokazuje, gdzie jesteś (router › obszar › czynność)."""
+    if TTY:
+        sys.stdout.write("\033[H\033[2J")
+        title = " › ".join(("ROUTER",) + crumbs)
+        right = host()
+        inner = width() - 2
+        gap = max(1, inner - len(title) - len(right) - 2)
+        print(c(B["tl"] + B["h"] * inner + B["tr"], "36"))
+        print(c(B["v"], "36") + " " + c(title, "1;37") + " " * gap + c(right, "36") + " " + c(B["v"], "36"))
+        print(c(B["bl"] + B["h"] * inner + B["br"], "36"))
+        return
+    print(c(" › ".join(("router",) + crumbs), "1;36") + c("   %s" % host(), "2"))
+    rule()
+
+
+def live(argv):
+    return os.path.basename(argv[0]) in LIVE_CMDS or bool(LIVE_ARGS & set(argv[1:]))
+
+
 def cmdline(argv):
     return " ".join(shlex.quote(a) for a in argv)
 
 
-def run(argv):
+def run(argv, paged=False):
+    """Uruchamia polecenie. paged: wynik przez less (dłuższy niż ekran = przewijanie, q = koniec)."""
     path = resolve(argv[0])
     if not path:
         print(c("  [BŁĄD] nie znaleziono polecenia: %s (czy usługa jest zainstalowana?)" % argv[0], "31"))
         return 127
+    pager = shutil.which("less") if paged and TTY and not live(argv) else None
     try:
-        return subprocess.call([path] + argv[1:])
+        if not pager:
+            return subprocess.call([path] + argv[1:])
+        p = subprocess.Popen([path] + argv[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.call([pager, "-FRX", "-P", "q = koniec, strzałki/PgUp/PgDn = przewijanie"], stdin=p.stdout)
+        p.stdout.close()
+        return p.wait()
     except KeyboardInterrupt:
         print("\n  (przerwano — powrót do menu)")
         return 130
@@ -5594,18 +7214,31 @@ def collect(action):
     return action["argv"] + pos + action["tail"] + flags, pos
 
 
-def execute(action):
+def execute(action, area=None):
+    if area is not None:
+        screen(area["title"], action["title"])
+        print(c("  %s" % action["desc"], "2"))
+        print()
     argv, pos = collect(action)
-    print("  %s %s" % (c("→ polecenie:", "2"), cmdline(argv)))
+    print("  %s %s" % (c("→ polecenie:", "2"), c(cmdline(argv), "1")))
     if action["preview"]:
+        print()
         print(c("  Podgląd zmian:", "1"))
+        rule()
         run([a.replace("{0}", pos[0]) if pos else a for a in action["preview"]])
+        rule()
     if action["mode"] == "write" and (action["preview"] or action["confirm"]):
         if not yes(c("  Zmienia stan routera. Wykonać?", "33")):
             print("  Przerwano — nic nie zmieniono.")
             return
-    rc = run(argv)
-    print(c("  [koniec, kod %d]" % rc, "2"))
+    rule()
+    rc = run(argv, paged=action["mode"] == "read")
+    rule()
+    if TTY:
+        print(c(" ✔ zakończono ", "1;30;42") + c("  [koniec, kod 0]", "2") if rc == 0
+              else c(" ✘ błąd ", "1;37;41") + c("  [koniec, kod %d]" % rc, "31"))
+    else:
+        print(c("  [koniec, kod %d]" % rc, "32" if rc == 0 else "31"))
 
 
 # --------------------------------------------------------------------------- ekrany
@@ -5629,62 +7262,104 @@ def edit_file(f):
     ed = os.environ.get("EDITOR") or shutil.which("nano") or "vi"
     run([ed, f["path"]])
     print("  Zastosuj zmiany: %s" % f["how"])
+    if TTY:
+        ask(c("  Enter = powrót do listy plików… ", "2"))
 
 
-def files_screen(files):
+def files_screen(files, where=None):
+    msg = ""
     while True:
+        screen(*((where, "Pliki konfiguracyjne") if where else ("Pliki konfiguracyjne",)))
+        if TTY:
+            table(["Nr", "Plik", "Narzędzie", "Zawiera / jak zastosować zmiany"],
+                  [[[(str(i), "1;33")], [(f["path"], "1")], [(f["tool"], "36")], [(f["what"], ""), ("→ " + f["how"], "2;36")]]
+                   for i, f in enumerate(files, 1)], [3, 34, 16, 0], 3)
+        else:
+            show_files(files, numbered=True)
         print()
-        print(c("Pliki konfiguracyjne", "1;36"))
-        show_files(files, numbered=True)
-        print()
+        if msg:
+            print(c("  " + msg, "31"))
+            msg = ""
         ch = ask("  Numer pliku do edycji (Enter = powrót): ").strip()
         if not ch:
             return
         if ch.isdigit() and 1 <= int(ch) <= len(files):
             edit_file(files[int(ch) - 1])
         else:
-            print(c("  Nieprawidłowy wybór: %s" % ch, "31"))
+            msg = "Nieprawidłowy wybór: %s" % ch
+            if not TTY:
+                print(c("  " + msg, "31"))
+                msg = ""
 
 
 def area_menu(area):
+    msg = ""
     while True:
-        print()
-        print(c("%s — %s" % (area["title"], area["desc"]), "1;36"))
+        screen(area["title"])
+        print(c("  %s" % area["desc"], "2"))
         for f in area["files"]:
-            print("  plik: %s  (%s)" % (f["path"], f["tool"]))
+            print(c("  plik: %s  (%s)" % (f["path"], f["tool"]), "2"))
         print()
-        for i, a in enumerate(area["actions"], 1):
+        if TTY:
+            rows = []
+            for i, a in enumerate(area["actions"], 1):
+                name = [(a["title"], "1")]
+                if a["params"]:
+                    name.append(("pyta: " + ", ".join(p["prompt"].split(" (")[0].lower() for p in a["params"]), "2"))
+                kind = [("ZMIANA", "1;33")] if a["mode"] == "write" else [("odczyt", "32")]
+                rows.append([[(str(i), "1;33")], name, kind, [(a["desc"], ""), ("→ " + (a["show"] or shown(a)), "2;36")]])
+            table(["Nr", "Czynność", "Rodzaj", "Opis i polecenie"], rows, [3, 30, 6, 0], 3)
+            print("  %s Pliki konfiguracyjne tego obszaru     %s Powrót" % (c("f", "1;33"), c("0", "1;33")))
+        for i, a in enumerate(area["actions"] if not TTY else (), 1):
             tag = c("[ZMIANA]", "33") if a["mode"] == "write" else c("[odczyt]", "32")
-            print(" %2d  %-44s %s" % (i, a["title"], tag))
+            print(" %2d  %-44s %s" % (i, c(a["title"], "1") if COLOR else a["title"], tag))
             print("       %s" % a["desc"])
             if a["params"]:
                 print("       parametry: %s" % ", ".join(p["prompt"].split(" (")[0].lower() for p in a["params"]))
             print(c("       → %s" % (a["show"] or shown(a)), "2"))
-        print("  f  Pliki konfiguracyjne tego obszaru")
-        print("  0  Powrót")
+        if not TTY:
+            rule()
+            print("  f  Pliki konfiguracyjne tego obszaru     0  Powrót")
+        if msg:
+            print(c("  " + msg, "31"))
+            msg = ""
         ch = ask("Wybierz: ").strip().lower()
         if ch in ("0", "b", ""):
             return
         if ch == "f":
-            files_screen(area["files"])
+            files_screen(area["files"], area["title"])
         elif ch.isdigit() and 1 <= int(ch) <= len(area["actions"]):
-            execute(area["actions"][int(ch) - 1])
-            ask(c("  Naciśnij Enter, aby wrócić do menu… ", "2"))
+            execute(area["actions"][int(ch) - 1], area)
+            ask(c("  Enter = powrót do menu „%s”… " % area["title"], "2"))
         else:
-            print(c("  Nieprawidłowy wybór: %s" % ch, "31"))
+            msg = "Nieprawidłowy wybór: %s" % ch
+            if not TTY:
+                print(c("  " + msg, "31"))
+                msg = ""
 
 
 def main_menu():
     all_files = [f for a in AREAS for f in a["files"]]
+    msg = ""
     while True:
-        print()
-        print(c("router — zarządzanie routerem %s" % host(), "1;36"))
-        print()
-        for i, a in enumerate(AREAS, 1):
-            print("  %d  %-28s %s" % (i, a["title"], c(a["desc"], "2")))
-        print("  f  Pliki konfiguracyjne")
-        print("  q  Wyjście")
+        screen()
+        if TTY:
+            status_bar()
+            rows = [[[(str(i), "1;33")], [(a["title"], "1")], [(a["desc"], "2")]] for i, a in enumerate(AREAS, 1)]
+            rows += [[[("f", "1;33")], [("Pliki konfiguracyjne", "1")], [("wszystkie pliki: co zawierają, jak zastosować zmiany", "2")]],
+                     [[("q", "1;33")], [("Wyjście", "1")], [("", "")]]]
+            table(["Nr", "Obszar", "Co tam jest"], rows, [3, 28, 0], 2)
+        else:
+            for i, a in enumerate(AREAS, 1):
+                print("  %d  %-28s %s" % (i, a["title"], c(a["desc"], "2")))
+            print()
+            print("  f  Pliki konfiguracyjne")
+            print("  q  Wyjście")
+            rule()
         print(c("  Autor: " + AUTOR, "2"))
+        if msg:
+            print(c("  " + msg, "31"))
+            msg = ""
         ch = ask("Wybierz: ").strip().lower()
         if ch in ("q", "quit", "exit"):
             return 0
@@ -5693,7 +7368,10 @@ def main_menu():
         elif ch.isdigit() and 1 <= int(ch) <= len(AREAS):
             area_menu(AREAS[int(ch) - 1])
         else:
-            print(c("  Nieprawidłowy wybór: %s" % ch, "31"))
+            msg = "Nieprawidłowy wybór: %s" % ch
+            if not TTY:
+                print(c("  " + msg, "31"))
+                msg = ""
 
 
 def help_text():
@@ -5804,7 +7482,7 @@ do_check() {
   printf '\n%s== Usługi ==%s\n' "$c_hdr" "$c_off"
   local u
   [[ -e /etc/router/firewall.enabled ]] || say "router-fw: firewall nieaktywny (aktywacja: router-fw enable) — usługa celowo nie działa"
-  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd sshd-dataplane snmpd-mgmt; do
+  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd sshd-dataplane snmpd-mgmt router-snmp routinator router-rpki-link; do
     if systemctl is-active --quiet "$u"; then ok "$u: active"; else warn "$u: $(systemctl is-active "$u" 2>/dev/null || true)"; fi
   done
 
@@ -6120,6 +7798,8 @@ Reguły są w tabeli **raw** (łańcuch `PREROUTING`): pakiet jest odrzucany zar
 
 **Nowa zaufana sieć:** dopisz linię `-A PREROUTING -s <prefiks> -m comment --comment "opis" -j ACCEPT` nad regułami `DROP` w obu plikach, przeładuj oba. Żeby miała też SNMP: dopisz `rocommunity <community> <prefiks>` w `/etc/snmp/snmpd.conf` (blok „zaufane sieci”) i `systemctl restart snmpd-dataplane`.
 
+**Monitoring (SNMP):** `router-snmp walk` pokazuje wszystko, co widzi LibreNMS, Zabbix albo Cacti: sesje BGP, zdrowie VPP, FIB vs BIRD, firewall, guard, RPKI, usługi, RAID, SMART, temperatury. Dane zbiera `router-snmp.service` co 30 s; gdy `rvDataAge` rośnie, sprawdź `journalctl -u router-snmp`. Szablony i plik MIB: katalog `templates/` w repozytorium instalatora.
+
 **Uwaga — nie odetnij się:** przed `netfilter-persistent reload` upewnij się, że adres, z którego jesteś po SSH, jest w zaufanych sieciach.
 
 **Ping i mtr na adresy w VPP obsługuje VPP, nie kernel** — limity iptables chronią kernel (eth2 i ruch przekazany przez VPP do Linuksa), ale nie ping obsłużony w VPP.
@@ -6151,7 +7831,7 @@ Plik `/etc/router/notify.conf` (tylko root; zawiera hasło SMTP, nie trafia do g
 ```
 ALERT_EMAILS="noc@firma.pl, dyzurny@firma.pl"
 SMTP_HOST=smtp.firma.pl   SMTP_PORT=587   SMTP_SECURITY=starttls   SMTP_USER=...   SMTP_PASS="..."
-MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"
+MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL RPKI OTHER"
 MAIL_SEND_CLEAR=yes        # także maile o zakończeniu zdarzenia
 MAIL_MAX_SEV=5             # poziomy 1..5 (1 = najpoważniejsze)
 MAIL_MIN_INTERVAL=60       # zdarzenia z 60 s idą jednym mailem
@@ -6190,6 +7870,22 @@ birdc configure check                # kontrola składni po edycji /etc/bird/
 birdc configure                      # wczytanie zmian bez restartu (sesje zostają)
 ```
 BIRD działa w netns `dataplane` i startuje dopiero po odtworzeniu interfejsów i firewalla. Restart VPP restartuje też BIRD (sesje wstają od nowa). Logi: `/var/log/router/bird.log`.
+
+### 8a. RPKI (Routinator, `router-rpki`)
+
+**Domyślnie nic nie jest odrzucane.** BIRD sprawdza trasy w RPKI, a Ty widzisz, co zostałoby odrzucone. Gdzie RPKI działa, decydujesz w filtrach BGP: `rpki_filter();` na początku filtru importu wybranych sesji (np. tylko globalne T1). Kiedy zaczyna odrzucać, decydujesz poleceniem:
+
+```
+router-rpki                          # stan: walidator, połączenie BIRD, VRP, tryb, liczba INVALID
+router-rpki invalid --count          # ile tras jest INVALID
+router-rpki invalid <sesja>          # trasy INVALID od jednej sesji
+router-rpki enable                   # ODRZUCAJ INVALID w sesjach z rpki_filter() (bez zrywania sesji)
+router-rpki disable                  # powrót do podglądu (stan domyślny)
+```
+
+Przykład filtru: `filter import_t1 { rpki_filter(); ...; accept; }`, w kanale sesji zalecane `import table on`. Funkcja `rpki_invalid()` służy do własnych reguł i podglądu (`birdc show route where rpki_invalid()`).
+
+**Awaria walidatora:** po 5 min przychodzi alarm `%RPKI-3-DOWN`. Do 1 h BIRD używa ostatnich danych, potem tablice ROA są puste, więc **nic nie jest odrzucane**. Po powrocie walidatora (`%RPKI-5-UP`) trasy są przeliczane same. Diagnostyka: `systemctl status routinator router-rpki-link`, `birdc show protocols all rpki_routinator`. Pełny opis: `docs/rpki.md` w repozytorium instalatora.
 
 ---
 
@@ -6257,6 +7953,8 @@ UPGRADE_PROGRAMS=(
   "router-guard|/opt/router/bin/router-guard|755|prog_router_guard|"
   "router|/opt/router/bin/router|755|prog_router|"
   "router-top|/opt/router/bin/router-top|755|prog_router_top|"
+  "router-snmp|/opt/router/bin/router-snmp|755|prog_router_snmp|router-snmp.service"
+  "router-rpki|/opt/router/bin/router-rpki|755|prog_router_rpki|"
   "router-alert|/opt/router/bin/router-alert|755|prog_router_alert|"
   "router-bootcheck|/opt/router/bin/router-bootcheck|755|prog_router_bootcheck|"
   "mdadm-alert|/opt/router/bin/mdadm-alert|755|prog_mdadm_alert|"
@@ -6320,6 +8018,60 @@ router_logrotate() {
 }
 EOF
   rm -f /etc/logrotate.d/router-monitor
+}
+
+# Blok snmpd.conf: dane router-snmp (ROUTER-VPP-MIB i BGP4-MIB) przez pass_persist
+snmp_ext_block() {
+  cat <<'EOF'
+# router-snmp: BGP, zdrowie VPP, firewall, guard, RPKI, RAID, dyski (ROUTER-VPP-MIB, BGP4-MIB); szablony: templates/ instalatora
+pass_persist .1.3.6.1.4.1.8072.9999.9999.630 /opt/router/bin/router-snmp pass .1.3.6.1.4.1.8072.9999.9999.630
+pass_persist .1.3.6.1.2.1.15 /opt/router/bin/router-snmp pass .1.3.6.1.2.1.15
+EOF
+}
+
+# router-snmp: usługa kolektora, blok pass_persist w obu snmpd, IF-MIB w dataplane tylko z VPP (instalacja i upgrade_script)
+snmp_router_ext() {
+  local f changed=0
+  put_file /etc/systemd/system/router-snmp.service "router-snmp collect: dane dla SNMP co 30 s (/run/router-snmp/cache.json)" <<'EOF'
+[Unit]
+Description=Router: dane dla SNMP (BGP, VPP, firewall, guard, RPKI, RAID, dyski)
+Documentation=file:/opt/router/README.md
+After=vpp.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/router/bin/router-snmp collect
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  printf '[Unit]\nWants=router-snmp.service\n' \
+    | put_file /etc/systemd/system/router.target.d/40-snmp.conf "router.target obejmuje router-snmp"
+  for f in /etc/snmp/snmpd.conf /etc/snmp/snmpd-mgmt.conf; do
+    [[ -f $f ]] || continue
+    grep -q 'router-snmp pass' "$f" && continue
+    snmp_ext_block >>"$f"
+    say "dopisano pass_persist router-snmp do $f"
+    changed=1
+  done
+  # IF-MIB w dataplane wyłącznie z vpp-snmp-agent (AgentX); własne ifTable snmpd pokazywałoby tapy linux-cp
+  f=/etc/systemd/system/snmpd-dataplane.service
+  if [[ -f $f ]] && grep -q -- '-I -smux,mteTrigger,mteTriggerConf -f' "$f"; then
+    sed -i.bak 's/-I -smux,mteTrigger,mteTriggerConf -f/-I -smux,mteTrigger,mteTriggerConf,interfaces,ifTable,ifXTable -f/' "$f" && rm -f "$f.bak"
+    say "snmpd-dataplane: IF-MIB tylko z vpp-snmp-agent"
+    changed=1
+  fi
+  systemctl daemon-reload
+  systemctl enable --now router-snmp.service >/dev/null 2>&1 || warn "router-snmp nie wystartował — journalctl -u router-snmp"
+  man_add service router-snmp.service "kolektor danych SNMP (BGP, VPP, firewall, guard, RPKI, RAID, dyski)"
+  if ((changed)); then
+    systemctl try-restart snmpd-dataplane.service snmpd-mgmt.service 2>/dev/null || warn "snmpd nie zrestartował się — journalctl -u snmpd-dataplane"
+    systemctl try-restart vpp-snmp-agent.service 2>/dev/null || true
+  fi
+  ok "router-snmp: ROUTER-VPP-MIB (.1.3.6.1.4.1.8072.9999.9999.630) i BGP4-MIB; podgląd: router-snmp walk"
 }
 
 do_upgrade() {
@@ -6399,6 +8151,9 @@ do_upgrade() {
   ok "podmieniono: ${changed[*]}   (poprzednie wersje: $bdir)"
   migrate_logdir
   router_logrotate
+  ln -sfn /opt/router/bin/router-snmp /usr/local/sbin/router-snmp
+  [[ -e /opt/router/bin/router-rpki ]] && ln -sfn /opt/router/bin/router-rpki /usr/local/sbin/router-rpki
+  snmp_router_ext
 
   # 4. restart tylko usług, których program się zmienił (nigdy VPP ani BIRD)
   for unit in "${restart[@]}"; do
@@ -9165,6 +10920,7 @@ master agentx
 agentXSocket tcp:localhost:705
 # LibreNMS: aplikacja mdadm (stan macierzy RAID)
 extend mdadm /etc/snmp/extend/mdadm
+$(snmp_ext_block)
 EOF
   local ldir=$SRC_DIR/librenms-agent
   mkdir -p "$ldir"
@@ -9182,7 +10938,7 @@ After=netns-dataplane.service
 [Service]
 Type=simple
 NetworkNamespacePath=/var/run/netns/dataplane
-ExecStart=/usr/sbin/snmpd -LOw -u Debian-snmp -g vpp -I -smux,mteTrigger,mteTriggerConf -f -p /run/snmpd-dataplane.pid
+ExecStart=/usr/sbin/snmpd -LOw -u Debian-snmp -g vpp -I -smux,mteTrigger,mteTriggerConf,interfaces,ifTable,ifXTable -f -p /run/snmpd-dataplane.pid
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 
@@ -9226,7 +10982,11 @@ EOF
   systemctl enable --now vpp-snmp-agent.service || warn "vpp-snmp-agent nie wystartował (sprawdź po restarcie)"
   man_add service snmpd-dataplane.service "snmpd w netns dataplane (UDP 161)"
   man_add service vpp-snmp-agent.service "AgentX z licznikami VPP"
-  ok "SNMP gotowe (community w $ENV_FILE)"
+  prog_router_snmp | put_file /opt/router/bin/router-snmp "router-snmp: dane routera dla SNMP (BGP, VPP, firewall, guard, RPKI, RAID, dyski)" 755
+  ln -sfn /opt/router/bin/router-snmp /usr/local/sbin/router-snmp
+  [[ -e /opt/router/bin/router-rpki ]] && ln -sfn /opt/router/bin/router-rpki /usr/local/sbin/router-rpki
+  snmp_router_ext
+  ok "SNMP gotowe (community w $ENV_FILE); szablony LibreNMS/Zabbix/Cacti: katalog templates/ instalatora"
 }
 
 st_sflow() {
@@ -9934,7 +11694,7 @@ EOF
 
 # Czy adres sesji SSH, z której działa instalator, jest w zaufanych sieciach (żeby nie odciąć dostępu)
 ssh_client_trusted() {
-  local ip=${SSH_CLIENT%% *}
+  local ip=${SSH_CLIENT:-}; ip=${ip%% *}
   [[ -z $ip ]] && ip=$(who -m 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
   [[ -z $ip ]] && return 2
   python3 - "$ip" "${TRUSTED_NETS[@]%%|*}" "${TRUSTED_NETS6[@]%%|*}" <<'PYEOF'
@@ -10063,6 +11823,7 @@ sysName $(hostname -f 2>/dev/null || hostname)
 sysLocation R630 BGP router
 sysContact noc
 extend mdadm /etc/snmp/extend/mdadm
+$(snmp_ext_block)
 EOF
     put_file /etc/systemd/system/snmpd-mgmt.service "snmpd w przestrzeni głównej (port zarządzający)" <<'EOF'
 [Unit]
@@ -10088,6 +11849,173 @@ EOF
   printf '[Unit]\nWants=sshd-dataplane.service snmpd-mgmt.service\n' \
     | put_file /etc/systemd/system/router.target.d/30-access.conf "router.target obejmuje sshd-dataplane i snmpd-mgmt"
   systemctl daemon-reload
+}
+
+# --- RPKI: Routinator (główna przestrzeń, dane przez port zarządzający) + BIRD w dataplane przez łącze veth
+RPKI_LINK_HOST=169.254.31.1     # rpki0 (główna przestrzeń): tu słucha RTR Routinatora
+RPKI_LINK_DP=169.254.31.2       # rpki1 (netns dataplane): stąd łączy się BIRD
+RPKI_RTR_PORT=3323
+
+rpki_bird_conf() {
+  cat <<EOF
+# install-router.sh — walidacja RPKI (Routinator przez RTR). Plik generowany: zmiany giną przy ponownej instalacji.
+# Dokumentacja: /etc/router/INSTRUKCJA.md, rozdział RPKI.  Stan: router-rpki.
+#
+# Użycie w filtrze importu sesji BGP (tylko tam, gdzie RPKI ma działać, np. globalne T1):
+#     filter import_t1 { rpki_filter(); ... accept; }
+# rpki_filter() odrzuca trasę INVALID tylko po "router-rpki enable"; domyślnie nic nie odrzuca.
+# rpki_invalid() = true, gdy trasa jest INVALID (podgląd: birdc show route where rpki_invalid()).
+
+roa4 table rpki4;
+roa6 table rpki6;
+
+protocol rpki rpki_routinator {
+  roa4 { table rpki4; };
+  roa6 { table rpki6; };
+  remote $RPKI_LINK_HOST port $RPKI_RTR_PORT;
+  retry keep 90;
+  refresh keep 900;
+  expire keep 3600;      # bez walidatora: ostatnie dane najwyżej 1 h, potem tablice ROA puste = nic nie jest odrzucane
+}
+
+include "/etc/bird/rpki-mode.conf";     # define RPKI_ENFORCE = 0 | 1  (router-rpki enable / disable)
+
+function rpki_invalid()
+{
+  if ! defined(bgp_path) then return false;
+  if net.type = NET_IP4 then return roa_check(rpki4, net, bgp_path.last_nonaggregated) = ROA_INVALID;
+  if net.type = NET_IP6 then return roa_check(rpki6, net, bgp_path.last_nonaggregated) = ROA_INVALID;
+  return false;
+}
+
+function rpki_filter()
+{
+  if RPKI_ENFORCE = 1 then {
+    if rpki_invalid() then reject;
+  }
+}
+EOF
+}
+
+st_rpki() {
+  say "repozytorium NLnet Labs (Routinator)"
+  curl -fsSL https://packages.nlnetlabs.nl/aptkey.asc | gpg --dearmor --yes -o /usr/share/keyrings/nlnetlabs-archive-keyring.gpg
+  man_add file /usr/share/keyrings/nlnetlabs-archive-keyring.gpg "klucz repozytorium NLnet Labs"
+  echo "deb [signed-by=/usr/share/keyrings/nlnetlabs-archive-keyring.gpg] https://packages.nlnetlabs.nl/linux/debian/ $(. /etc/os-release; echo "$VERSION_CODENAME") main" \
+    | put_file /etc/apt/sources.list.d/nlnetlabs.list "repozytorium apt NLnet Labs (Routinator)"
+  apt-get update
+  apt-get install "${APT_OPTS[@]}" routinator
+  man_add pkg "routinator $(dpkg-query -W -f='${Version}' routinator)" "walidator RPKI (NLnet Labs), serwer RTR dla BIRD"
+
+  # łącze veth: Routinator w głównej przestrzeni (pobiera dane przez port zarządzający), BIRD w dataplane
+  put_file /etc/systemd/system/router-rpki-link.service "łącze veth rpki0 ↔ rpki1 (dataplane) dla RTR" <<EOF
+[Unit]
+Description=Router: łącze RTR między Routinatorem (przestrzeń główna) a BIRD (netns dataplane)
+Documentation=file:/etc/router/INSTRUKCJA.md
+Requires=netns-dataplane.service
+BindsTo=netns-dataplane.service
+After=netns-dataplane.service
+Before=routinator.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/sbin/ip link del rpki0
+ExecStart=/usr/sbin/ip link add rpki0 type veth peer name rpki1 netns dataplane
+ExecStart=/usr/sbin/ip addr add $RPKI_LINK_HOST/30 dev rpki0
+ExecStart=/usr/sbin/ip link set rpki0 up
+ExecStart=/usr/sbin/ip -n dataplane addr add $RPKI_LINK_DP/30 dev rpki1
+ExecStart=/usr/sbin/ip -n dataplane link set rpki1 up
+ExecStop=-/usr/sbin/ip link del rpki0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  put_file /etc/systemd/system/routinator.service.d/10-router.conf "Routinator: start po łączu RTR, limit pamięci, restart po awarii" <<'EOF'
+[Unit]
+Requires=router-rpki-link.service
+After=router-rpki-link.service network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=on-failure
+RestartSec=10
+MemoryMax=4G
+# walidacja ma niższy priorytet niż BIRD, snmpd i system: najwyżej 2 rdzenie, CPU i dysk tylko z wolnego czasu
+CPUQuota=200%
+Nice=15
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+EOF
+  # konfiguracja pakietu zostaje, zmieniamy tylko adresy nasłuchu (RTR na łączu veth, HTTP tylko lokalnie)
+  local rc=/etc/routinator/routinator.conf key val
+  [[ -f $rc ]] || { mkdir -p /etc/routinator; : >"$rc"; }
+  [[ -e $BACKUP_DIR$rc ]] || { mkdir -p "$BACKUP_DIR/etc/routinator"; cp -a "$rc" "$BACKUP_DIR$rc"; }
+  # validation-threads: walidacja co 10 min nie zajmuje wszystkich rdzeni systemowych naraz (BIRD, SNMP mają zapas)
+  for key in rtr-listen http-listen validation-threads; do
+    val="[\"$RPKI_LINK_HOST:$RPKI_RTR_PORT\"]"
+    [[ $key == http-listen ]] && val='["127.0.0.1:8323"]'
+    [[ $key == validation-threads ]] && val=2
+    if grep -qE "^#?[[:space:]]*$key[[:space:]]*=" "$rc"; then
+      sed -i -E "s|^#?[[:space:]]*$key[[:space:]]*=.*|$key = $val|" "$rc"
+    else
+      echo "$key = $val" >>"$rc"
+    fi
+  done
+  man_add file "$rc" "Routinator: RTR na $RPKI_LINK_HOST:$RPKI_RTR_PORT (veth do dataplane), HTTP/metryki 127.0.0.1:8323"
+
+  # BIRD: tablice ROA, połączenie RTR, funkcje rpki_invalid() / rpki_filter(); tryb nie jest nadpisywany
+  rpki_bird_conf | put_file /etc/bird/conf.d/05-rpki.conf "BIRD: RPKI (Routinator), rpki_invalid(), rpki_filter()" 640
+  if [[ ! -f /etc/bird/rpki-mode.conf ]]; then
+    printf '%s\n' "# router-rpki — NIE edytuj ręcznie, przełączaj: router-rpki enable | router-rpki disable" \
+      "# 0 = trasy INVALID przechodzą (tylko podgląd: router-rpki invalid), 1 = rpki_filter() je odrzuca" \
+      "define RPKI_ENFORCE = 0;" | put_file /etc/bird/rpki-mode.conf "tryb RPKI: 0 = tylko podgląd (domyślnie), 1 = odrzucanie" 640
+  else
+    say "tryb RPKI bez zmian: $(grep -o 'RPKI_ENFORCE = [01]' /etc/bird/rpki-mode.conf || echo '?')"
+  fi
+  chown root:bird /etc/bird/conf.d/05-rpki.conf /etc/bird/rpki-mode.conf
+
+  prog_router_rpki | put_file /opt/router/bin/router-rpki "router-rpki: stan RPKI, trasy INVALID, przełącznik odrzucania" 755
+  ln -sfn /opt/router/bin/router-rpki /usr/local/sbin/router-rpki
+  put_file /etc/systemd/system/router-rpki-check.service "router-rpki check --log (alarmy RPKI, liczba INVALID)" <<'EOF'
+[Unit]
+Description=Router: kontrola RPKI (walidator, połączenie BIRD, trasy INVALID)
+Documentation=file:/etc/router/INSTRUKCJA.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/bin/router-rpki check --log
+EOF
+  put_file /etc/systemd/system/router-rpki-check.timer "co 5 minut: kontrola RPKI" <<'EOF'
+[Unit]
+Description=Router: co 5 minut kontrola RPKI
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+  printf '[Unit]\nWants=router-rpki-link.service routinator.service router-rpki-check.timer\n' \
+    | put_file /etc/systemd/system/router.target.d/50-rpki.conf "router.target obejmuje Routinator i kontrolę RPKI"
+  systemctl daemon-reload
+  systemctl enable --now router-rpki-link.service || warn "łącze rpki0/rpki1 nie powstało — journalctl -u router-rpki-link"
+  systemctl enable routinator.service >/dev/null 2>&1 || true
+  systemctl restart routinator.service || warn "Routinator nie wystartował — journalctl -u routinator"
+  systemctl enable --now router-rpki-check.timer >/dev/null 2>&1 || warn "nie włączono router-rpki-check.timer"
+  man_add service router-rpki-link.service "veth rpki0 ($RPKI_LINK_HOST) ↔ rpki1 w dataplane ($RPKI_LINK_DP)"
+  man_add service routinator.service "walidator RPKI, RTR na $RPKI_LINK_HOST:$RPKI_RTR_PORT"
+  man_add service router-rpki-check.timer "co 5 min: router-rpki check --log → %RPKI-3-DOWN / %RPKI-5-UP"
+
+  say "bird -p (kontrola składni z RPKI)"
+  if bird -p -c /etc/bird/bird.conf; then
+    birdc configure >/dev/null 2>&1 || warn "birdc configure nie powiódł się — BIRD działa? (journalctl -u $(bird_unit))"
+  else
+    warn "konfiguracja BIRD z RPKI nie przechodzi kontroli — sprawdź /etc/bird/conf.d/05-rpki.conf"
+  fi
+  ok "RPKI: Routinator działa, BIRD sprawdza trasy; odrzucanie WYŁĄCZONE (router-rpki enable). Pierwsze pobranie danych trwa 5–15 min."
 }
 
 st_system() {
@@ -10181,7 +12109,7 @@ EOF
   done
   local rc=0; ssh_client_trusted || rc=$?
   if ((rc == 1)); then
-    warn "Twoja sesja SSH (${SSH_CLIENT%% *}) NIE jest w TRUSTED_NETS — reguły portu zarządzającego odcięłyby dostęp."
+    warn "Twoja sesja SSH (${SSH_CLIENT:-konsola}) NIE jest w TRUSTED_NETS — reguły portu zarządzającego odcięłyby dostęp."
     warn "Zapisano /etc/iptables/rules.v4, ale NIE wczytano i wyłączono netfilter-persistent. Dopisz swój adres i: --from 25"
     systemctl disable netfilter-persistent >/dev/null 2>&1 || true
   else
@@ -10455,6 +12383,7 @@ Po restarcie serwera wstają same, w tej kolejności:
 | 7 | `hsflowd.service` | eksport sFlow do kolektora | — |
 | 8 | `router-monitor.service` | alarmy obciążenia w czasie rzeczywistym | restart po 5 s |
 | 9 | `router-notify.service` | wysyła alarmy e-mailem (kolejka `/var/spool/router-notify`) | restart po 10 s |
+| — | `router-snmp.service` | co 30 s zbiera dane dla SNMP (BGP, VPP, firewall, guard, RPKI, RAID, dyski) do `/run/router-snmp/cache.json`; podgląd: `router-snmp walk` | restart po 10 s |
 | 10 | `router-bootcheck.service` | po starcie: wykrywa nieczysty restart / kernel panic, sprawdza usługi, wynik do logu i e-mailem | przy starcie i zamknięciu systemu |
 | — | `router-ifaces-check.timer` | co 5 min: czy VPP zgadza się z ifaces.conf (rozjazd → alarm) | — |
 | — | `mdmonitor` / `smartd` | zdarzenia RAID / zdrowie dysków | — |
@@ -10644,7 +12573,7 @@ SMTP_SECURITY=starttls        # starttls (587) | ssl (465) | none (25)
 SMTP_USER=router@firma.pl
 SMTP_PASS="hasło"
 SMTP_FROM=router@firma.pl
-MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL OTHER"
+MAIL_SEND="CRASH SERVICES BOOT RAID DISKS NIC_FW VPP_STATE VPP_DROPS VPP_LOAD VPP_PUNT SYS_CPU IFACES FIREWALL RPKI OTHER"
 MAIL_SEND_CLEAR=yes           # yes = wysyłaj też zakończenia zdarzeń (np. LOAD_NORMAL z czasem trwania)
 MAIL_MAX_SEV=5                # wysyłane poziomy 1..5
 MAIL_MIN_INTERVAL=60          # zdarzenia w ciągu 60 s idą jednym mailem
@@ -11089,7 +13018,7 @@ Instalator tworzy w VPP loopback **`loop0`** z adresem `LOOP0_ADDR` (domyślnie 
 | Usługa | Gdzie słucha | Co daje |
 |---|---|---|
 | SSH (`sshd-dataplane`) | `loop0:22` w `dataplane`, osobny `sshd_config_dataplane`, hasło lub klucz SSH | logowanie przez adres `loop0`, także gdy port zarządzający nie działa |
-| SNMP (`snmpd-dataplane`) | `loop0:161` i `127.0.0.1:161` w `dataplane` | liczniki portów i VLAN-ów z VPP (LibreNMS po adresie `loop0`) |
+| SNMP (`snmpd-dataplane`) | `loop0:161` i `127.0.0.1:161` w `dataplane` | liczniki portów i VLAN-ów z VPP (LibreNMS po adresie `loop0`) oraz dane `router-snmp`: BGP, zdrowie VPP, FIB vs BIRD, firewall, guard, RPKI, RAID, SMART (ROUTER-VPP-MIB, BGP4-MIB) |
 | SNMP (`snmpd-mgmt`) | wszystkie adresy portu zarządzającego (przestrzeń główna) | host: interfejsy Linuksa, CPU, dyski, RAID |
 | SSH (zwykły `sshd`) | port zarządzający (przestrzeń główna) | droga awaryjna, bez zmian |
 
@@ -11351,6 +13280,7 @@ run_stage 23 "Ochrona przed odbiciami (router-guard)"  st_guard
 run_stage 24 "Logi w plikach (rsyslog → /var/log/router)" st_logs
 run_stage 25 "System: czas, DNS, iptables (ochrona CPU)" st_system
 run_stage 26 "SSH i SNMP na loop0 (dataplane) + SNMP portu zarządzającego" st_loop0_access
+run_stage 27 "RPKI: Routinator + walidacja w BIRD (odrzucanie wyłączone)" st_rpki
 
 printf '\n%s[%s] INSTALACJA ZAKOŃCZONA.%s\n' "$c_ok" "$(now)" "$c_off"
 cat <<EOF
