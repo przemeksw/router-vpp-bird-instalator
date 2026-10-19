@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.0"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.1"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -7138,19 +7138,23 @@ prog_router() {
   router                        menu: numer obszaru → lista czynności z opisem i wywołaniem → numer czynności
   router help                   lista obszarów i skrótów
   router files [obszar]         pliki konfiguracyjne: który plik, które narzędzie go czyta, jak zastosować zmiany
+  router dataplane              powłoka bash w netns dataplane (ip netns exec dataplane bash); exit = powrót
   router <skrót> [argumenty]    uruchom narzędzie wprost, np. router ifaces diff, router fw apply, router guard status
-  skróty:  ifaces fw guard top notify check update bird
+  skróty:  ifaces fw guard top notify check update bird arp
 
 Czynności zmieniające stan pokazują podgląd i pytają o potwierdzenie; zawsze widać też równoważne polecenie.
-W menu: numer = wybór, 0 = powrót, f = pliki konfiguracyjne, q = wyjście.
+W menu: numer = wybór, 0 = powrót, f = pliki konfiguracyjne, d = powłoka w dataplane, q = wyjście.
+Menu uruchomione z powłoki w dataplane pokazuje to w nagłówku (wyjście z dataplane: q, potem exit).
 """
 import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 try:
@@ -7164,6 +7168,7 @@ COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 TTY = sys.stdout.isatty() and sys.stdin.isatty()          # ekran: czyszczenie i przewijanie tylko na terminalu
 LIVE_ARGS = {"-w", "-f", "--watch", "--follow"}           # czynności na żywo: bez przewijania (less), Ctrl+C wraca
 LIVE_CMDS = {"router-top", "tail", "watch", "less", "vi", "vim", "nano"}
+NETNS = "dataplane"
 
 
 def c(text, code):
@@ -7363,6 +7368,10 @@ AREAS = [
          A("Błędy węzłów", "liczniki błędów (w tym synack-guard)", ["vppctl", "show", "errors"]),
          A("Obciążenie węzłów", "wektory na wywołanie i cykle (runtime)", ["vppctl", "show", "runtime"]),
          A("Pary linux-cp", "interfejsy VPP sparowane z Linuksem w dataplane", ["vppctl", "show", "lcp"]),
+         A("Pokaż ARP (VPP)", "sąsiedzi IPv4 (ARP) i IPv6 (ND) w VPP: adres, MAC, interfejs, flagi — to, czym VPP przełącza ruch",
+           ["vppctl", "show", "ip", "neighbors"]),
+         A("Pokaż ARP (Linux w dataplane)", "tablica sąsiadów Linuksa w netns dataplane (BIRD, SSH, SNMP przez linux-cp)",
+           ["ip", "netns", "exec", NETNS, "ip", "neigh", "show"]),
          A("Układ rdzeni i maksimum workerów", "ile workerów jest teraz, ile można i jak rozłożą się rdzenie (nic nie zmienia)",
            ["install-router", "set_workers", "--dry-run"]),
          A("Zmień liczbę workerów", "bez reinstalacji: GRUB (izolacja rdzeni) + startup.conf; działa po restarcie serwera",
@@ -7389,7 +7398,8 @@ AREAS = [
 ]
 
 ALIASES = {"ifaces": ["router-ifaces"], "fw": ["router-fw"], "guard": ["router-guard"], "top": ["router-top"],
-           "notify": ["router-notify"], "check": ["install-router", "--check"], "update": ["install-router"], "bird": ["birdc"]}
+           "notify": ["router-notify"], "check": ["install-router", "--check"], "update": ["install-router"], "bird": ["birdc"],
+           "arp": ["vppctl", "show", "ip", "neighbors"]}
 
 
 # --------------------------------------------------------------------------- uruchamianie
@@ -7488,6 +7498,68 @@ def status_bar():
         parts.append(c("alarmy (1 h): %d" % n, "33" if n else "32"))
     print("  " + "    ".join(parts))
     rule()
+
+
+def in_dataplane():
+    """Czy menu działa w netns dataplane (np. uruchomione z powłoki „ip netns exec dataplane bash”).
+    Tak samo jak „ip netns identify”: ten sam namespace sieciowy = to samo urządzenie i i-węzeł nsfs."""
+    forced = os.environ.get("ROUTER_MENU_NETNS")              # testy: udawany namespace
+    if forced is not None:
+        return forced == NETNS
+    try:
+        me, dp = os.stat("/proc/self/ns/net"), os.stat("/run/netns/" + NETNS)
+    except OSError:
+        return False
+    return (me.st_dev, me.st_ino) == (dp.st_dev, dp.st_ino)
+
+
+def dataplane_note():
+    """Ostrzeżenie w menu głównym, gdy menu działa w netns dataplane."""
+    print(c("  ⚑ Jesteś w netns dataplane — polecenia działają bez „ip netns exec dataplane”. "
+            "Wyjście z dataplane: q, potem exit.", "1;33"))
+    rule()
+
+
+def dataplane_shell():
+    """Powłoka bash w netns dataplane; exit wraca do menu. Znak zachęty zaczyna się od (dataplane)."""
+    screen("Powłoka w dataplane")
+    if in_dataplane():
+        print(c("  Już jesteś w netns dataplane — polecenia działają bez „ip netns exec dataplane”.", "33"))
+        print("  Wyjście z dataplane: zakończ menu (q) i wpisz exit.")
+        return 0
+    ip = resolve("ip")
+    if not ip:
+        print(c("  [BŁĄD] nie znaleziono polecenia: ip", "31"))
+        return 127
+    argv = ["ip", "netns", "exec", NETNS, "bash"]
+    print("  %s %s" % (c("→ polecenie:", "2"), c(cmdline(argv), "1")))
+    print("  Polecenia w tej powłoce działają w dataplane (ip a, ip route, ping, ss, iptables) — bez „ip netns exec”.")
+    print("  " + c("exit", "1;33") + " (albo Ctrl+D) = wyjście z dataplane i powrót do menu.")
+    rule()
+    # rcfile: zwykłe ustawienia basha + znak zachęty „(dataplane)”; zmienna ROUTER_NETNS dla skryptów użytkownika
+    fd, rc = tempfile.mkstemp(prefix="router-dataplane-", suffix=".bashrc")
+    with os.fdopen(fd, "w") as f:
+        f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n[ -f ~/.bashrc ] && . ~/.bashrc\n'
+                'export ROUTER_NETNS=%s\nPS1="\\[\\e[1;33m\\](%s)\\[\\e[0m\\] $PS1"\n'
+                'echo "  netns %s — exit = powrót do menu router"\n' % (NETNS, NETNS, NETNS))
+    # Ctrl+C w powłoce trafia do całej grupy procesów: menu go ignoruje, powłoka i jej polecenia dostają domyślną obsługę
+    sys.stdout.flush()
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        code = subprocess.call([ip] + argv[1:] + ["--rcfile", rc, "-i"],
+                               preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+    except OSError as e:
+        print(c("  [BŁĄD] %s" % e, "31"))
+        code = 126
+    finally:
+        signal.signal(signal.SIGINT, old)
+        try:
+            os.unlink(rc)
+        except OSError:
+            pass
+    rule()
+    print("  Opuszczono netns dataplane — powrót do menu.")
+    return code
 
 
 def width():
@@ -7617,7 +7689,7 @@ def execute(action, area=None):
 
 # --------------------------------------------------------------------------- ekrany
 def host():
-    return socket.gethostname()
+    return socket.gethostname() + (" [%s]" % NETNS if in_dataplane() else "")
 
 
 def show_files(files, numbered=False):
@@ -7717,17 +7789,26 @@ def main_menu():
     msg = ""
     while True:
         screen()
+        here = in_dataplane()
+        dp_desc = ("jesteś już w dataplane — wyjście: q, potem exit" if here
+                   else "ip netns exec dataplane bash: polecenia bez netns; exit = powrót do menu")
         if TTY:
             status_bar()
+            if here:
+                dataplane_note()
             rows = [[[(str(i), "1;33")], [(a["title"], "1")], [(a["desc"], "2")]] for i, a in enumerate(AREAS, 1)]
             rows += [[[("f", "1;33")], [("Pliki konfiguracyjne", "1")], [("wszystkie pliki: co zawierają, jak zastosować zmiany", "2")]],
+                     [[("d", "1;33")], [("Przejdź do netns dataplane", "1")], [(dp_desc, "1;33" if here else "2")]],
                      [[("q", "1;33")], [("Wyjście", "1")], [("", "")]]]
             table(["Nr", "Obszar", "Co tam jest"], rows, [3, 28, 0], 2)
         else:
+            if here:
+                dataplane_note()
             for i, a in enumerate(AREAS, 1):
                 print("  %d  %-28s %s" % (i, a["title"], c(a["desc"], "2")))
             print()
             print("  f  Pliki konfiguracyjne")
+            print("  d  Przejdź do netns dataplane  %s" % c(dp_desc, "2"))
             print("  q  Wyjście")
             rule()
         print(c("  Autor: " + AUTOR, "2"))
@@ -7739,6 +7820,10 @@ def main_menu():
             return 0
         if ch == "f":
             files_screen(all_files)
+        elif ch == "d":
+            dataplane_shell()
+            if in_dataplane():
+                ask(c("  Enter = powrót do menu… ", "2"))
         elif ch.isdigit() and 1 <= int(ch) <= len(AREAS):
             area_menu(AREAS[int(ch) - 1])
         else:
@@ -7754,6 +7839,9 @@ def help_text():
     for i, a in enumerate(AREAS, 1):
         print("  %d  %-28s %s" % (i, a["title"], a["desc"]))
     print("\nSkróty: " + "  ".join("%s → %s" % (k, cmdline(v)) for k, v in ALIASES.items()))
+    print("Powłoka w dataplane: router dataplane → %s (exit = powrót)" % cmdline(["ip", "netns", "exec", NETNS, "bash"]))
+    if in_dataplane():
+        print("Teraz jesteś w netns dataplane (wyjście: exit).")
     print("Autor: " + AUTOR)
 
 
@@ -7765,6 +7853,8 @@ def main():
     if args[:1] in (["help"], ["-h"], ["--help"]):
         help_text()
         return 0
+    if args[:1] in (["dataplane"], ["dp"]):
+        return dataplane_shell()
     if args[:1] == ["files"]:
         sel = args[1] if len(args) > 1 else ""
         areas = [a for a in AREAS if not sel or sel in (a["key"], a["alias"])]
@@ -7972,6 +8062,8 @@ SSH (port zarządzający eth2) działa poza VPP — żadna zmiana interfejsów, 
 | `vpp.log`, `bird.log` | komunikaty VPP i BIRD |
 
 Na żywo: `tail -f /var/log/router/alarmy.log`
+
+Powłoka w netns dataplane (BIRD, SSH/SNMP na loop0): `router dataplane` albo `d` w menu `router` — to samo co `ip netns exec dataplane bash`, polecenia (`ip a`, `ip neigh`, `ping`, `ss`) bez `ip netns exec`; znak zachęty zaczyna się od `(dataplane)`, `exit` = wyjście. ARP: `router arp` (sąsiedzi w VPP).
 
 ---
 

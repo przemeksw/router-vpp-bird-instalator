@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.0"                     '^SCRIPT_VERSION="1\.5\.0"' 1
+chk "wersja skryptu 1.5.1"                     '^SCRIPT_VERSION="1\.5\.1"' 1
 chk "router-guard w UPGRADE_PROGRAMS"          '"router-guard\|/opt/router/bin/router-guard\|755\|prog_router_guard\|"' 1
 chk "router-fw w UPGRADE_PROGRAMS"            '"router-fw\|/opt/router/bin/router-fw\|755\|prog_router_fw\|"' 1
 chk "TOTAL_STAGES=27"                         '^TOTAL_STAGES=27$' 1

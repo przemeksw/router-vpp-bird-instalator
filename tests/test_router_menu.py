@@ -215,6 +215,48 @@ class TestFilesAndCli(Base):
         self.assertIn("nie znaleziono", out)
 
 
+class TestDataplaneAndArp(Base):
+    def test_main_menu_offers_dataplane_shell(self):
+        rc, out = self.run_menu("q\n")
+        self.assertIn("d  Przejdź do netns dataplane", out)
+        self.assertNotIn("Jesteś w netns dataplane", out)
+
+    def test_dataplane_shell_runs_ip_netns_exec_bash(self):
+        rc, out = self.run_menu("d\nq\n")
+        self.assertEqual(rc, 0, out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, out)
+        self.assertTrue(calls[0].startswith("FAKE ip netns exec dataplane bash --rcfile "), calls)
+        self.assertIn("exit", out)
+        self.assertIn("Opuszczono netns dataplane", out)
+        rc_file = calls[0].split("--rcfile ")[1].split()[0]
+        self.assertFalse(os.path.exists(rc_file))                                   # plik tymczasowy usunięty
+
+    def test_cli_dataplane(self):
+        rc, out = self.run_menu("", "dataplane")
+        self.assertTrue(self.calls()[0].startswith("FAKE ip netns exec dataplane bash"), out)
+
+    def test_inside_dataplane_is_detected_and_not_nested(self):
+        self.env["ROUTER_MENU_NETNS"] = "dataplane"
+        rc, out = self.run_menu("d\n\nq\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Jesteś w netns dataplane", out)
+        self.assertIn("[dataplane]", out)                                           # nagłówek: host [dataplane]
+        self.assertIn("Już jesteś w netns dataplane", out)
+        self.assertEqual(self.calls(), [])                                          # bez zagnieżdżania powłoki
+
+    def test_arp_actions_and_alias(self):
+        _rc, out = self.run_menu("8\n0\nq\n")
+        nums = {mm.group(2).split("  ")[0].strip(): mm.group(1) for mm in re.finditer(r"^\s{1,3}(\d+)\s{2}(.*)$", out, re.M)}
+        n_vpp = next(v for k, v in nums.items() if k.startswith("Pokaż ARP (VPP)"))
+        n_lnx = next(v for k, v in nums.items() if k.startswith("Pokaż ARP (Linux"))
+        self.run_menu("8\n%s\n\n8\n%s\n\n0\nq\n" % (n_vpp, n_lnx))
+        self.assertEqual(self.calls(), ["FAKE vppctl show ip neighbors", "FAKE ip netns exec dataplane ip neigh show"])
+        os.remove(self.log)
+        self.run_menu("", "arp")
+        self.assertEqual(self.calls(), ["FAKE vppctl show ip neighbors"])
+
+
 @unittest.skipUnless(hasattr(os, "fork") and shutil.which("less"), "brak pty / less")
 class TestTerminal(unittest.TestCase):
     """Na prawdziwym terminalu: każdy ekran od czystej strony, długi wynik przez less, błąd wyboru nie znika."""
