@@ -11,6 +11,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from xml.sax.saxutils import escape
@@ -565,6 +566,351 @@ def cacti(tname, title):
     return "\n".join(o)
 
 
+# --------------------------------------------------------------------------- Cacti: pełny szablon (jeden plik XML)
+# Format eksportu Cacti 1.2.20+ (hash_TTVVVV<md5>: TT = typ obiektu, VVVV = 0103). Własne obiekty mają stałe skróty
+# liczone z nazw, więc ponowny import aktualizuje te same obiekty zamiast tworzyć kopie. Obiekty wbudowane w Cacti
+# (metody wejścia SNMP, GPRINT „Normal”, CDEF bajty→bity) są tylko wskazywane skrótem — są w każdej instalacji.
+CACTI_VER = "0103"
+CT = {"graph_template": "00", "data_template": "01", "host_template": "02", "data_input": "03", "data_query": "04",
+      "cdef": "05", "gprint": "06", "data_input_field": "07", "data_template_item": "08", "graph_template_input": "09",
+      "graph_template_item": "10", "data_query_graph": "11", "data_query_sv_graph": "12", "data_query_sv_ds": "13"}
+DIM_SNMP = "3eb92bb845b9660a7445cf9740726522"            # Get SNMP Data
+DIM_SNMP_IDX = "bf566c869ac6443b0c75d1c32b5a350e"        # Get SNMP Data (Indexed)
+DIF_SNMP = ["92f5906c8dc0f964b41f4253df582c38", "32285d5bf16e56c478f5e83f32cda9ef", "ad14ac90641aed388139f6ba86a2e48b",
+            "9c55a74bd571b4f00a96fd4b793278c6", "012ccb1d3687d3edb29c002ea66e72da", "4276a5ec6e3fe33995129041b1909762",
+            "fc64b99742ec417cc424dbf8c7692d36"]           # pola Get SNMP Data; 6. = OID
+DIF_SNMP_OID = "4276a5ec6e3fe33995129041b1909762"
+DIF_SNMP_IDX = ["92f5906c8dc0f964b41f4253df582c38", "32285d5bf16e56c478f5e83f32cda9ef", "617cdc8a230615e59f06f361ef6e7728",
+                "acb449d1451e8a2a655c2c99d31142c7", "f4facc5e2ca7ebee621f09bc6d9fc792", "1cc1493a6781af2c478fa4de971531cf",
+                "b5c23f246559df38662c255f4aa21d6b", "6027a919c7c7731fbe095b6f53ab127b", "cbbe5c1ddfb264a6e5d509ce1c78c95f",
+                "e6deda7be0f391399c5130e7c4a48b28", "c1f36ee60c3dc98945556d57f26e475b", "2cf7129ad3ff819a7a7ac189bee48ce8",
+                "6b13ac0a0194e171d241d4b06f913158", "3a33d4fc65b8329ab2ac46a36da26b72"]
+DIF_SNMP_IDX_PER_DS = {"6027a919c7c7731fbe095b6f53ab127b", "cbbe5c1ddfb264a6e5d509ce1c78c95f",
+                       "e6deda7be0f391399c5130e7c4a48b28"}   # index_type, index_value, output_type: ustala Cacti
+GPRINT_NORMAL = "e9c43831e54eca8069317a2ce8c6f751"
+CDEF_BITS = "73f95f8b77b5508157d64047342c421e"           # Turn Bytes into Bits
+# Szablony wbudowane (pakiety Generic SNMP Device / Net-SNMP Device): podpinane do szablonu urządzenia, jeśli są w Cacti
+STOCK_GRAPHS = ["ab37cbed8610deeffbb20dc1fe57b330",       # Device - Uptime
+                "5107ec0206562e77d965ce6b852ef9d4",       # Net-SNMP - Load Average
+                "be275639d5680e94c72c0ebb4e19056d",       # Net-SNMP - Memory Usage
+                "eee71ec20dc7b44635ab185bbf924dc4"]       # Net-SNMP - CPU Utilization
+STOCK_QUERIES = ["d75e406fdeca4fcef45b8be3a9a63cbc",      # SNMP - Interface Statistics (porty i VLAN-y VPP)
+                 "9343eab1f4d88b0e61ffc9d020f35414"]      # SNMP - Get Mounted Partitions
+CACTI_HOST_TEMPLATE = "Router VPP BIRD"
+CACTI_FILE = "router_vpp_bird_cacti.xml"
+CACTI_INSTALLER = "install-cacti-router-vpp.sh"
+
+# typ RRD: liczniki jako DERIVE z minimum 0 — zerowanie licznika po restarcie VPP daje jedną pustą próbkę, nie skok
+DS_GAUGE, DS_DERIVE = 1, 3
+LINE, AREA, STACK = 4, 7, 8
+
+
+def cs(*parts):
+    return hashlib.md5(("router-vpp-cacti|" + "|".join(parts)).encode()).hexdigest()
+
+
+def ch(kind, md5):
+    return "hash_%s%s%s" % (CT[kind], CACTI_VER, md5)
+
+
+def dsname(name):
+    n = name[2:] if name.startswith("rv") else name
+    return n[:19]
+
+
+# Wykres: (klucz, tytuł, opis osi, [(obiekt, etykieta, rodzaj linii)], opcje)
+# opcje: cdef = CDEF dla wszystkich linii, upper = górna granica osi (bez sztywnego limitu)
+CG_SCALAR = [
+    ("vector", "VPP - najwiekszy wektor workera", "wektor", [("rvVppVectorMax", "Wektor (1 luz, 256 nasycenie)", LINE)], {}),
+    ("hkcpu", "System - najbardziej zajety rdzen", "%", [("rvVppHkCpuMax", "Rdzen systemowy", AREA)], {"upper": 100}),
+    ("loss", "VPP - straty pakietow", "pakiety/s", [("rvVppRxMissPps", "rx-miss + rx-no-buf", LINE),
+                                                     ("rvVppNicDiscardPps", "Odrzucenia karty", LINE),
+                                                     ("rvVppDrops", "Drops interfejsow", LINE),
+                                                     ("rvVppErrors", "show errors (error)", LINE)], {}),
+    ("punt", "VPP - ruch do control plane (punt)", "pakiety/s", [("rvVppPuntPps", "Punt", AREA)], {}),
+    ("buffers", "VPP - bufory", "bufory", [("rvVppBufUsed", "Zajete", AREA), ("rvVppBufCached", "W watkach", STACK),
+                                          ("rvVppBufAvail", "Wolne", STACK)], {}),
+    ("buffree", "VPP - wolne bufory", "%", [("rvVppBufFreePct", "Wolne + w watkach", LINE)], {"upper": 100}),
+    ("routes4", "Trasy IPv4 - FIB VPP i BIRD", "trasy", [("rvFib4Routes", "FIB VPP", AREA),
+                                                         ("rvBird4Routes", "BIRD master4", LINE)], {}),
+    ("routes6", "Trasy IPv6 - FIB VPP i BIRD", "trasy", [("rvFib6Routes", "FIB VPP", AREA),
+                                                         ("rvBird6Routes", "BIRD master6", LINE)], {}),
+    ("fibdiff", "Trasy - roznica FIB VPP i BIRD", "%", [("rvFibDiffPct", "Roznica", LINE)], {}),
+    ("fwpkts", "Firewall - pakiety", "pakiety/s", [("rvFwPermitPkts", "Przepuszczone (permit)", LINE),
+                                                   ("rvFwDenyPkts", "Odrzucone (deny)", LINE),
+                                                   ("rvFwBlockPkts", "Blokady dorazne", LINE)], {}),
+    ("fwbits", "Firewall - odrzucony ruch", "bity/s", [("rvFwDenyBytes", "Odrzucone (deny)", AREA)], {"cdef": CDEF_BITS}),
+    ("fwblocks", "Firewall - blokady dorazne", "blokady", [("rvFwBlocks", "Aktywne blokady", LINE)], {}),
+    ("guard", "Guard - liczniki", "pakiety/s", [("rvGuardChecked", "Sprawdzone", LINE), ("rvGuardPassed", "Przepuszczone", LINE),
+                                                ("rvGuardViolations", "Naruszenia", LINE), ("rvGuardDropped", "Odrzucone", LINE),
+                                                ("rvGuardRstSent", "Wyslane RST", LINE)], {}),
+    ("guardtab", "Guard - zapelnienie tablic", "%", [("rvGuardTable4Pct", "Tablica IPv4", LINE),
+                                                     ("rvGuardTable6Pct", "Tablica IPv6", LINE)], {"upper": 100}),
+    ("rpkiinv", "RPKI - trasy INVALID", "trasy", [("rvRpkiInvalid", "INVALID", AREA)], {}),
+    ("alarms", "Router - alarmy i uslugi", "liczba", [("rvAlarmsHour", "Alarmy 1-4 (1 h)", LINE),
+                                                      ("rvAlarmsCritHour", "Krytyczne 1-2 (1 h)", LINE),
+                                                      ("rvServicesDown", "Niedzialajace uslugi", LINE)], {}),
+    ("state", "Router - stan (1 = tak)", "stan", [("rvVppUp", "VPP dziala", LINE), ("rvRpkiValidatorUp", "Routinator dziala", LINE),
+                                                  ("rvIfacesDrift", "Rozjazd interfejsow", LINE),
+                                                  ("rvFwDrift", "Rozjazd firewalla", LINE), ("rvGuardDrift", "Rozjazd guarda", LINE)],
+     {"upper": 1}),
+    ("dataage", "Router - wiek danych SNMP", "s", [("rvDataAge", "Wiek danych", LINE)], {}),
+]
+
+# Wykresy z zapytań SNMP (tablice): (klucz, tablica, tytuł po nazwie hosta, opis osi, [(kolumna, etykieta, linia)], opcje)
+CG_TABLE = [
+    ("worker", "rvWorkerTable", "VPP |query_rvWorkerName| - wektor", "wektor", [("rvWorkerVector", "Wektor", LINE)], {}),
+    ("port", "rvPortTable", "Port |query_rvPortName| - straty i bledy", "pakiety/s",
+     [("rvPortRxMiss", "rx-miss", LINE), ("rvPortRxNoBuf", "rx-no-buf", LINE), ("rvPortHwDiscards", "Odrzucenia karty", LINE),
+      ("rvPortRxErrors", "rx-error", LINE), ("rvPortTxErrors", "tx-error", LINE), ("rvPortDrops", "drops", LINE),
+      ("rvPortPunt", "punt", LINE)], {}),
+    ("error", "rvErrorTable", "show errors |query_rvErrorNode| - |query_rvErrorReason|", "zdarzenia/s",
+     [("rvErrorCount", "Licznik", AREA)], {}),
+    ("bgpprefix", "rvBgpPeerTable", "BGP |query_rvBgpPeerName| |query_rvBgpPeerNeighbor| - prefiksy", "prefiksy",
+     [("rvBgpPeerImported", "Przyjete", AREA), ("rvBgpPeerExported", "Wyslane", LINE),
+      ("rvBgpPeerFiltered", "Odrzucone przez filtr", LINE), ("rvBgpPeerImportLimit", "Limit (0 = brak)", LINE)], {}),
+    ("bgpstate", "rvBgpPeerTable", "BGP |query_rvBgpPeerName| |query_rvBgpPeerNeighbor| - stan (6 = established)", "stan",
+     [("rvBgpPeerState", "Stan", LINE)], {"upper": 6}),
+    ("service", "rvServiceTable", "Usluga |query_rvServiceName| (1 = dziala)", "stan", [("rvServiceUp", "Dziala", AREA)],
+     {"upper": 1}),
+    ("rpki", "rvRpkiTable", "RPKI |query_rvRpkiName| - VRP", "VRP", [("rvRpkiVrp4", "VRP IPv4", LINE),
+                                                                    ("rvRpkiVrp6", "VRP IPv6", LINE)], {}),
+    ("raidsync", "rvRaidTable", "RAID |query_rvRaidName| - synchronizacja", "%", [("rvRaidSyncPct", "Zsynchronizowane", LINE)],
+     {"upper": 100}),
+    ("raiddeg", "rvRaidTable", "RAID |query_rvRaidName| - zdegradowana (1 = tak)", "stan",
+     [("rvRaidDegraded", "Zdegradowana", AREA)], {"upper": 1}),
+    ("disktemp", "rvDiskTable", "Dysk |query_rvDiskName| - temperatura", "C", [("rvDiskTemp", "Temperatura", LINE)], {}),
+    ("disksect", "rvDiskTable", "Dysk |query_rvDiskName| - sektory", "sektory",
+     [("rvDiskRealloc", "Realokowane", LINE), ("rvDiskPending", "Oczekujace", LINE)], {}),
+    ("diskwear", "rvDiskTable", "Dysk |query_rvDiskName| - zuzycie SSD", "%", [("rvDiskWearPct", "Zuzycie", LINE)],
+     {"upper": 100}),
+    ("cputemp", "rvTempTable", "CPU |query_rvTempName| - temperatura", "C",
+     [("rvTempValue", "Temperatura", LINE), ("rvTempCrit", "Prog krytyczny", LINE)], {}),
+]
+def plain(title):
+    """Tytuł bez zmiennych |query_…| (nazwa szablonu), np. „BGP - prefiksy”."""
+    t = re.sub(r"\s*\|query_\w+\|", "", title)
+    t = re.sub(r"\s+-\s+-\s+|\s+-\s*$", " - ", t).strip(" -")
+    return re.sub(r"\s+", " ", t)
+
+
+def xel(tag, value, ind):
+    return "%s<%s>%s</%s>" % ("\t" * ind, tag, escape(str(value)), tag)
+
+
+def ds_type(name):
+    return DS_DERIVE if OBJ[name]["typ"] in ("counter64", "counter") else DS_GAUGE
+
+
+def cacti_data_template(key, title, items, indexed, oid=None):
+    """Szablon danych: jedna pozycja (Get SNMP Data, OID skalara) albo kilka kolumn tablicy (Get SNMP Data (Indexed))."""
+    h = cs("dt", key)
+    o = ["\t<%s>" % ch("data_template", h), xel("name", "Router VPP - " + title, 2), "\t\t<ds>", xel("t_name", "", 3),
+         xel("name", "|host_description| - " + title, 3), xel("data_source_path", "", 3),
+         xel("data_input_id", ch("data_input", DIM_SNMP_IDX if indexed else DIM_SNMP), 3), xel("t_data_source_profile_id", "", 3),
+         xel("data_source_profile_id", "0", 3), xel("t_rrd_step", "", 3), xel("rrd_step", "60", 3), xel("t_active", "", 3),
+         xel("active", "on", 3), "\t\t</ds>", "\t\t<items>"]
+    for name in items:
+        o += ["\t\t\t<%s>" % ch("data_template_item", cs("dti", key, name)), xel("t_data_source_name", "", 4),
+              xel("data_source_name", dsname(name), 4), xel("t_rrd_minimum", "", 4), xel("rrd_minimum", "0", 4),
+              xel("t_rrd_maximum", "", 4), xel("rrd_maximum", "U", 4), xel("t_data_source_type_id", "", 4),
+              xel("data_source_type_id", ds_type(name), 4), xel("t_rrd_heartbeat", "", 4), xel("rrd_heartbeat", "600", 4),
+              xel("t_data_input_field_id", "", 4), xel("data_input_field_id", "0", 4),
+              "\t\t\t</%s>" % ch("data_template_item", cs("dti", key, name))]
+    o += ["\t\t</items>", "\t\t<data>"]
+    for i, f in enumerate(DIF_SNMP_IDX if indexed else DIF_SNMP):
+        per_ds = indexed and f in DIF_SNMP_IDX_PER_DS
+        val = "." + oid + ".0" if (not indexed and f == DIF_SNMP_OID) else ""
+        o += ["\t\t\t<item_%03d>" % i, xel("data_input_field_id", ch("data_input_field", f), 4),
+              xel("t_value", "on" if per_ds else "", 4), xel("value", val, 4), "\t\t\t</item_%03d>" % i]
+    o += ["\t\t</data>", "\t</%s>" % ch("data_template", h), ""]
+    return o
+
+
+GRAPH_FIELDS = [("image_format_id", "3"), ("height", "200"), ("width", "700"), ("base_value", "1000"), ("slope_mode", "on"),
+                ("auto_scale", "on"), ("auto_scale_opts", "2"), ("auto_scale_log", ""), ("scale_log_units", ""),
+                ("auto_scale_rigid", ""), ("upper_limit", "100"), ("lower_limit", "0"), ("unit_value", ""),
+                ("unit_exponent_value", ""), ("unit_length", ""), ("no_gridfit", ""), ("alt_y_grid", ""),
+                ("right_axis", ""), ("right_axis_label", ""), ("right_axis_format", "0"), ("right_axis_formatter", "0"),
+                ("left_axis_formatter", "0"), ("auto_padding", "on"), ("dynamic_labels", ""), ("force_rules_legend", ""),
+                ("tab_width", "40"), ("legend_position", "0"), ("legend_direction", "0")]
+
+
+def cacti_graph_template(key, title, vlabel, lines, opts, dt_key):
+    """Szablon wykresu: linia/obszar + LAST/AVERAGE/MAX dla każdego źródła; dt_key(obiekt) = klucz szablonu danych."""
+    h = cs("gt", key)
+    o = ["\t<%s>" % ch("graph_template", h), xel("name", "Router VPP - " + plain(title), 2), xel("multiple", "", 2), xel("test_source", "", 2), "\t\t<graph>", xel("t_title", "", 3),
+         xel("title", "|host_description| - " + title, 3), xel("t_vertical_label", "", 3), xel("vertical_label", vlabel, 3)]
+    for f, v in GRAPH_FIELDS:
+        if f == "upper_limit" and "upper" in opts:
+            v = str(opts["upper"])
+        o += [xel("t_" + f, "", 3), xel(f, v, 3)]
+    o += ["\t\t</graph>", "\t\t<items>"]
+    seq, inputs = 0, []
+    width = max(len(lb) for _n, lb, _t in lines) + 2
+    for i, (name, label, kind) in enumerate(lines):
+        rrd = ch("data_template_item", cs("dti", dt_key(name), name))
+        color = COLORS[i % len(COLORS)]
+        cdef = ch("cdef", opts["cdef"]) if "cdef" in opts else "0"
+        refs = []
+        for gtype, cf, text, alpha, hr in ((kind, 1, label.ljust(width), "FF" if kind == LINE else "7F", ""),
+                                           (9, 4, "Teraz:", "FF", ""), (9, 1, "Srednio:", "FF", ""),
+                                           (9, 3, "Max:", "FF", "on")):
+            seq += 1
+            ih = cs("gti", key, name, str(seq))
+            refs.append("hash_00%s%s" % (CACTI_VER, ih))
+            o += ["\t\t\t<%s>" % ch("graph_template_item", ih), xel("graph_type_id", gtype, 4), xel("task_item_id", rrd, 4),
+                  xel("color_id", color if gtype != 9 else "0", 4), xel("alpha", alpha, 4),
+                  xel("consolidation_function_id", cf, 4), xel("cdef_id", cdef, 4), xel("vdef_id", "0", 4), xel("shift", "", 4),
+                  xel("value", "", 4), xel("gprint_id", ch("gprint", GPRINT_NORMAL), 4), xel("textalign", "", 4),
+                  xel("text_format", text, 4), xel("hard_return", hr, 4),
+                  xel("line_width", "1.50" if gtype == LINE else "0.00", 4), xel("dashes", "", 4), xel("dash_offset", "0", 4),
+                  xel("sequence", seq, 4), "\t\t\t</%s>" % ch("graph_template_item", ih)]
+        inputs.append((name, label, refs))
+    o += ["\t\t</items>", "\t\t<inputs>"]
+    for name, label, refs in inputs:
+        ih = ch("graph_template_input", cs("gti-in", key, name))
+        o += ["\t\t\t<%s>" % ih, xel("name", "Zrodlo danych [%s]" % dsname(name), 4), xel("description", label, 4),
+              xel("column_name", "task_item_id", 4), xel("items", "|".join(refs), 4), "\t\t\t</%s>" % ih]
+    o += ["\t\t</inputs>", "\t</%s>" % ch("graph_template", h), ""]
+    return o
+
+
+def cacti_data_query(tname, fname, title, graphs):
+    t = next(x for x in RS.TABLES if x[1] == tname)
+    h = cs("dq", tname)
+    o = ["\t<%s>" % ch("data_query", h), xel("name", title, 2), xel("description", t[3], 2),
+         xel("xml_path", "<path_cacti>/resource/snmp_queries/%s.xml" % fname, 2),
+         xel("data_input_id", ch("data_input", DIM_SNMP_IDX), 2), "\t\t<graphs>"]
+    for key, _t, gtitle, _v, lines, _o in graphs:
+        gh = ch("data_query_graph", cs("dqg", key))
+        o += ["\t\t\t<%s>" % gh, xel("graph_template_id", ch("graph_template", cs("gt", key)), 4),
+              xel("name", plain(gtitle), 4), "\t\t\t\t<rrd>"]
+        for i, (name, _l, _k) in enumerate(lines):
+            o += ["\t\t\t\t\t<item_%03d>" % i, xel("snmp_field_name", name, 6),
+                  xel("data_template_id", ch("data_template", cs("dt", key)), 6),
+                  xel("data_template_rrd_id", ch("data_template_item", cs("dti", key, name)), 6), "\t\t\t\t\t</item_%03d>" % i]
+        sv = ch("data_query_sv_graph", cs("dqsv", key))
+        sd = ch("data_query_sv_ds", cs("dqsd", key))
+        o += ["\t\t\t\t</rrd>", "\t\t\t\t<sv_graph>", "\t\t\t\t\t<%s>" % sv, xel("field_name", "title", 6), xel("sequence", "1", 6),
+              xel("text", "|host_description| - " + gtitle, 6), "\t\t\t\t\t</%s>" % sv, "\t\t\t\t</sv_graph>",
+              "\t\t\t\t<sv_data_source>", "\t\t\t\t\t<%s>" % sd, xel("field_name", "name", 6),
+              xel("data_template_id", ch("data_template", cs("dt", key)), 6), xel("sequence", "1", 6),
+              xel("text", "|host_description| - " + re.sub(r"\s*\(.*\)$", "", gtitle), 6), "\t\t\t\t\t</%s>" % sd,
+              "\t\t\t\t</sv_data_source>", "\t\t\t</%s>" % gh]
+    o += ["\t\t</graphs>", "\t</%s>" % ch("data_query", h), ""]
+    return o
+
+
+def cacti_template():
+    """Jeden plik do importu (Console → Import/Export → Import Templates): zapytania SNMP, szablony danych i wykresów,
+    szablon urządzenia „Router VPP BIRD”."""
+    o = ["<cacti>"]
+    graphs, queries = [], []
+    host = ch("host_template", cs("host"))
+    for key, title, vlabel, lines, opts in CG_SCALAR:
+        graphs.append(ch("graph_template", cs("gt", key)))
+    for tname, fname, title in CACTI:
+        queries.append(ch("data_query", cs("dq", tname)))
+    graphs += [ch("graph_template", x) for x in STOCK_GRAPHS]
+    queries += [ch("data_query", x) for x in STOCK_QUERIES]
+    o += ["\t<%s>" % host, xel("name", CACTI_HOST_TEMPLATE, 2), xel("class", "linux", 2),
+          xel("graph_templates", "|".join(graphs), 2), xel("data_queries", "|".join(queries), 2), "\t</%s>" % host, ""]
+    for key, title, vlabel, lines, opts in CG_SCALAR:
+        o += cacti_graph_template(key, title, vlabel, lines, opts, lambda n: "s:" + n)
+    for key, tname, gtitle, vlabel, lines, opts in CG_TABLE:
+        o += cacti_graph_template(key, gtitle, vlabel, lines, opts, lambda n, k=key: k)
+    for key, title, vlabel, lines, opts in CG_SCALAR:
+        for name, _l, _k in lines:
+            o += cacti_data_template("s:" + name, "%s (%s)" % (OBJ[name]["desc"].split(" (")[0], name), [name], False,
+                                     OBJ[name]["oid"])
+    for key, tname, gtitle, vlabel, lines, opts in CG_TABLE:
+        o += cacti_data_template(key, "%s (%s)" % (plain(gtitle), tname), [n for n, _l, _k in lines], True)
+    for tname, fname, title in CACTI:
+        o += cacti_data_query(tname, fname, title, [g for g in CG_TABLE if g[1] == tname])
+    o += ["</cacti>", ""]
+    return "\n".join(o)
+
+
+CACTI_INSTALLER_HEAD = r'''#!/usr/bin/env bash
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+# Generowany: tools/build-templates.py (instalator routera) — nie edytuj ręcznie.
+#
+# Szablon Cacti „Router VPP BIRD” w jednym pliku: zapisuje zapytania SNMP do <cacti>/resource/snmp_queries/
+# i importuje szablon (zapytania, szablony danych i wykresów, szablon urządzenia) przez cli/import_template.php.
+# Cacti 1.2.20 lub nowsze. Uruchom na serwerze Cacti jako root (albo użytkownik z prawem zapisu do katalogu Cacti):
+#
+#   bash install-cacti-router-vpp.sh                    # katalog Cacti wykrywany sam
+#   bash install-cacti-router-vpp.sh /var/www/html/cacti
+#   bash install-cacti-router-vpp.sh --preview          # tylko podgląd: co zostanie dodane/zmienione
+#
+# Ponowne uruchomienie (np. po aktualizacji routera) aktualizuje te same obiekty, nie tworzy kopii.
+set -euo pipefail
+preview=""
+dir=""
+for a in "$@"; do
+  case $a in
+    --preview) preview="--preview" ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) dir=$a ;;
+  esac
+done
+if [[ -z $dir ]]; then
+  for d in /usr/share/cacti/site /usr/share/cacti /var/www/html/cacti /var/www/cacti /srv/www/htdocs/cacti /opt/cacti; do
+    [[ -f $d/cli/import_template.php ]] && { dir=$d; break; }
+  done
+fi
+[[ -n $dir && -f $dir/cli/import_template.php ]] || { echo "Nie znaleziono Cacti (cli/import_template.php). Podaj katalog: bash $0 /ścieżka/do/cacti" >&2; exit 1; }
+php=$(command -v php || true)
+[[ -n $php ]] || { echo "Brak polecenia php" >&2; exit 1; }
+q=$dir/resource/snmp_queries
+[[ -d $q ]] || { echo "Brak katalogu $q" >&2; exit 1; }
+owner=$(stat -c %U:%G "$q" 2>/dev/null || stat -f %Su:%Sg "$q")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "Cacti: $dir"
+
+put() {   # put <plik w resource/snmp_queries> — treść ze stdin
+  cat >"$tmp/$1"
+  if [[ -n $preview ]]; then
+    if [[ ! -f $q/$1 ]]; then echo "  nowy:       $q/$1"
+    elif cmp -s "$tmp/$1" "$q/$1"; then echo "  bez zmian:  $q/$1"
+    else echo "  zmieniony:  $q/$1"; fi
+    return
+  fi
+  install -m 644 "$tmp/$1" "$q/$1"
+  chown "$owner" "$q/$1" 2>/dev/null || true
+  echo "  zapisano:   $q/$1"
+}
+'''
+
+CACTI_INSTALLER_TAIL = r'''
+echo "Import szablonu${preview:+ (podgląd)}:"
+# import_template.php wypisuje wynik jako HTML — zostawiamy sam tekst: [success] nazwa [new|updated|unchanged]
+"$php" -d error_reporting=E_ERROR -d display_errors=stderr "$dir/cli/import_template.php" --filename="$tmp/template.xml" $preview \
+  | sed -e 's/<[^>]*>//g' -e 's/&quot;/"/g' -e "s/&#039;/'/g" | grep -v '^[[:space:]]*$'
+if [[ -z $preview ]]; then
+  cat <<'EOT'
+
+Gotowe. Dalej w Cacti:
+  1. Management → Devices → Add: adres loop0 routera, SNMP v2c, community z /etc/router/router.env,
+     Device Template: „Router VPP BIRD”.
+  2. W urządzeniu: Create Graphs for this Device — zaznacz wykresy (skalarne od razu, sesje BGP, porty,
+     dyski itd. z listy zapytań). Zapytania można sprawdzić opcją „Verbose Query”.
+EOT
+fi
+'''
+
+
+def cacti_installer(resources, template):
+    o = [CACTI_INSTALLER_HEAD]
+    for fname, text in resources:
+        o.append("put %s <<'ROUTER_VPP_XML'\n%sROUTER_VPP_XML\n" % (fname, text))
+    o.append("cat >\"$tmp/template.xml\" <<'ROUTER_VPP_XML'\n%sROUTER_VPP_XML\n" % template)
+    o.append(CACTI_INSTALLER_TAIL)
+    return "".join(o)
+
+
 def oid_list():
     o = ["# Obiekty SNMP routera (router-snmp)", "",
          "Generowany: `tools/build-templates.py`. Wartości skalarne mają sufiks `.0`, kolumny tablic — indeks wiersza.",
@@ -588,8 +934,12 @@ def outputs():
              "librenms/os_discovery/vpprouter.yaml": disc,
              "librenms/mibs/vpprouter/ROUTER-VPP-MIB": mib(),
              "OID-LIST.md": oid_list()}
+    resources = []
     for tname, fname, title in CACTI:
         files["cacti/resource/snmp_queries/%s.xml" % fname] = cacti(tname, title)
+        resources.append(("%s.xml" % fname, files["cacti/resource/snmp_queries/%s.xml" % fname]))
+    files["cacti/" + CACTI_FILE] = cacti_template()
+    files["cacti/" + CACTI_INSTALLER] = cacti_installer(resources, files["cacti/" + CACTI_FILE])
     return files
 
 
@@ -611,6 +961,8 @@ def main():
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
+            if path.endswith(".sh"):
+                os.chmod(path, 0o755)
             print("zapisano templates/%s" % rel)
     if check and stale:
         print("nieaktualne (uruchom: python3 tools/build-templates.py): %s" % ", ".join(stale))

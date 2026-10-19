@@ -21,7 +21,7 @@ Instalator routera BGP (Debian 13): VPP 26.06 budowany ze źródeł (DPDK mlx5, 
 | `tests/test_router_guard.py`, `tests/test-guard-core.sh`, `tests/guard_core_test.c` | testy router-guard (symulator VPP) i rdzenia modułu C (kompilator na hoście, ASan/UBSan) |
 | `docs/synack-guard-design.md`, `docs/synack-guard-lab-checklist.md` | skrót projektu i lista kontrolna do labu |
 | `docs/router-fw-design.md`, `docs/router-fw-lab-checklist.md` | skrót projektu firewalla i lista kontrolna do labu |
-| `templates/` | **szablony monitoringu: LibreNMS, Zabbix, Cacti**, plik MIB i lista OID (instrukcja: `templates/README.md`) |
+| `templates/` | **szablony monitoringu: LibreNMS, Zabbix, Cacti** (Cacti: jeden plik `templates/cacti/install-cacti-router-vpp.sh`), plik MIB i lista OID (instrukcja: `templates/README.md`) |
 | `tools/build-templates.py` | generuje `templates/` ze schematu OID programu `router-snmp` (`--check` = tylko kontrola) |
 | `docs/rpki.md` | RPKI: Routinator, filtry `rpki_filter()`/`rpki_invalid()`, przełącznik `router-rpki`, zachowanie przy awarii walidatora |
 | `tests/test_router_rpki.py` | testy `router-rpki`: przełącznik z wycofaniem przy błędzie, alarmy walidatora, liczba INVALID |

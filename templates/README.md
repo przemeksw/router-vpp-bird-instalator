@@ -127,34 +127,57 @@ Szablon zawiera:
   | `{$RV.CPU.TEMP.MAX}` | 85 °C |
   | `{$RV.DATA.AGE.MAX}` | 300 s |
 
-## Cacti (1.2)
+## Cacti (1.2.20 i nowsze)
 
-Cacti nie ma formatu szablonów, który dałoby się poprawnie wygenerować poza samym Cacti, bo eksport XML zawiera
-wewnętrzne skróty (hash) instancji. Dlatego są tu **zapytania SNMP (Data Queries)**: definicje tablic z indeksami,
-nazwami i wszystkimi OID-ami. Wykresy dodajesz do nich raz, w interfejsie Cacti.
+Cały szablon jest w jednym pliku: **`cacti/install-cacti-router-vpp.sh`**. Skopiuj go na serwer Cacti i uruchom:
 
-1. Skopiuj `cacti/resource/snmp_queries/*.xml` do `<cacti>/resource/snmp_queries/`.
-2. Dla każdego pliku utwórz zapytanie w *Data Collection → Data Queries → Add*:
-   - nazwa: dowolna, np. „Router VPP - sesje BGP”;
-   - XML Path: `<path_cacti>/resource/snmp_queries/router_vpp_bgp_peers.xml`;
-   - Data Input Method: **Get SNMP Data (Indexed)**.
-3. Dla wybranych kolumn wyjściowych (`direction = output`) utwórz Data Template i Graph Template i powiąż je z
-   zapytaniem w sekcji *Associated Graph Templates*. Liczniki Counter64 ustaw jako COUNTER, pozostałe jako GAUGE.
-4. Na urządzeniu (adres loop0) dodaj zapytanie w *Associated Data Queries* i sprawdź je opcją *Verbose Query*.
-5. Pojedyncze wartości, np. wolne bufory VPP (`...630.2.11.0`) albo różnicę FIB i BIRD (`...630.2.20.0`), dodaj
-   szablonem **SNMP - Generic OID Template**. Numery OID są w [OID-LIST.md](OID-LIST.md).
+```
+scp templates/cacti/install-cacti-router-vpp.sh root@<serwer-cacti>:/root/
+bash /root/install-cacti-router-vpp.sh --preview    # podgląd: co zostanie dodane lub zmienione
+bash /root/install-cacti-router-vpp.sh              # instalacja (katalog Cacti wykrywany sam)
+bash /root/install-cacti-router-vpp.sh /var/www/html/cacti   # albo z podanym katalogiem
+```
 
-| Plik | Tablica |
+Skrypt zapisuje 9 zapytań SNMP do `<cacti>/resource/snmp_queries/` i importuje szablon przez
+`cli/import_template.php`. Ponowne uruchomienie, np. po aktualizacji routera, aktualizuje te same obiekty i nie
+tworzy kopii.
+
+Dlaczego skrypt, a nie sam plik XML do zaimportowania w przeglądarce: zapytanie SNMP w Cacti to plik XML na dysku
+serwera. Import w przeglądarce (*Import Templates*) nie zapisuje plików. Zapisuje je tylko pakiet (*Import Packages*),
+ale Cacti przyjmuje wyłącznie pakiety podpisane kluczem Cacti Group.
+
+Jeśli wolisz import w przeglądarce: skopiuj `cacti/resource/snmp_queries/*.xml` do `<cacti>/resource/snmp_queries/`,
+a potem zaimportuj `cacti/router_vpp_bird_cacti.xml` w *Import/Export → Import Templates*. Efekt jest ten sam.
+
+Po instalacji:
+
+1. *Management → Devices → Add*: adres **loop0**, SNMP v2c, community z `/etc/router/router.env`,
+   Device Template **Router VPP BIRD**.
+2. W urządzeniu: *Create Graphs for this Device*. Wykresy skalarne powstają od razu. Wykresy z zapytań (sesje BGP,
+   porty, dyski itd.) zaznaczasz na liście, a zapytanie sprawdzisz opcją *Verbose Query*.
+
+Co zawiera szablon urządzenia **Router VPP BIRD**:
+
+| Wykresy skalarne | Wykresy z zapytań SNMP (dla każdego wiersza tablicy) |
 |---|---|
-| `router_vpp_bgp_peers.xml` | sesje BGP: stan, czas, prefiksy przyjęte, wysłane i odfiltrowane, limit, upadki |
-| `router_vpp_ports.xml` | porty VPP: rx-miss, rx-no-buf, błędy, drops, punt, odrzucenia sprzętowe |
-| `router_vpp_errors.xml` | liczniki `show errors` (tylko niezerowe) |
-| `router_vpp_workers.xml` | wektor każdego workera |
-| `router_vpp_services.xml` | usługi routera |
-| `router_vpp_rpki.xml` | RPKI: połączenie, VRP IPv4 i IPv6 |
-| `router_vpp_raid.xml` | macierze mdadm |
-| `router_vpp_disks.xml` | SMART: stan, temperatura, sektory, czas pracy, zużycie |
-| `router_vpp_temps.xml` | temperatury procesorów |
+| VPP: największy wektor workera, straty pakietów, punt, bufory i wolne bufory | VPP: wektor każdego workera |
+| System: najbardziej zajęty rdzeń | Port VPP: rx-miss, rx-no-buf, odrzucenia karty, błędy, drops, punt |
+| Trasy IPv4 i IPv6: FIB VPP i BIRD, różnica FIB i BIRD | `show errors`: każdy niezerowy licznik |
+| Firewall: pakiety permit, deny i blokad, odrzucony ruch (b/s), blokady doraźne | BGP: prefiksy (przyjęte, wysłane, odfiltrowane, limit), stan sesji |
+| Guard: liczniki i zapełnienie tablic | Usługi routera, RPKI (VRP), RAID (synchronizacja, degradacja) |
+| RPKI: trasy INVALID; alarmy, niedziałające usługi, stan (VPP, rozjazdy), wiek danych | Dyski: temperatura, sektory, zużycie SSD; temperatury CPU |
 
-Ruch na portach i VLAN-ach daje standardowe zapytanie Cacti **SNMP - Interface Statistics** (IF-MIB z
-`vpp-snmp-agent`).
+Liczniki są zapisywane jako DERIVE z minimum 0, więc zerowanie po restarcie VPP daje jedną pustą próbkę zamiast
+skoku na wykresie. Krok próbkowania bierze się z domyślnego profilu źródeł danych w Cacti (zwykle 5 minut).
+
+Szablon podpina też standardowe obiekty Cacti, o ile są zainstalowane (pakiety *Generic SNMP Device* i
+*Net-SNMP Device*): **SNMP - Interface Statistics** (ruch na portach i VLAN-ach z `vpp-snmp-agent`), *Get Mounted
+Partitions*, *Uptime*, *Load Average*, *Memory Usage* i *CPU Utilization*.
+
+Pliki w `cacti/`:
+
+| Plik | Do czego |
+|---|---|
+| `install-cacti-router-vpp.sh` | **jeden plik do instalacji**: zapytania SNMP i szablon w środku |
+| `router_vpp_bird_cacti.xml` | sam szablon do importu w przeglądarce (wymaga plików z `resource/`) |
+| `resource/snmp_queries/*.xml` | zapytania SNMP: sesje BGP, porty, `show errors`, workery, usługi, RPKI, RAID, dyski, temperatury |

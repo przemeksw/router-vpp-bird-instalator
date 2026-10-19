@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -639,6 +640,37 @@ class TestTemplates(unittest.TestCase):
         p = subprocess.run([sys.executable, os.path.join(TOP, "tools", "build-templates.py"), "--check"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_cacti_template_is_self_contained(self):
+        """Jeden plik XML Cacti: każdy wskazany skrót jest w pliku albo jest obiektem wbudowanym w Cacti; zapytania SNMP
+        wskazują pliki, które instalator zapisuje; każde OID istnieje w router-snmp."""
+        d = os.path.join(TOP, "templates", "cacti")
+        with open(os.path.join(d, "router_vpp_bird_cacti.xml"), encoding="utf-8") as f:
+            text = f.read()
+        defined = set(re.findall(r"<hash_\w{6}([0-9a-f]{32})>", text))
+        builtin = {"3eb92bb845b9660a7445cf9740726522", "bf566c869ac6443b0c75d1c32b5a350e",   # Get SNMP Data (Indexed)
+                   "e9c43831e54eca8069317a2ce8c6f751", "73f95f8b77b5508157d64047342c421e"}    # GPRINT Normal, bajty→bity
+        stock = {"ab37cbed8610deeffbb20dc1fe57b330", "5107ec0206562e77d965ce6b852ef9d4", "be275639d5680e94c72c0ebb4e19056d",
+                 "eee71ec20dc7b44635ab185bbf924dc4", "d75e406fdeca4fcef45b8be3a9a63cbc", "9343eab1f4d88b0e61ffc9d020f35414"}
+        # odwołania: wartość elementu lub lista "a|b|c"; pola metod wejścia (07…) należą do metod wbudowanych
+        refs = set(re.findall(r"[>|]hash_(?!07)\w{6}([0-9a-f]{32})", text))
+        self.assertEqual(refs - defined - builtin - stock, set(), "skróty bez definicji")
+        self.assertEqual(len(re.findall(r"^\t<hash_02", text, re.M)), 1)                  # jeden szablon urządzenia
+        self.assertIn("<name>Router VPP BIRD</name>", text)
+        with open(os.path.join(d, "install-cacti-router-vpp.sh"), encoding="utf-8") as f:
+            inst = f.read()
+        self.assertIn(text, inst)                                                       # szablon osadzony w instalatorze
+        paths = re.findall(r"&lt;path_cacti&gt;/resource/snmp_queries/([\w.]+)", text)
+        self.assertEqual(len(paths), 9)
+        for path in paths:
+            self.assertIn("put %s <<'ROUTER_VPP_XML'" % path, inst)
+        known = {o for o, *_r in rs.objects()}
+        for oid in re.findall(r"<value>\.(1\.3\.6[\d.]+)</value>", text):
+            self.assertIn(oid, known)
+        for name in re.findall(r"<data_source_name>(\w+)</data_source_name>", text):
+            self.assertLessEqual(len(name), 19)                                         # limit nazwy źródła w RRD
+        p = subprocess.run(["bash", "-n", os.path.join(d, "install-cacti-router-vpp.sh")], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_cli_help_and_oids(self):
         out = subprocess.run([sys.executable, SRC, "--help"], capture_output=True, text=True).stdout
