@@ -6237,7 +6237,8 @@ class Collector:
             n = parse_route_count(out)
             if n is not None:
                 s["rvBird%dRoutes" % fam] = n
-        diffs = [abs(s["rvFib%dRoutes" % f] - s["rvBird%dRoutes" % f]) * 100 // s["rvBird%dRoutes" % f]
+        diffs = [abs(s["rvFib%dRoutes" % f] - s["rvBird%dRoutes" % f]) * 100
+                 // max(s["rvFib%dRoutes" % f], s["rvBird%dRoutes" % f])
                  for f in (4, 6) if s.get("rvBird%dRoutes" % f) and "rvFib%dRoutes" % f in s]
         if diffs:
             s["rvFibDiffPct"] = max(diffs)
