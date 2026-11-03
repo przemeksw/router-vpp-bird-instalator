@@ -5494,6 +5494,242 @@ if __name__ == "__main__":
 ROUTER_RPKI_PY
 }
 
+# router-history: kopie i historia zmian /etc (etckeeper) — lista z datami, podgląd, wyciągnięcie kopii do katalogu
+prog_router_history() {
+  cat <<'ROUTER_HISTORY_PY'
+#!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+"""router-history — kopie i historia zmian /etc (etckeeper): lista z datami, podgląd, wyciągnięcie kopii
+
+  router-history                       przegląd: wybór pliku, potem daty zmian — podgląd albo wyciągnięcie kopii
+  router-history log [PLIK]            hash, data i opis zmian (wszystkie pliki albo jeden, najnowsze pierwsze)
+  router-history show HASH PLIK        treść pliku tak, jak wyglądał w podanym commicie
+  router-history diff HASH PLIK        co ten commit zmienił w pliku (diff z poprzednią wersją)
+  router-history extract HASH PLIK [KATALOG]   zapisuje tę wersję pliku do KATALOG (domyślnie /root/router-kopie)
+
+Historia pochodzi z etckeeper (git -C /etc, commit po każdej zmianie). PLIK to ścieżka względem /etc,
+np. router/firewall.conf. HASH — z „router-history log” albo z przeglądu. Wyciągnięcie kopii niczego
+nie zmienia w /etc — tylko odkłada wskazaną wersję pliku gdzie indziej, do przeglądnięcia albo porównania.
+"""
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("ROUTER_HISTORY_ROOT", "")      # tylko do testów
+ETC = ROOT + "/etc"
+DEFAULT_OUT = ROOT + "/root/router-kopie"
+TTY = sys.stdout.isatty()
+
+
+def color(s, c):
+    return "\033[%sm%s\033[0m" % (c, s) if TTY else s
+
+
+def git(args, timeout=30):
+    try:
+        p = subprocess.run(["git", "-C", ETC] + args, capture_output=True, text=True, timeout=timeout, check=False)
+        return p.returncode, p.stdout, p.stderr
+    except OSError as ex:
+        return 127, "", str(ex)
+    except subprocess.TimeoutExpired:
+        return 124, "", "przekroczony czas"
+
+
+def ensure_repo():
+    if not os.path.isdir(os.path.join(ETC, ".git")):
+        print(color("Brak historii: %s/.git nie istnieje (etckeeper nieaktywny albo brak uprawnień)." % ETC, "31"),
+              file=sys.stderr)
+        return False
+    return True
+
+
+def norm_path(p):
+    p = p.strip()
+    if p.startswith(ETC + "/"):
+        p = p[len(ETC) + 1:]
+    elif p.startswith("/etc/"):
+        p = p[5:]
+    return p.lstrip("/")
+
+
+def log_rows(path=None, limit=40):
+    args = ["log", "--date=format:%Y-%m-%d %H:%M", "--pretty=format:%h\t%ad\t%s", "-n", str(limit)]
+    if path:
+        args += ["--", path]
+    rc, out, _ = git(args)
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            rows.append(tuple(parts))
+    return rows
+
+
+def recent_files(limit=30):
+    """[(ścieżka, hash ostatniej zmiany, data)], najpierw pliki zmieniane najniedawniej."""
+    rc, out, _ = git(["log", "--name-only", "--pretty=format:\x01%h\t%ad", "--date=format:%Y-%m-%d %H:%M"])
+    if rc != 0:
+        return []
+    order, seen, cur = [], {}, None
+    for line in out.splitlines():
+        if line.startswith("\x01"):
+            h, d = line[1:].split("\t", 1)
+            cur = (h, d)
+        elif line.strip() and cur and line not in seen:
+            seen[line] = cur
+            order.append(line)
+    return [(p,) + seen[p] for p in order[:limit]]
+
+
+def cmd_log(args):
+    if not ensure_repo():
+        return 1
+    path = norm_path(args[0]) if args else None
+    rows = log_rows(path, limit=200 if path else 40)
+    if not rows:
+        print("brak zmian" + (" dla %s" % path if path else "") + " w historii /etc")
+        return 0
+    w = max(len(h) for h, _, _ in rows)
+    for h, d, s in rows:
+        print("%s  %s  %s" % (h.ljust(w), d, s))
+    return 0
+
+
+def cmd_show(args):
+    if not ensure_repo():
+        return 1
+    if len(args) < 2:
+        print("użycie: router-history show HASH PLIK", file=sys.stderr)
+        return 2
+    h, path = args[0], norm_path(args[1])
+    rc, out, err = git(["show", "%s:%s" % (h, path)])
+    if rc != 0:
+        print(color("nie można odczytać %s w %s: %s" % (path, h, err.strip()), "31"), file=sys.stderr)
+        return 1
+    sys.stdout.write(out)
+    return 0
+
+
+def cmd_diff(args):
+    if not ensure_repo():
+        return 1
+    if len(args) < 2:
+        print("użycie: router-history diff HASH PLIK", file=sys.stderr)
+        return 2
+    h, path = args[0], norm_path(args[1])
+    rc, out, err = git(["show", h, "--", path])
+    if rc != 0:
+        print(color("nie można odczytać %s w %s: %s" % (path, h, err.strip()), "31"), file=sys.stderr)
+        return 1
+    if not out.strip():
+        print("ten commit nie zmienił %s (albo plik wtedy nie istniał)" % path)
+        return 0
+    sys.stdout.write(out)
+    return 0
+
+
+def cmd_extract(args):
+    if not ensure_repo():
+        return 1
+    if len(args) < 2:
+        print("użycie: router-history extract HASH PLIK [KATALOG]", file=sys.stderr)
+        return 2
+    h, path = args[0], norm_path(args[1])
+    outdir = args[2] if len(args) > 2 else DEFAULT_OUT
+    rc, out, err = git(["show", "%s:%s" % (h, path)])
+    if rc != 0:
+        print(color("nie można odczytać %s w %s: %s" % (path, h, err.strip()), "31"), file=sys.stderr)
+        return 1
+    _, dout, _ = git(["log", "-1", "--date=format:%Y%m%d-%H%M", "--pretty=format:%ad", h])
+    stamp = dout.strip() or time.strftime("%Y%m%d-%H%M")
+    dest = os.path.join(outdir, "%s.%s.%s" % (os.path.basename(path) or "plik", stamp, h[:7]))
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        with open(dest, "w") as f:
+            f.write(out)
+    except OSError as ex:
+        print(color("nie można zapisać %s: %s" % (dest, ex), "31"), file=sys.stderr)
+        return 1
+    print("zapisano: %s" % dest)
+    return 0
+
+
+def ask(prompt):
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def cmd_menu(_args):
+    if not ensure_repo():
+        return 1
+    while True:
+        files = recent_files()
+        if not files:
+            print("Historia /etc jest pusta.")
+            return 0
+        print(color("Ostatnio zmieniane pliki (najpierw najnowsze):", "1"))
+        for i, (p, _h, d) in enumerate(files, 1):
+            print("  %2d  %-45s  ostatnia zmiana: %s" % (i, p, d))
+        choice = ask("Numer pliku (albo wpisz ścieżkę; Enter = koniec): ").strip()
+        if not choice:
+            return 0
+        path = files[int(choice) - 1][0] if choice.isdigit() and 1 <= int(choice) <= len(files) else norm_path(choice)
+        revs = log_rows(path, limit=100)
+        if not revs:
+            print(color("brak historii dla %s" % path, "33"))
+            continue
+        while True:
+            print()
+            print(color("Zmiany pliku %s:" % path, "1"))
+            for i, (h, d, s) in enumerate(revs, 1):
+                print("  %2d  %s  %s  %s" % (i, h, d, s))
+            sel = ask("Numer zmiany (Enter = wróć do listy plików): ").strip()
+            if not sel:
+                break
+            if not (sel.isdigit() and 1 <= int(sel) <= len(revs)):
+                print(color("nieprawidłowy wybór: %s" % sel, "33"))
+                continue
+            h = revs[int(sel) - 1][0]
+            act = ask("  [p]odgląd / [d]iff / [e]kstrakcja (Enter = powrót): ").strip().lower()
+            if act in ("p", "pod", "podgląd"):
+                cmd_show([h, path])
+            elif act in ("d", "diff"):
+                cmd_diff([h, path])
+            elif act in ("e", "ekstrakcja", "extract"):
+                outdir = ask("  Katalog docelowy [%s]: " % DEFAULT_OUT).strip() or DEFAULT_OUT
+                cmd_extract([h, path, outdir])
+            print()
+
+
+def main():
+    argv = [a for a in sys.argv[1:] if a != "--menu"]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip() + "\n\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return 0
+    if argv and argv[0] in ("-V", "--version"):
+        print("router-history — kopie i historia zmian /etc\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        return 0
+    if not argv:
+        return cmd_menu(argv)
+    cmds = {"log": cmd_log, "show": cmd_show, "diff": cmd_diff, "extract": cmd_extract}
+    name = argv[0]
+    if name not in cmds:
+        print("nieznane polecenie: %s (router-history --help)" % name, file=sys.stderr)
+        return 2
+    return cmds[name](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ROUTER_HISTORY_PY
+}
+
 # router-snmp: kolektor danych (BGP, VPP, firewall, guard, RPKI, RAID, dyski) i pass_persist dla snmpd
 prog_router_snmp() {
   cat <<'ROUTER_SNMP_PY'
@@ -7141,7 +7377,7 @@ prog_router() {
   router files [obszar]         pliki konfiguracyjne: który plik, które narzędzie go czyta, jak zastosować zmiany
   router dataplane              powłoka bash w netns dataplane (ip netns exec dataplane bash); exit = powrót
   router <skrót> [argumenty]    uruchom narzędzie wprost, np. router ifaces diff, router fw apply, router guard status
-  skróty:  ifaces fw guard top notify check update bird arp
+  skróty:  ifaces fw guard top notify check update bird arp history
 
 Czynności zmieniające stan pokazują podgląd i pytają o potwierdzenie; zawsze widać też równoważne polecenie.
 W menu: numer = wybór, 0 = powrót, f = pliki konfiguracyjne, d = powłoka w dataplane, q = wyjście.
@@ -7167,7 +7403,7 @@ AUTOR = "PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
 BIN_DIRS = ("/opt/router/bin", "/usr/local/sbin")
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 TTY = sys.stdout.isatty() and sys.stdin.isatty()          # ekran: czyszczenie i przewijanie tylko na terminalu
-LIVE_ARGS = {"-w", "-f", "--watch", "--follow"}           # czynności na żywo: bez przewijania (less), Ctrl+C wraca
+LIVE_ARGS = {"-w", "-f", "--watch", "--follow", "--menu"}  # czynności na żywo: bez przewijania (less), Ctrl+C wraca
 LIVE_CMDS = {"router-top", "tail", "watch", "less", "vi", "vim", "nano"}
 NETNS = "dataplane"
 
@@ -7379,7 +7615,7 @@ AREAS = [
            ["install-router", "set_workers"], mode="write", params=[P("liczba", "Nowa liczba workerów", required=True)],
            tail=["--yes"], preview=["install-router", "set_workers", "{0}", "--dry-run"])]},
     {"key": "system", "alias": "install-router", "title": "System i aktualizacje",
-     "desc": "wersja, aktualizacja programów, firmware karty, RAID/UEFI, historia zmian /etc",
+     "desc": "wersja, aktualizacja programów, firmware karty, RAID/UEFI",
      "files": [
          F("/opt/router/install-router.sh", "install-router", "kopia instalatora (naprawa etapów, upgrade_script)",
            "install-router --from <nr>", edit=False)],
@@ -7394,13 +7630,32 @@ AREAS = [
          A("Firmware karty: sprawdź", "obecna i dostępna wersja firmware ConnectX", ["router-fw-update", "--check"]),
          A("Firmware karty: aktualizuj", "zapis firmware (pyta o potwierdzenie, wymaga restartu serwera)", ["router-fw-update"],
            mode="write"),
-         A("RAID/UEFI: podgląd", "kopia ESP na drugi dysk RAID1 (dry-run)", ["install-uefi-mdadm", "--dry-run"]),
-         A("Historia zmian /etc", "20 ostatnich zmian zapisanych przez etckeeper", ["git", "-C", "/etc", "log", "--oneline", "-n", "20"])]},
+         A("RAID/UEFI: podgląd", "kopia ESP na drugi dysk RAID1 (dry-run)", ["install-uefi-mdadm", "--dry-run"])]},
+    {"key": "history", "alias": "router-history", "title": "Kopie i historia zmian /etc",
+     "desc": "etckeeper: lista zmian z datami, podgląd pliku z przeszłości, wyciągnięcie kopii do katalogu",
+     "files": [
+         F("/etc/.git", "etckeeper", "historia każdej zmiany w /etc (commit po każdej zmianie)",
+           "git -C /etc log -p <plik>", edit=False)],
+     "actions": [
+         A("Przegląd (wybór pliku i daty)", "lista ostatnio zmienianych plików, potem daty zmian — podgląd albo kopia",
+           ["router-history"], tail=["--menu"]),
+         A("Lista zmian", "hash, data i opis zmian; bez pliku — 40 ostatnich we wszystkich plikach", ["router-history", "log"],
+           params=[P("plik", "Ścieżka względem /etc (Enter = wszystkie pliki)", False)]),
+         A("Podgląd pliku z danej daty", "treść pliku tak, jak wyglądał w wybranym commicie (hash z listy zmian)",
+           ["router-history", "show"],
+           params=[P("commit", "Hash commitu (z listy zmian)", True), P("plik", "Ścieżka pliku względem /etc", True)]),
+         A("Różnice wprowadzone przez zmianę", "co ten commit zmienił w pliku (diff z poprzednią wersją)",
+           ["router-history", "diff"],
+           params=[P("commit", "Hash commitu (z listy zmian)", True), P("plik", "Ścieżka pliku względem /etc", True)]),
+         A("Wyciągnij kopię do katalogu", "zapisuje wskazaną wersję pliku poza /etc — oryginału i stanu routera nie dotyka",
+           ["router-history", "extract"],
+           params=[P("commit", "Hash commitu (z listy zmian)", True), P("plik", "Ścieżka pliku względem /etc", True),
+                   P("katalog", "Katalog docelowy (Enter = /root/router-kopie)", False)])]},
 ]
 
 ALIASES = {"ifaces": ["router-ifaces"], "fw": ["router-fw"], "guard": ["router-guard"], "top": ["router-top"],
            "notify": ["router-notify"], "check": ["install-router", "--check"], "update": ["install-router"], "bird": ["birdc"],
-           "arp": ["vppctl", "show", "ip", "neighbors"]}
+           "arp": ["vppctl", "show", "ip", "neighbors"], "history": ["router-history"]}
 
 
 # --------------------------------------------------------------------------- uruchamianie
@@ -8038,7 +8293,7 @@ Pełna dokumentacja techniczna (architektura, wszystkie pliki, parametry tej ins
 2. **Zawsze w tej kolejności: `check` → `diff` → `apply`.** `diff` pokazuje dokładnie, co się zmieni, i niczego nie rusza.
 3. **Firewall zmieniaj z siatką bezpieczeństwa:** `router-fw apply --confirm 120`. Jeśli zmiana odetnie Ci dostęp albo coś zepsuje, sama się cofnie po 120 s.
 4. **Jeden błąd w pliku = nic nie jest zmieniane.** Po restarcie, gdy plik ma błąd, router użyje ostatniej poprawnej wersji i wyśle alarm `CONFIG_ERROR`.
-5. **Historia `/etc` jest w gicie (etckeeper).** Każdą zmianę da się podejrzeć i cofnąć: `git -C /etc log -p router/firewall.conf`.
+5. **Historia `/etc` jest w gicie (etckeeper).** Przegląd z datami, podgląd i kopia pliku z przeszłości: `router-history` (rozdział 12).
 
 SSH (port zarządzający eth2) działa poza VPP — żadna zmiana interfejsów, firewalla ani guarda nie odetnie dostępu do serwera.
 
@@ -8408,7 +8663,7 @@ router-notify test | categories
 birdc show protocols | configure check | configure
 
 systemctl status router.target            # wszystkie usługi routera
-git -C /etc log -p router/                # historia zmian konfiguracji
+router-history                            # kopie i historia zmian /etc: daty, podgląd, wyciągnięcie do katalogu
 iptables -t raw -L PREROUTING -nv         # ochrona CPU: eth2
 ip netns exec dataplane iptables -t raw -L PREROUTING -nv   # ochrona CPU: adresy VPP, loop0
 chronyc sources                           # synchronizacja czasu
@@ -8426,6 +8681,7 @@ UPGRADE_PROGRAMS=(
   "router-top|/opt/router/bin/router-top|755|prog_router_top|"
   "router-snmp|/opt/router/bin/router-snmp|755|prog_router_snmp|router-snmp.service"
   "router-rpki|/opt/router/bin/router-rpki|755|prog_router_rpki|"
+  "router-history|/opt/router/bin/router-history|755|prog_router_history|"
   "router-alert|/opt/router/bin/router-alert|755|prog_router_alert|"
   "router-bootcheck|/opt/router/bin/router-bootcheck|755|prog_router_bootcheck|"
   "mdadm-alert|/opt/router/bin/mdadm-alert|755|prog_mdadm_alert|"
@@ -11562,6 +11818,8 @@ st_etckeeper() {
   fi
   etckeeper commit "install-router.sh: stan przed instalacją routera" >/dev/null 2>&1 || true
   man_add dir /etc/.git "etckeeper: historia zmian /etc (git log -C /etc, tylko root)"
+  prog_router_history | put_file /opt/router/bin/router-history \
+    "router-history: kopie i historia zmian /etc — lista z datami, podgląd, wyciągnięcie kopii do katalogu" 755
   ok "etckeeper aktywny: $(git -C /etc log --oneline | wc -l) commitów w historii /etc"
 }
 
@@ -13570,6 +13828,7 @@ Polecenie **`router`** to jedno wejście do wszystkich narzędzi. Po wpisaniu `r
   1  Interfejsy                 2  Firewall tranzytu          3  Ochrona przed odbiciami
   4  Status i podgląd na żywo   5  Monitoring i alarmy e-mail 6  BGP / BIRD
   7  SNMP, sFlow i SSH          8  VPP (data plane)           9  System i aktualizacje
+ 10  Kopie i historia zmian /etc
   f  Pliki konfiguracyjne       q  Wyjście
 ```
 
@@ -13602,10 +13861,18 @@ Community SNMP: `/etc/router/router.env` (zmienna `SNMP_COMMUNITY`). snmpd dzia�
 
 ## 12. Zmiany, awarie, przywracanie
 
-**Historia `/etc` (etckeeper).** Każda zmiana w `/etc` jest w gicie:
+**Historia `/etc` (etckeeper).** Każda zmiana w `/etc` jest w gicie. Przeglądanie gołym `git log` jest niewygodne
+(brak dat w `--oneline`, trzeba znać ścieżkę), więc do przeglądania, podglądu i wyciągania kopii służy
+**`router-history`** (albo obszar 10 w menu `router`, „Kopie i historia zmian /etc”):
 
 ```
-git -C /etc log --oneline            # historia
+router-history                                        # przegląd: plik → daty zmian → podgląd/diff/kopia
+router-history log [router/firewall.conf]              # hash, data i opis zmian (albo tylko dla jednego pliku)
+router-history show <hash> router/firewall.conf        # treść pliku tak, jak wyglądał w tym commicie
+router-history diff <hash> router/firewall.conf         # co ten commit zmienił w pliku
+router-history extract <hash> router/firewall.conf [katalog]   # kopia tej wersji do katalogu (domyślnie /root/router-kopie)
+
+git -C /etc log --oneline            # historia (bez dat) — wprost z gita
 git -C /etc show <commit>            # co się zmieniło
 git -C /etc checkout <commit> -- vpp/startup.conf    # przywrócenie jednego pliku
 etckeeper commit "opis zmiany"       # własny commit po ręcznej zmianie

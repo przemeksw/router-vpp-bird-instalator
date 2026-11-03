@@ -431,10 +431,17 @@ Community SNMP: `/etc/router/router.env` (zmienna `SNMP_COMMUNITY`). snmpd dzia�
 
 ## 12. Zmiany, awarie, przywracanie
 
-**Historia /etc (etckeeper).** Każda zmiana w `/etc` jest w gicie:
+**Historia /etc (etckeeper).** Każda zmiana w `/etc` jest w gicie. Do przeglądania, podglądu i wyciągania kopii
+służy **`router-history`** (albo obszar 10 w menu `router`, „Kopie i historia zmian /etc”):
 
 ```
-git -C /etc log --oneline            # historia
+router-history                                        # przegląd: plik → daty zmian → podgląd/diff/kopia
+router-history log [router/firewall.conf]              # hash, data i opis zmian (albo tylko dla jednego pliku)
+router-history show <hash> router/firewall.conf        # treść pliku tak, jak wyglądał w tym commicie
+router-history diff <hash> router/firewall.conf         # co ten commit zmienił w pliku
+router-history extract <hash> router/firewall.conf [katalog]   # kopia tej wersji do katalogu (domyślnie /root/router-kopie)
+
+git -C /etc log --oneline            # historia (bez dat) — wprost z gita
 git -C /etc show <commit>            # co się zmieniło
 git -C /etc checkout <commit> -- vpp/startup.conf    # przywrócenie jednego pliku
 etckeeper commit "opis zmiany"       # własny commit po ręcznej zmianie

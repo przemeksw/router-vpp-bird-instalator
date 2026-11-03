@@ -254,5 +254,9 @@ t "errors: przyrost +4"                     0 bash -c "vpp() { :; }; $W/bin/fake
 t "errors: bez przyrostu = kod 0"           0 $RI errors
 t "errors -w: odświeża i kończy po Ctrl+C"  0 watch2 python3 $PWD/build/router-ifaces errors -w --interval 1
 
+echo
+echo "14. router-history"
+python3 tests/test_router_history.py || fail=$((fail + 1))
+
 printf '\nWynik: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))

@@ -205,7 +205,9 @@ router-ifaces apply     # wdrożenie na żywo, bez restartu VPP
 router-ifaces           # stan interfejsów
 ```
 
-Zmiany w `/etc` są automatycznie wersjonowane na routerze przez etckeeper (`git -C /etc log -p router/ifaces.conf`).
+Zmiany w `/etc` są automatycznie wersjonowane na routerze przez etckeeper. Zamiast przeglądać to gołym gitem,
+`router-history` pokazuje listę zmian z datami, podgląd pliku z przeszłości i wyciąga wybraną wersję do katalogu
+(`router-history`, albo obszar „Kopie i historia zmian /etc” w menu `router`).
 
 ## Monitoring SNMP (`router-snmp`)
 
