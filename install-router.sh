@@ -13602,7 +13602,7 @@ Community SNMP: `/etc/router/router.env` (zmienna `SNMP_COMMUNITY`). snmpd dzia�
 
 ## 12. Zmiany, awarie, przywracanie
 
-**Historia /etc (etckeeper).** Każda zmiana w `/etc` jest w gicie:
+**Historia `/etc` (etckeeper).** Każda zmiana w `/etc` jest w gicie:
 
 ```
 git -C /etc log --oneline            # historia
