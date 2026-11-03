@@ -5512,6 +5512,7 @@ np. router/firewall.conf. HASH — z „router-history log” albo z przeglądu.
 nie zmienia w /etc — tylko odkłada wskazaną wersję pliku gdzie indziej, do przeglądnięcia albo porównania.
 """
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -5631,6 +5632,15 @@ def cmd_diff(args):
     return 0
 
 
+def unsafe_dir(path):
+    """Katalog do zapisu kopii jest niebezpieczny: wpisywalny przez innych bez sticky bitu (jak /tmp bez niego)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return bool(st.st_mode & stat.S_IWOTH) and not bool(st.st_mode & stat.S_ISVTX)
+
+
 def cmd_extract(args):
     if not ensure_repo():
         return 1
@@ -5646,14 +5656,24 @@ def cmd_extract(args):
     _, dout, _ = git(["log", "-1", "--date=format:%Y%m%d-%H%M", "--pretty=format:%ad", h])
     stamp = dout.strip() or time.strftime("%Y%m%d-%H%M")
     dest = os.path.join(outdir, "%s.%s.%s" % (os.path.basename(path) or "plik", stamp, h[:7]))
+    existed = os.path.isdir(outdir)
     try:
         os.makedirs(outdir, exist_ok=True)
-        with open(dest, "w") as f:
+        if not existed:
+            os.chmod(outdir, 0o700)
+        elif unsafe_dir(outdir):
+            print(color("katalog %s jest wpisywalny przez innych (bez sticky bitu) — wskaż inny, to kopia z /etc."
+                         % outdir, "31"), file=sys.stderr)
+            return 1
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(out)
+        os.chmod(dest, 0o600)
     except OSError as ex:
         print(color("nie można zapisać %s: %s" % (dest, ex), "31"), file=sys.stderr)
         return 1
     print("zapisano: %s" % dest)
+    print("  uprawnienia: 0600, tylko właściciel (katalog 0700, jeśli nowy)")
     return 0
 
 

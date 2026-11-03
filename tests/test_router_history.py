@@ -7,6 +7,7 @@ przegląd interaktywny (na prawdziwym gicie, bez atrap) — bez roota, działa n
 """
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -125,12 +126,16 @@ class TestShowAndDiff(Base):
 
 
 class TestExtract(Base):
+    @staticmethod
+    def extracted_path(out):
+        return out.split("zapisano:", 1)[1].splitlines()[0].strip()
+
     def test_extract_writes_copy_named_with_date_and_hash(self):
         outdir = os.path.join(self.d, "kopie")
         rc, out = self.run_history("extract", self.h2, "router/firewall.conf", outdir)
         self.assertEqual(rc, 0, out)
         self.assertIn("zapisano:", out)
-        dest = out.split("zapisano:", 1)[1].strip()
+        dest = self.extracted_path(out)
         self.assertTrue(dest.startswith(outdir))
         self.assertTrue(os.path.basename(dest).startswith("firewall.conf."))
         self.assertIn(self.h2[:7], os.path.basename(dest))
@@ -143,8 +148,44 @@ class TestExtract(Base):
     def test_extract_default_directory_when_not_given(self):
         rc, out = self.run_history("extract", self.h1, "router/firewall.conf")
         self.assertEqual(rc, 0, out)
-        dest = out.split("zapisano:", 1)[1].strip()
+        dest = self.extracted_path(out)
         self.assertTrue(dest.startswith(os.path.join(self.root, "root", "router-kopie")))
+
+    def test_extract_file_and_new_directory_are_locked_down(self):
+        outdir = os.path.join(self.d, "kopie-prywatne")
+        rc, out = self.run_history("extract", self.h2, "router/firewall.conf", outdir)
+        self.assertEqual(rc, 0, out)
+        dest = self.extracted_path(out)
+        self.assertEqual(stat_mode_bits(dest), 0o600)                      # kopia: tylko właściciel
+        self.assertEqual(stat_mode_bits(outdir), 0o700)                    # nowy katalog: tylko właściciel
+
+    def test_extract_does_not_tighten_a_preexisting_directory(self):
+        outdir = os.path.join(self.d, "juz-istniejacy")
+        os.makedirs(outdir, mode=0o755)
+        os.chmod(outdir, 0o755)                                            # makedirs honoruje umask, wymuś 0755
+        rc, _out = self.run_history("extract", self.h2, "router/firewall.conf", outdir)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stat_mode_bits(outdir), 0o755)                    # katalog zastany — nietknięty
+
+    def test_extract_refuses_world_writable_directory_without_sticky_bit(self):
+        outdir = os.path.join(self.d, "wspolny")
+        os.makedirs(outdir)
+        os.chmod(outdir, 0o777)                                            # world-writable, bez sticky bitu
+        rc, out = self.run_history("extract", self.h2, "router/firewall.conf", outdir)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("wpisywalny przez innych", out)
+        self.assertEqual(os.listdir(outdir), [])                           # niczego nie zapisano
+
+    def test_extract_allows_world_writable_directory_with_sticky_bit(self):
+        outdir = os.path.join(self.d, "tmp-jak")
+        os.makedirs(outdir)
+        os.chmod(outdir, 0o777 | stat.S_ISVTX)                             # jak /tmp
+        rc, out = self.run_history("extract", self.h2, "router/firewall.conf", outdir)
+        self.assertEqual(rc, 0, out)
+
+
+def stat_mode_bits(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
 
 
 class TestUnknownCommand(Base):
