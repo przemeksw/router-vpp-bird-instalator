@@ -171,6 +171,10 @@ echo
 python3 tests/test_router_monitor.py || fail=$((fail + 1))
 
 echo
+echo "9b. router-kthreads (wątki kernela poza rdzeniami VPP)"
+python3 tests/test_router_kthreads.py || fail=$((fail + 1))
+
+echo
 echo "10. router-top"
 python3 tests/test_router_top.py || fail=$((fail + 1))
 
@@ -184,51 +188,53 @@ python3 tests/test_router_rpki.py || fail=$((fail + 1))
 
 echo
 echo "13. router-ifaces optics (DDM wkładek)"
-mkdir -p "$W/root/sys/bus/pci/devices/0000:82:00.0/net/ens1f0np0" "$W/root/sys/bus/pci/devices/0000:82:00.1/net/ens1f1np1"
-cat >"$W/ddm-ens1f0np0" <<'D'
-	Identifier                                : 0x11 (QSFP28)
-	Vendor name                               : FS
-	Vendor PN                                 : QSFP28-LR4-100G
-	Vendor SN                                 : F2030012345
-	Module temperature                        : 38.20 degrees C / 100.76 degrees F
-	Module voltage                            : 3.2900 V
-	Alarm/warning flags implemented           : Yes
-	Laser tx bias current (Channel 1)         : 40.000 mA
-	Laser tx bias current (Channel 2)         : 41.000 mA
-	Transmit avg optical power (Channel 1)    : 0.8913 mW / -0.50 dBm
-	Transmit avg optical power (Channel 2)    : 0.9120 mW / -0.40 dBm
-	Rcvr signal avg optical power(Channel 1)  : 0.7943 mW / -1.00 dBm
-	Rcvr signal avg optical power(Channel 2)  : 0.0000 mW / -inf dBm
-	Laser bias current high alarm   (Chan 1)  : Off
-	Laser rx power low alarm   (Chan 2)       : On
-	Laser bias current high alarm threshold   : 75.000 mA
-	Laser bias current low alarm threshold    : 10.000 mA
-	Laser output power high alarm threshold   : 3.1623 mW / 5.00 dBm
-	Laser output power low alarm threshold    : 0.1000 mW / -10.00 dBm
-	Laser output power high warning threshold : 2.5119 mW / 4.00 dBm
-	Laser output power low warning threshold  : 0.1585 mW / -8.00 dBm
-	Laser rx power high alarm threshold       : 3.1623 mW / 5.00 dBm
-	Laser rx power low alarm threshold        : 0.0398 mW / -14.00 dBm
-	Laser rx power high warning threshold     : 2.5119 mW / 4.00 dBm
-	Laser rx power low warning threshold      : 0.0794 mW / -11.00 dBm
-	Module temperature high alarm threshold   : 75.00 degrees C / 167.00 degrees F
-	Module temperature low alarm threshold    : -5.00 degrees C / 23.00 degrees F
+cat >"$W/ddm-hu0" <<'D'
+Interface: hu0
+  EEPROM Type: 0x03 (SFF-8636)
+  Module Base Information:
+    Vendor Name: FS
+    Vendor OUI: 00:00:00
+    Vendor Part Number: QSFP28-LR4-100G
+    Vendor Serial Number: F2030012345
+    Identifier: 0x11 (QSFP28)
+    Extended Identifier: 0x00
+    Connector: 0x00 (Unknown)
+    Encoding: 0x00 (Unknown)
+    Nominal Bit Rate: 0 Mbps
+    Vendor Revision: 01
+    Wavelength: 1310.000 nm
+    Date Code: 200301
+  Module Diagnostics:
+    Current Values:
+      Temperature: 38.20 °C
+      Supply Voltage: 3.2900 V
+      Lane 1:
+        TX Bias Current: 40.00 mA
+        TX Average Power: 0.8913 mW (-0.50 dBm)
+        RX Average Power: 0.7943 mW (-1.00 dBm)
+      Lane 2:
+        TX Bias Current: 41.00 mA
+        TX Average Power: 0.9120 mW (-0.40 dBm)
+        RX Average Power: 0.0000 mW (-inf dBm)
+    Alarm Thresholds:
+      Temperature High: 75.00 °C, Low: -5.00 °C
+      Voltage High: 3.6300 V, Low: 2.9700 V
+      Bias Current High: 75.00 mA, Low: 10.00 mA
+      TX Power High: 3.1623 mW (5.00 dBm), Low: .1000 mW (-10.00 dBm)
+      RX Power High: 3.1623 mW (5.00 dBm), Low: .0398 mW (-14.00 dBm)
+    Warning Thresholds:
+      TX Power High: 2.5119 mW (4.00 dBm), Low: .1585 mW (-8.00 dBm)
+      RX Power High: 2.5119 mW (4.00 dBm), Low: .0794 mW (-11.00 dBm)
 D
-cat >"$W/bin/fakeethtool" <<E
-#!/bin/sh
-[ -f "$W/ddm-\$2" ] && exec cat "$W/ddm-\$2"
-echo "netlink error: Operation not supported" >&2; exit 1
-E
-chmod 755 "$W/bin/fakeethtool"
-export ROUTER_IFACES_ETHTOOL=$W/bin/fakeethtool
+vpp fake transceiver hu0 "$W/ddm-hu0" >/dev/null
 t "optics: tor bez światła = alarm (kod 1)" 1 $RI optics
 t "optics: moc RX toru 1"                   0 has "-1.00" $RI optics
 t "optics: typ i model modułu"              0 has "QSFP28 FS QSFP28-LR4-100G" $RI optics
 t "optics: port bez DDM opisany"            0 has "moduł bez DDM" $RI optics
-t "optics: flaga modułu"                    0 has "Laser rx power low alarm" $RI optics
+t "optics: ALARM liczony z wartości (bez osobnej flagi modułu)" 0 has "ALARM" $RI optics
 t "optics --json: progi RX"                 0 has '"low alarm": -14.0' $RI optics --json
-sed -i.bak 's#0.0000 mW / -inf dBm#0.7000 mW / -1.55 dBm#; /Chan 2)       : On/d' "$W/ddm-ens1f0np0"
-cp "$W/ddm-ens1f0np0" "$W/ddm-ens1f1np1"
+sed -i.bak 's#0.0000 mW (-inf dBm)#0.7000 mW (-1.55 dBm)#' "$W/ddm-hu0"
+vpp fake transceiver hu1 "$W/ddm-hu0" >/dev/null
 t "optics: wszystko w normie (kod 0)"       0 $RI optics
 t "optics: link i prędkość z VPP"           0 has "100Gbps" $RI optics
 vpp fake link-down hu0 >/dev/null

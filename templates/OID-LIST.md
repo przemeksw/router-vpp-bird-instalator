@@ -16,7 +16,7 @@ Typy: int = Integer32, gauge = Gauge32, counter = Counter32, counter64 = Counter
 | `1.3.6.1.4.1.8072.9999.9999.630.2.3.0` | rvVppWorkers | gauge |  | Liczba workerow VPP |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.4.0` | rvVppPuntPps | gauge | pps | Ruch do control plane (punt), pakiety/s |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.5.0` | rvVppRxMissPps | gauge | pps | Pakiety gubione na wejsciu (rx-miss + rx-no-buf), pakiety/s |
-| `1.3.6.1.4.1.8072.9999.9999.630.2.6.0` | rvVppNicDiscardPps | gauge | pps | Pakiety odrzucane sprzetowo przez karte, pakiety/s |
+| `1.3.6.1.4.1.8072.9999.9999.630.2.6.0` | rvVppNicDiscardPps | gauge | pps | Pakiety odrzucane sprzetowo przez karte (xstats discard, bez rx_out_of_buffer), pakiety/s |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.7.0` | rvVppHkCpuMax | gauge | % | Najbardziej zajety rdzen systemowy (BIRD, SNMP, system), % |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.8.0` | rvVppBufAvail | gauge |  | Bufory VPP wolne |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.9.0` | rvVppBufUsed | gauge |  | Bufory VPP zajete |
@@ -25,7 +25,7 @@ Typy: int = Integer32, gauge = Gauge32, counter = Counter32, counter64 = Counter
 | `1.3.6.1.4.1.8072.9999.9999.630.2.12.0` | rvVppDrops | counter64 |  | Suma licznikow drops interfejsow VPP |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.13.0` | rvVppRxMiss | counter64 |  | Suma rx-miss i rx-no-buf portow |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.14.0` | rvVppPunt | counter64 |  | Suma pakietow punt |
-| `1.3.6.1.4.1.8072.9999.9999.630.2.15.0` | rvVppErrors | counter64 |  | Suma licznikow show errors o poziomie error |
+| `1.3.6.1.4.1.8072.9999.9999.630.2.15.0` | rvVppErrors | counter64 |  | Suma licznikow show errors o poziomie error, bez licznikow objetosci (ACL permit/checked, odpowiedzi/zapytania wyslane) |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.16.0` | rvFib4Routes | gauge |  | Trasy IPv4 w FIB VPP (VRF 0) |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.17.0` | rvFib6Routes | gauge |  | Trasy IPv6 w FIB VPP (VRF 0) |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.18.0` | rvBird4Routes | gauge |  | Sieci IPv4 w tablicy master4 BIRD |
@@ -43,7 +43,7 @@ Typy: int = Integer32, gauge = Gauge32, counter = Counter32, counter64 = Counter
 | `1.3.6.1.4.1.8072.9999.9999.630.4.1.6` | rvPortTxErrors | counter64 |  | tx-error |
 | `1.3.6.1.4.1.8072.9999.9999.630.4.1.7` | rvPortDrops | counter64 |  | drops |
 | `1.3.6.1.4.1.8072.9999.9999.630.4.1.8` | rvPortPunt | counter64 |  | punt (ruch do control plane) |
-| `1.3.6.1.4.1.8072.9999.9999.630.4.1.9` | rvPortHwDiscards | counter64 |  | Odrzucenia sprzetowe karty (xstats discard, out_of_buffer) |
+| `1.3.6.1.4.1.8072.9999.9999.630.4.1.9` | rvPortHwDiscards | counter64 |  | Odrzucenia sprzetowe karty (xstats discard; rx_out_of_buffer = rvPortRxMiss) |
 | `1.3.6.1.4.1.8072.9999.9999.630.5.1.1` | rvErrorIndex | int |  | Indeks |
 | `1.3.6.1.4.1.8072.9999.9999.630.5.1.2` | rvErrorNode | string |  | Wezel grafu VPP |
 | `1.3.6.1.4.1.8072.9999.9999.630.5.1.3` | rvErrorReason | string |  | Powod |

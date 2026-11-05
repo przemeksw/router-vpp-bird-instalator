@@ -36,7 +36,8 @@ class TestIfacesScreen(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         os.makedirs(self.root + "/etc/router")
         with open(self.root + "/etc/router/ifaces.conf", "w") as f:
-            f.write("hu0 - - - Trunk 100G\nhu0 100 192.0.2.2/30 - Transit: EPIX\nhu0 300 10.0.0.1/30 - Core: BNG\n")
+            f.write("hu0 - - - Trunk 100G\nhu0 100 192.0.2.2/30 - netflow Transit: EPIX\n"
+                    "hu0 300 10.0.0.1/30 - nonetflow Core: BNG\n")
         top.IFACES_CONF = self.root + "/etc/router/ifaces.conf"
 
     def tearDown(self):
@@ -54,6 +55,9 @@ class TestIfacesScreen(unittest.TestCase):
         self.assertIn("2.00 M", text)                        # hu0 RX pkt/s
         self.assertIn("└ hu0.100", text)                     # VLAN pod portem
         self.assertIn("Transit: EPIX", text)                 # opis z ifaces.conf
+        descs = top.read_descs()
+        self.assertEqual(descs["hu0.100"], ("netflow", "Transit: EPIX"))      # znacznik osobno, nie w opisie
+        self.assertEqual(descs["hu0.300"], ("nonetflow", "Core: BNG"))
         self.assertNotIn("local0", text)
         self.assertNotIn("tap4096", text)
         self.assertLess(text.index("hu0 "), text.index("└ hu0.100"))

@@ -27,14 +27,16 @@ tail -f /var/log/router/alarmy.log   # alarmy na żywo
    │ VPP v26.06  — forwarding pakietów                     │
    │   main-core 3, workery 5,7,9,11,13,15,17,19,21,23,25,27 (NUMA 1)  │
    │   linux-cp: lustro interfejsów do netns "dataplane"       │
-   │   sflow: próbki 1:10000 → hsflowd                  │
+   │   NetFlow/IPFIX (flowprobe) → tap0/nf-export (dedykowany) │
    └───────┬───────────────────────────────┬──────────────────┘
-           │ TAP (linux-cp)                │ statystyki (/run/vpp/stats.sock)
+           │ TAP (linux-cp + nf-export)    │ statystyki (/run/vpp/stats.sock)
    ┌───────┴──────────────────────┐   ┌────┴─────────────────────────────┐
    │ netns "dataplane"             │   │ router-monitor (alarmy co 1 s)    │
    │   BIRD 3 (BGP)  → trasy do    │   │ vpp-snmp-agent (liczniki → SNMP)  │
-   │     kernela → linux-nl → VPP  │   │ hsflowd (sFlow → kolektor)        │
-   │   snmpd (UDP 161, LibreNMS)   │   └───────────────────────────────────┘
+   │     kernela → linux-nl → VPP  │   └───────────────────────────────────┘
+   │   snmpd (UDP 161, LibreNMS)   │
+   │   router-netflow               │
+   │     → FastNetMon, Akvorado…   │
    └───────────────────────────────┘
    Zarządzanie awaryjne: port 1G na płycie (eth2) + iDRAC — poza VPP.
 ```
@@ -44,6 +46,7 @@ Zasada działania:
 - **VPP** przekazuje cały ruch tranzytowy. Kernel Linuksa go nie widzi (dlatego iptables/nftables nie filtrują tranzytu — robią to ACL-e w VPP).
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
+- **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
 - Rdzenie VPP są wyłączone z harmonogramu systemu (`isolcpus=3,5,7,9,11,13,15,17,19,21,23,25,27`), a karta i VPP pracują na tym samym węźle NUMA (1).
 
 ---
@@ -61,10 +64,9 @@ Po restarcie serwera wstają same, w tej kolejności:
 | 4 | `bird.service` | BGP (w netns dataplane), startuje po odtworzeniu interfejsów | restartuje się razem z VPP; po awarii restart po 5 s |
 | 5 | `snmpd-dataplane.service` | SNMP dla LibreNMS (UDP 161 w netns dataplane) | restart |
 | 6 | `vpp-snmp-agent.service` | liczniki interfejsów VPP → SNMP (AgentX), opisy z ifaces.conf | restart po 5 s |
-| 7 | `hsflowd.service` | eksport sFlow do kolektora | — |
-| 8 | `router-monitor.service` | alarmy obciążenia w czasie rzeczywistym | restart po 5 s |
-| 9 | `router-notify.service` | wysyła alarmy e-mailem (kolejka `/var/spool/router-notify`) | restart po 10 s |
-| 10 | `router-bootcheck.service` | po starcie: wykrywa nieczysty restart / kernel panic, sprawdza usługi, wynik do logu i e-mailem | przy starcie i zamknięciu systemu |
+| 7 | `router-monitor.service` | alarmy obciążenia w czasie rzeczywistym | restart po 5 s |
+| 8 | `router-notify.service` | wysyła alarmy e-mailem (kolejka `/var/spool/router-notify`) | restart po 10 s |
+| 9 | `router-bootcheck.service` | po starcie: wykrywa nieczysty restart / kernel panic, sprawdza usługi, wynik do logu i e-mailem | przy starcie i zamknięciu systemu |
 | — | `router-ifaces-check.timer` | co 5 min: czy VPP zgadza się z ifaces.conf (rozjazd → alarm) | — |
 | — | `mdmonitor` / `smartd` | zdarzenia RAID / zdrowie dysków | — |
 | — | `irqbalance` | przerwania z pominięciem rdzeni VPP | — |
@@ -107,10 +109,9 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/router/notify.conf` | SMTP i odbiorcy alarmów (tylko root, poza historią etckeeper — zawiera hasło) |
 | `/etc/router/hardware-audit.md` | wynik audytu sprzętu z instalacji |
 | `/etc/vpp/startup.conf` | konfiguracja VPP (rdzenie, pamięć, porty, linux-cp) |
-| `/etc/vpp/bootstrap.vpp` | polecenia VPP po starcie (MTU 1500, porty up, sFlow) |
+| `/etc/vpp/bootstrap.vpp` | polecenia VPP po starcie (MTU 1500, porty up, NetFlow/IPFIX) |
 | `/etc/bird/bird.conf`, `/etc/bird/conf.d/` | BIRD (sesje BGP dokłada skrypt sieciowy w `conf.d/`) |
 | `/etc/snmp/snmpd.conf` | SNMP (community, AgentX, extend mdadm) |
-| `/etc/hsflowd.conf` | kolektor sFlow |
 | `/etc/systemd/system/router.target` | grupa usług routera |
 | `/etc/systemd/system/*.service`, `*.service.d/` | jednostki i nakładki systemd |
 | `/etc/sysctl.d/81-vpp-router.conf`, `82-router-neigh.conf` | hugepages, bufory netlink, tablice ARP/ND |
@@ -119,8 +120,9 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/mdadm/mdadm.conf` | `PROGRAM /opt/router/bin/mdadm-alert` |
 | `/etc/smartd.conf` | `-M exec /opt/router/bin/smartd-alert` |
 | `/etc/sysctl.d/83-router-panic.conf` | restart po kernel panic / oops / zawieszeniu kernela |
+| `/etc/sysctl.d/85-router-isolation.conf` | watchdog na rdzeniach systemowych, `numa_balancing` wyłączony |
 | `/etc/systemd/system.conf.d/90-router-watchdog.conf` | watchdog sprzętowy (restart przy całkowitym zawieszeniu) |
-| `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo |
+| `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo, transparent hugepages `madvise` |
 | `/var/lib/router/` | znaczniki czystego wyłączenia (wykrywanie awarii), stan `router-ifaces` (`ifaces.state.json`, `ifaces.last-good.conf`) |
 | `/var/spool/router-notify/` | kolejka alarmów do wysłania e-mailem |
 | `/var/log/router/` | logi alarmów (60 dni, rotacja dzienna) |
@@ -176,7 +178,7 @@ Format jak w syslogu Cisco: `%OBSZAR-POZIOM-ZDARZENIE: opis`. Poziom: 1 = alarm 
 | Komunikat | Znaczenie | Co zrobić |
 |---|---|---|
 | `%VPP-4-LOAD_HIGH` | wektor workera ≥ `VEC_WARN` | obserwować; przy częstych wystąpieniach rozważyć więcej workerów |
-| `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (sFlow/FastNetMon), ewentualnie blackhole |
+| `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (NetFlow/FastNetMon), ewentualnie blackhole |
 | `%VPP-5-LOAD_NORMAL` | koniec przeciążenia, z czasem trwania i szczytem | — |
 | `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: zidentyfikować cel ataku, RTBH/Flowspec u upstreamu |
 | `%VPP-3-NIC_DISCARD` | karta odrzuca pakiety sprzętowo | limit karty/PCIe; przy stałym występowaniu — ConnectX-5 |
@@ -418,7 +420,8 @@ router-ifaces                         # interfejsy: stan, adresy, opisy (rozdzia
 vppctl show interface                 # porty i liczniki
 vppctl show hardware-interfaces hu0   # szczegóły karty, liczniki sprzętowe
 vppctl show runtime                   # obciążenie workerów (kolumna Vectors/Call)
-vppctl show sflow
+vppctl show flowprobe params          # NetFlow/IPFIX: parametry eksportu
+vppctl show flowprobe statistics      # NetFlow/IPFIX: liczniki — czy coś realnie eksportuje
 birdc show protocols                  # sesje BGP (birdc działa z każdego miejsca)
 birdc show route count
 ip netns exec dataplane ip addr       # interfejsy widziane przez BIRD/SNMP
@@ -492,7 +495,7 @@ apt-mark unhold bird3 && apt-get install bird3 && apt-mark hold bird3
 | Wersja VPP | v26.06 |
 | Router ID BIRD | 192.168.80.111 (zmieni go skrypt sieciowy na adres loopbacka) |
 | SNMP — dozwolone źródło | 192.168.80.0/24 |
-| sFlow | 1:10000, kolektor: brak (uzupełnij /etc/hsflowd.conf) |
+| NetFlow/IPFIX | kolektor: brak (uzupełnij NETFLOW_COLLECTOR w ustawieniach skryptu):2055 |
 | Hugepages | 7900 × 2 MB |
 | Sterta VPP / bufory | 4G / 262144 |
 | Alarmy e-mail | noc@tradepartner.pl |

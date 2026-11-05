@@ -21,6 +21,7 @@ extract ROUTER_TOP_PY     router-top
 extract ROUTER_SNMP_PY    router-snmp
 extract ROUTER_RPKI_PY    router-rpki
 extract ROUTER_HISTORY_PY router-history
+extract ROUTER_KTHREADS_PY router-kthreads
 mkdir -p build/synack_guard
 extract GUARD_CORE_H      synack_guard/synack_guard_core.h
 extract GUARD_PLUGIN_C    synack_guard/synack_guard.c

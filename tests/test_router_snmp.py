@@ -181,7 +181,7 @@ ActiveState=failed
 SubState=failed
 UnitFileState=enabled
 ConditionResult=yes
-Id=hsflowd.service
+Id=snmpd-mgmt.service
 
 Type=simple
 Result=success
@@ -240,8 +240,9 @@ class TestParsers(unittest.TestCase):
         self.assertTrue(rs.phys_if("hu0"))
         self.assertFalse(rs.phys_if("hu0.100") or rs.phys_if("loop0") or rs.phys_if("local0") or rs.phys_if("tap1"))
 
-    def test_hw_xstats_ignores_tx(self):
-        self.assertEqual(rs.parse_hw_xstats(SHOW_HW), {"hu0": 15, "hu1": 0, "local0": 0})
+    def test_hw_xstats_ignores_tx_and_out_of_buffer(self):
+        # rx_out_of_buffer (3) to ten sam licznik co rx-miss — nie wchodzi do odrzuceń sprzętowych
+        self.assertEqual(rs.parse_hw_xstats(SHOW_HW), {"hu0": 12, "hu1": 0, "local0": 0})
 
     def test_show_errors_sums_threads(self):
         errs = sorted(rs.parse_show_errors(SHOW_ERRORS))
@@ -305,7 +306,7 @@ class TestParsers(unittest.TestCase):
         self.assertEqual(rs.service_up(us["vpp.service"]), 1)
         self.assertEqual(rs.service_up(us["router-ifaces.service"]), 1)     # oneshot zakończony sukcesem
         self.assertEqual(rs.service_up(us["router-fw.service"]), 1)         # celowo nieaktywny (warunek)
-        self.assertEqual(rs.service_up(us["hsflowd.service"]), 0)
+        self.assertEqual(rs.service_up(us["snmpd-mgmt.service"]), 0)
 
     def test_smart(self):
         r = rs.smart_row(SMART_SDA)
@@ -441,7 +442,7 @@ class TestCollector(unittest.TestCase):
         self.assertEqual(t["rvWorkerTable"]["1"]["rvWorkerName"], "worker 1 cpu 5")
         self.assertEqual(sorted(r["rvPortName"] for r in t["rvPortTable"].values()), ["hu0", "hu1"])
         hu0 = by("rvPortTable", "rvPortName", "hu0", d)
-        self.assertEqual((hu0["rvPortRxMiss"], hu0["rvPortRxNoBuf"], hu0["rvPortHwDiscards"]), (42, 3, 15))
+        self.assertEqual((hu0["rvPortRxMiss"], hu0["rvPortRxNoBuf"], hu0["rvPortHwDiscards"]), (42, 3, 12))
         e4 = by("rvBgpPeerTable", "rvBgpPeerName", "epix4", d)
         self.assertEqual((e4["rvBgpPeerState"], e4["rvBgpPeerEnabled"], e4["rvBgpPeerImported"], e4["rvBgpPeerFiltered"],
                           e4["rvBgpPeerImportLimit"], e4["rvBgpPeerAfi"]), (6, 1, 950000, 12, 1000000, "ipv4"))
@@ -455,7 +456,7 @@ class TestCollector(unittest.TestCase):
         self.assertEqual((rp["rvRpkiUp"], rp["rvRpkiVrp4"], rp["rvRpkiVrp6"]), (1, 450000, 120000))
         svc = {r["rvServiceName"]: r["rvServiceUp"] for r in t["rvServiceTable"].values()}
         self.assertEqual(svc, {"vpp.service": 1, "bird.service": 1, "router-ifaces.service": 1, "router-fw.service": 1,
-                               "hsflowd.service": 0})
+                               "snmpd-mgmt.service": 0})
         self.assertEqual(s["rvServicesDown"], 1)
         self.assertEqual(by("rvRaidTable", "rvRaidName", "md1", d)["rvRaidDegraded"], 1)
         self.assertEqual(by("rvDiskTable", "rvDiskName", "nvme0", d)["rvDiskHealthOk"], 0)

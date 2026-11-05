@@ -149,7 +149,7 @@ put router_vpp_ports.xml <<'ROUTER_VPP_XML'
 			<oid>.1.3.6.1.4.1.8072.9999.9999.630.4.1.8</oid>
 		</rvPortPunt>
 		<rvPortHwDiscards>
-			<name>Odrzucenia sprzetowe karty (xstats discard, out_of_buffer)</name>
+			<name>Odrzucenia sprzetowe karty (xstats discard; rx_out_of_buffer = rvPortRxMiss)</name>
 			<method>walk</method>
 			<source>value</source>
 			<direction>output</direction>
@@ -8200,10 +8200,10 @@ cat >"$tmp/template.xml" <<'ROUTER_VPP_XML'
 	</hash_010103fe38328d2001a530ca2263078fe1605e>
 
 	<hash_010103bc4e99d64537e3b52d96b04012d6877d>
-		<name>Router VPP - Pakiety odrzucane sprzetowo przez karte, pakiety/s (rvVppNicDiscardPps)</name>
+		<name>Router VPP - Pakiety odrzucane sprzetowo przez karte (rvVppNicDiscardPps)</name>
 		<ds>
 			<t_name></t_name>
-			<name>|host_description| - Pakiety odrzucane sprzetowo przez karte, pakiety/s (rvVppNicDiscardPps)</name>
+			<name>|host_description| - Pakiety odrzucane sprzetowo przez karte (rvVppNicDiscardPps)</name>
 			<data_source_path></data_source_path>
 			<data_input_id>hash_0301033eb92bb845b9660a7445cf9740726522</data_input_id>
 			<t_data_source_profile_id></t_data_source_profile_id>
@@ -8338,10 +8338,10 @@ cat >"$tmp/template.xml" <<'ROUTER_VPP_XML'
 	</hash_010103c4c95411820e89409904e1d1a03b23d4>
 
 	<hash_010103a0961a0976bb5afa444d52dae3556adb>
-		<name>Router VPP - Suma licznikow show errors o poziomie error (rvVppErrors)</name>
+		<name>Router VPP - Suma licznikow show errors o poziomie error, bez licznikow objetosci (rvVppErrors)</name>
 		<ds>
 			<t_name></t_name>
-			<name>|host_description| - Suma licznikow show errors o poziomie error (rvVppErrors)</name>
+			<name>|host_description| - Suma licznikow show errors o poziomie error, bez licznikow objetosci (rvVppErrors)</name>
 			<data_source_path></data_source_path>
 			<data_input_id>hash_0301033eb92bb845b9660a7445cf9740726522</data_input_id>
 			<t_data_source_profile_id></t_data_source_profile_id>

@@ -156,7 +156,7 @@ class TestFilesAndCli(Base):
                            ("/etc/router/synack-guard.conf", "router-guard"), ("/etc/router/notify.conf", "router-notify"),
                            ("/etc/router/router-monitor.conf", "router-monitor"), ("/etc/vpp/startup.conf", "VPP"),
                            ("/etc/bird/bird.conf", "BIRD"), ("/etc/snmp/snmpd.conf", "snmpd"),
-                           ("/etc/hsflowd.conf", "hsflowd"), ("/etc/ssh/sshd_config_dataplane", "sshd")):
+                           ("/etc/ssh/sshd_config_dataplane", "sshd")):
             self.assertIn(path, out)
             line = [l for l in out.splitlines() if path in l]
             self.assertTrue(line and tool in "\n".join(self.block(out, path)), (path, tool))

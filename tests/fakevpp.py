@@ -90,6 +90,34 @@ def vppctl(cmd):
             if t[3:] != ["ra-suppress"]:
                 raise ValueError("unknown input `%s'" % " ".join(t[3:]))
             st["if"][t[2]]["ra_suppress"] = True
+        elif t[:2] == ["flowprobe", "params"]:
+            # realne VPP: odmawia zmiany parametrów, gdy jakikolwiek interfejs ma już włączony flowprobe
+            if any(v is not None for v in st.get("flowprobe", {}).values()):
+                raise ValueError("Couldn't change flowperpacket params when feature is enabled on some interface ...")
+            st["flowprobe_params_ok"] = True
+        elif t[:3] == ["flowprobe", "feature", "add-del"]:
+            n = t[3]
+            if n not in st["if"]:
+                raise ValueError("unknown input `%s'" % n)
+            rest = t[4:]
+            disable = "disable" in rest
+            which = next((w for w in rest if w in ("ip4", "ip6", "l2")), None)
+            fp = st.setdefault("flowprobe", {})
+            if not disable and not st.get("flowprobe_params_ok"):
+                raise ValueError("flowprobe feature add-del: Please specify flowprobe params record first...")
+            if disable:
+                fp.pop(n, None)
+            elif n in fp and fp[n] != which:
+                raise ValueError("Interface has enable different datapath ...")
+            elif n in fp and fp[n] == which:
+                raise ValueError("Datapath is already enabled for given interface ...")
+            else:
+                fp[n] = which
+        elif cmd == "show flowprobe feature":
+            for n, w in st.get("flowprobe", {}).items():
+                out += " %s %s rx tx\n" % (n, w)
+        elif cmd == "show flowprobe params":
+            out = " l2 l3 l4 active: 60 passive: 60\n" if st.get("flowprobe_params_ok") else " active: 15 passive: 120\n"
         elif cmd == "show lcp":
             out = "lcp default netns dataplane\nlcp lcp-auto-subint on\nlcp lcp-sync on\n"
             for k, (n, h) in enumerate(st["lcp"].items()):
@@ -159,6 +187,7 @@ def vppctl(cmd):
             n = t[2]
             if n in st["lcp"]:
                 st["linux"].pop(st["lcp"].pop(n), None)
+            st.get("flowprobe", {}).pop(n, None)
             del st["if"][n]
         elif t[:4] == ["delete", "loopback", "interface", "intfc"]:
             del st["if"][t[4]]
@@ -291,6 +320,19 @@ def vppctl(cmd):
             st.setdefault("hw_err", {}).setdefault(t[2], {})[t[3]] = int(t[4])
         elif t[:2] == ["fake", "link-down"]:     # tylko testy: port bez fizycznego linku
             st["link_down"] = t[2:]
+        elif t[:2] == ["fake", "transceiver"]:   # tylko testy: plik z treścią "show ... transceiver" (- usuwa)
+            if len(t) > 3 and t[3] != "-":
+                st.setdefault("transceiver", {})[t[2]] = t[3]
+            else:
+                st.setdefault("transceiver", {}).pop(t[2], None)
+        elif t[:3] == ["show", "interface", "transceiver"]:
+            path = st.get("transceiver", {}).get(t[3] if len(t) > 3 else "")
+            if path:
+                try:
+                    with open(path) as f:
+                        out = f.read()
+                except OSError:
+                    out = ""
         elif cmd == "show errors":
             g = st.get("guard", {"errors": {}})
             out = "   Count                    Node                  Reason               Severity\n"

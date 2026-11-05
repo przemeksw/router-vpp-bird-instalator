@@ -107,7 +107,7 @@ rvVppNicDiscardPps OBJECT-TYPE
     UNITS       "pps"
     MAX-ACCESS  read-only
     STATUS      current
-    DESCRIPTION "Pakiety odrzucane sprzetowo przez karte, pakiety/s"
+    DESCRIPTION "Pakiety odrzucane sprzetowo przez karte (xstats discard, bez rx_out_of_buffer), pakiety/s"
     ::= { rvVpp 6 }
 
 rvVppHkCpuMax OBJECT-TYPE
@@ -172,7 +172,7 @@ rvVppErrors OBJECT-TYPE
     SYNTAX      Counter64
     MAX-ACCESS  read-only
     STATUS      current
-    DESCRIPTION "Suma licznikow show errors o poziomie error"
+    DESCRIPTION "Suma licznikow show errors o poziomie error, bez licznikow objetosci (ACL permit/checked, odpowiedzi/zapytania wyslane)"
     ::= { rvVpp 15 }
 
 rvFib4Routes OBJECT-TYPE
@@ -539,7 +539,7 @@ rvPortHwDiscards OBJECT-TYPE
     SYNTAX      Counter64
     MAX-ACCESS  read-only
     STATUS      current
-    DESCRIPTION "Odrzucenia sprzetowe karty (xstats discard, out_of_buffer)"
+    DESCRIPTION "Odrzucenia sprzetowe karty (xstats discard; rx_out_of_buffer = rvPortRxMiss)"
     ::= { rvPortEntry 9 }
 
 rvErrorTable OBJECT-TYPE

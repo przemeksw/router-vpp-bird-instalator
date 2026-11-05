@@ -11,7 +11,9 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.1"                     '^SCRIPT_VERSION="1\.5\.1"' 1
+chk "wersja skryptu 1.5.30"                     '^SCRIPT_VERSION="1\.5\.30"' 1
+chk "router-monitor: WK_GRACE po starcie VPP (kod i konfiguracja)" '"WK_GRACE": 120,|^WK_GRACE=120$|t0 - vpp_seen_t < CFG\["WK_GRACE"\]' 3
+chk "router-monitor: CPU procesów bez wątków na izolowanych rdzeniach" 'procs = read_proc_cpu\(isolated\)' 1
 chk "router-guard w UPGRADE_PROGRAMS"          '"router-guard\|/opt/router/bin/router-guard\|755\|prog_router_guard\|"' 1
 chk "router-fw w UPGRADE_PROGRAMS"            '"router-fw\|/opt/router/bin/router-fw\|755\|prog_router_fw\|"' 1
 chk "TOTAL_STAGES=27"                         '^TOTAL_STAGES=27$' 1
@@ -109,7 +111,35 @@ fwt "reguły: COMMIT"                       4 '^COMMIT$'
 fwt "reguły: w tabeli raw"                 4 '^\*raw$'
 fwt "reguły: nic w filter INPUT"           4 '^-A INPUT' 0
 fwt "reguły: bez conntrack/state"          4 '(-m (state|conntrack)|-j CT)' 0
-chk "hsflowd: tymczasowy kolektor, gdy SFLOW_COLLECTOR puste" 'echo "  collector \{ ip=127\.0\.0\.1 udpport=6343 \}' 1
+chk "NetFlow: eksport do dedykowanego TAP-a, nie do loop0/ROUTER_ID" 'echo "set ipfix exporter collector \$NETFLOW_TAP_LINUX port \$NETFLOW_PORT src \$NETFLOW_TAP_VPP' 1
+chk "NetFlow: dedykowany TAP tworzony w bootstrap.vpp (host-ns dataplane)" 'echo "create tap id 0 host-if-name nf-export host-ns dataplane' 1
+chk "NetFlow: TAP-y to NIE adres VPP (ROUTER_ID) — ip4-local by odrzucił jako spoofing" '^NETFLOW_TAP_VPP=' 1
+chk "NetFlow: tap0 w osobnej tabeli routingu (VRF), nie w głównej z hu0/hu1" 'echo "set interface ip table tap0 \$NETFLOW_TAP_FIB"' 1
+chk "NetFlow: eksporter dostaje fib-id tej samej, odizolowanej tabeli" 'fib-id \$NETFLOW_TAP_FIB' 3
+chk "NetFlow: przykład netflow.conf, gdy NETFLOW_COLLECTORS puste" '192\.0\.2\.10:2055   # przykład: FastNetMon' 1
+chk "NetFlow: router-netflow w UPGRADE_PROGRAMS" '"router-netflow\|/opt/router/bin/router-netflow\|755\|prog_router_netflow\|router-netflow\.service"' 1
+chk "NetFlow: wyłącznik NETFLOW_ENABLE domyślnie yes" '^NETFLOW_ENABLE=yes' 1
+chk "NetFlow: INST_NETFLOW_ENABLE zapisywane do router.env" '^INST_NETFLOW_ENABLE=\$NETFLOW_ENABLE' 1
+chk "NetFlow: bootstrap.vpp/upgrade_vpp_sync/vpp_conf_diff sprawdzają NETFLOW_ENABLE" 'if \[\[ \$NETFLOW_ENABLE == yes \]\]; then' 3
+chk "NetFlow: st_netflow ma wczesny return przy wyłączonym NETFLOW_ENABLE" '\$NETFLOW_ENABLE != yes \]\]; then' 1
+chk "NetFlow: fw_rules pomija regułę portu, gdy wyłączone" 'where == \*dataplane\* && \$NETFLOW_ENABLE == yes' 1
+chk "NetFlow: router-ifaces czyta INST_NETFLOW_ENABLE z router.env" 'INST_NETFLOW_ENABLE=\(yes\|no\)' 1
+chk "NetFlow: router-ifaces wyłącza flowprobe na interfejsie, gdy NETFLOW_ENABLE=no" 'NetFlow/IPFIX: wyłączone \(NETFLOW_ENABLE=no albo nonetflow w ifaces\.conf\)' 1
+chk "NetFlow: żywy włącznik netflow-on/netflow-off (plik stanu)" '^NETFLOW_STATE_FILE = ROOT \+ "/etc/router/netflow\.enabled"' 1
+chk "NetFlow: netflow-on/netflow-off w wyborze poleceń router-ifaces" 'choices=\["show", "diff", "apply", "check", "render", "boot", "snmp",' 1
+chk "NetFlow: argparse zna netflow-on/netflow-off" '"optics", "errors", "netflow-on", "netflow-off"\]\)' 1
+chk "NetFlow: funkcja do_netflow (włącznik bez restartu VPP)" '^def do_netflow\(args, enable\):' 1
+chk "NetFlow: dispatch netflow-on/netflow-off w main()" '"netflow-on": lambda a: do_netflow\(a, True\), "netflow-off": lambda a: do_netflow\(a, False\)' 1
+chk "NetFlow: menu router ma akcję Włącz NetFlow/IPFIX" 'router-ifaces", "netflow-on"\]' 1
+chk "NetFlow: menu router ma akcję Wyłącz NetFlow/IPFIX" 'router-ifaces", "netflow-off"\]' 1
+chk "NetFlow: menu router ma akcję Restart replikacji NetFlow" '\["systemctl", "restart", "router-netflow"\]' 1
+chk "NetFlow: menu router ma akcję Zatrzymaj replikację NetFlow" '\["systemctl", "stop", "router-netflow"\]' 1
+chk "NetFlow: NETFLOW_INSTALLED (instalacyjne, niezależne od żywego przełącznika)" '^NETFLOW_INSTALLED = _inst_netflow_enable\(\)' 1
+chk "NetFlow: kotwica na loop0 (licznik referencji nigdy nie spada do zera)" 'NetFlow/IPFIX: kotwica \(licznik referencji nigdy nie spada do zera\)' 2
+chk "NetFlow: Entry ma pole netflow_override (nadpisanie per-interfejs)" 'self\.netflow_override = None' 1
+chk "NetFlow: parser rozpoznaje słowo netflow/nonetflow w opisie" 'm = re\.match\(r"\^\(nonetflow\|netflow\)\\b\\s\*", desc, re\.I\)' 1
+chk "NetFlow: plan() liczy want_fp z globalnego przełącznika i nadpisania" 'want_fp = NETFLOW_INSTALLED and \(NETFLOW_ENABLED if e\.netflow_override is None else e\.netflow_override\)' 1
+chk "NetFlow: ostrzeżenie, gdy znacznik użyty na loopbacku (bez efektu)" 'znacznik netflow na loopbacku nie ma znaczenia' 1
 chk "etap 26 uruchamia st_loop0_access"       '^run_stage 26 .*st_loop0_access$' 1
 chk "etap 27 uruchamia st_rpki"               '^run_stage 27 .*st_rpki$' 1
 chk "RPKI: domyślnie bez odrzucania"          'define RPKI_ENFORCE = 0;' 1
@@ -144,6 +174,22 @@ chk "router-monitor: minutowe STATS domyślnie wyłączone (konfiguracja)" '^SUM
 chk "router-monitor: minutowe STATS domyślnie wyłączone (kod)"  '"SUMMARY_EVERY": 0,' 1
 chk "router-monitor.conf: LOG_MAX_SEV=4"      '^LOG_MAX_SEV=4$' 1
 chk "router-monitor: filtr alarmy.log"        'fh\.addFilter\(AlarmFilter\(\)\)' 1
+# wywłaszczenia workerów VPP (kcompactd1 na cpu 5 wywłaszczał vpp_wk_0 → rx_out_of_buffer): alarm, narzędzie, sysctl, usługa
+chk "router-monitor: alarm WK_PREEMPT"        'Alarm\("VPP", 3, "WK_PREEMPT", "WK_PREEMPT_END"\)' 1
+chk "router-monitor: liczniki z /proc/<pid>/task" '^def read_worker_preempt\(pid\):' 1
+chk "router-monitor: PID VPP po nazwie wątku (bez pidfile)" '^def find_vpp_pid\(\):' 1
+chk "router-monitor.conf: próg WK_PREEMPT"    '^WK_PREEMPT=1$' 1
+chk "router-notify: WK_PREEMPT w kategorii VPP_DROPS" 'VPP-\(RX_MISS\|NIC_DISCARD\|WK_PREEMPT\)' 1
+chk "NIC_DISCARD bez rx_out_of_buffer (= rx-miss, liczony podwójnie)" '\(\?:discard\|out_of_buffer\)' 0
+chk "xstats discard: router-monitor i router-snmp" '\]\]\*discard\[A-Za-z0-9_' 3
+chk "router-kthreads: program osadzony"       "^prog_router_kthreads\(\) \{" 1
+chk "router-kthreads: w UPGRADE_PROGRAMS z usługą" '^  "router-kthreads\|/opt/router/bin/router-kthreads\|755\|prog_router_kthreads\|router-kthreads.service"$' 1
+chk "router-kthreads.service włączana w st_isolation" 'systemctl enable --now router-kthreads.service' 1
+chk "sysctl: proaktywna kompakcja wyłączona"  '^vm.compaction_proactiveness = 0$' 1
+chk "upgrade_vpp_sync sprawdza kompakcję i usługę" 'sysctl -n vm.compaction_proactiveness 2>/dev/null\) == 0 \]\]' 1
+chk "vpp_conf_diff: kompakcja i usługa (z nadpisaniem w testach)" 'VPP_COMPACT_PROACTIVE-|VPP_KTHREADS_UNIT:-' 3
+chk "router-kthreads w router.target"         'vpp.service router-kthreads.service router-ifaces.service' 1
+chk "--check: wywłaszczenia workerów"         'nr_involuntary_switches' 7
 chk "stopka z autorem (ifaces, fw, guard) definiowana"  '^def signature\(\):' 3
 chk "stopka z autorem wołana po poleceniu"    '^    signature\(\)$' 3
 chk "tryb set_workers w argumentach"          'set_workers\|--set-workers\) MODE=workers' 1
@@ -155,7 +201,7 @@ chk "dispatch trybu workers po etapie 01"     '^if \[\[ \$MODE == workers \]\]; 
 chk "set_workers przelicza izolację i VPP"    'run_stage 0[69] .*st_(isolation|vpp_config)$' 5
 chk "sama izolacja: bez restartu VPP"         'if ! vpp_conf_diff vpp >/dev/null; then' 1
 chk "set_workers bez N: obecna liczba"        'cur_w=\$\(sed -n .s/\^\[\[:space:\]\]\*corelist-workers' 1
-chk "upgrade_script uzupełnia izolację"       '^if \[\[ \$MODE == upgrade \]\]; then do_upgrade; upgrade_isolation; exit 0; fi' 1
+chk "upgrade_script uzupełnia izolację"       '^if \[\[ \$MODE == upgrade \]\]; then do_upgrade; upgrade_vpp_sync; exit 0; fi' 1
 chk "set_workers nie wymaga internetu"        '^\[\[ \$MODE == workers \]\] \|\| timeout 10 getent' 1
 chk "bufory liczone funkcją calc_buffers"      '^calc_buffers\(\) \{' 1
 chk "bufory VPP z liczby workerów i portów"   'BUFFERS=\$\(calc_buffers "\$\{#NIC_PCI\[@\]\}" "\$VPP_WORKERS"' 1
@@ -244,7 +290,11 @@ dpdk {
 }
 EOC
   vds=$(mktemp); echo "vm.nr_hugepages = 8037" >"$vds"
-  tv() { local got; got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds WORKERS_CSV=$2 BUFFERS=$3 MAIN_HEAP=$4 HUGEPAGES_2M=${7:-8037}; NIC_PCI=($5); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' ); if [[ $got == *"$6"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff $1: oczekiwano '$6', jest '$got'"; fi; }
+  vdb=$(mktemp)
+  { echo "create tap id 0 host-if-name nf-export host-ns dataplane host-ip4-addr 192.0.2.2/30"
+    echo "set ipfix exporter collector 192.0.2.2 port 2055 src 192.0.2.1 fib-id 100 template-interval 20"
+    echo "flowprobe params record l2 l3 l4 active 60 passive 300"; } >"$vdb"
+  tv() { local got; got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 WORKERS_CSV=$2 BUFFERS=$3 MAIN_HEAP=$4 HUGEPAGES_2M=${7:-8037}; NIC_PCI=($5); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' ); if [[ $got == *"$6"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff $1: oczekiwano '$6', jest '$got'"; fi; }
   tv "bez zmian"              5,7,9 262144 4G "0000:82:00.0 0000:82:00.1" "rc=1"
   tv "same bufory"            5,7,9 1081344 4G "0000:82:00.0 0000:82:00.1" "bufory 262144 → 1081344"
   tv "zmiana portów"          5,7,9 262144 4G "0000:82:00.0" "porty 0000:82:00.0 0000:82:00.1 → 0000:82:00.0"
@@ -252,17 +302,29 @@ EOC
   tv "zmiana sterty"          5,7,9 262144 2G "0000:82:00.0 0000:82:00.1" "sterta 4G → 2G"
   tv "tylko hugepages"        5,7,9 262144 4G "0000:82:00.0 0000:82:00.1" "hugepages 8037 → 11251" 11251
   vdg=$(mktemp); echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=3,5,7,9 rcu_nocbs=3,5,7,9 panic=10"' >"$vdg"
-  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
   if [[ $got == *"izolacja rdzeni"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff stara izolacja: jest '$got'"; fi
   echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,3,5,7,9 nohz_full=5,7,9 rcu_nocbs=3,5,7,9 irqaffinity=0-2 panic=10"' >"$vdg"
-  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
   if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff nowa izolacja: jest '$got'"; fi
   cm=$(eval "$(sed -n '/^cpu_mask() {/,/^}/p' install-router.sh)"; cpu_mask 0 1 40)
   if [[ $cm == "00000100,00000003" ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  cpu_mask: jest '$cm'"; fi
-  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_GRUB_CONF=/nonexistent WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=/nonexistent WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
   if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff vpp (bez izolacji): jest '$got'"; fi
-  rm -f "$vdg"
-  rm -f "$vdc" "$vds"
+  vdt=$(mktemp); echo '[always] madvise never' >"$vdt"
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=1 VPP_THP_FILE=$vdt WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == *"numa_balancing"*"transparent hugepages"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff numa_balancing/THP: jest '$got'"; fi
+  vdt2=$(mktemp); echo 'always [madvise] never' >"$vdt2"
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff numa_balancing=0 i THP madvise: jest '$got'"; fi
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=/nonexistent NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == *"NetFlow/IPFIX"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff flowprobe nieskonfigurowany: jest '$got'"; fi
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 VPP_COMPACT_PROACTIVE=20 VPP_KTHREADS_UNIT=/nonexistent WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == *"compaction_proactiveness"*"router-kthreads.service"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff kompakcja/router-kthreads: jest '$got'"; fi
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 VPP_COMPACT_PROACTIVE=0 VPP_KTHREADS_UNIT=$vdt2 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff kompakcja=0 i router-kthreads.service jest: jest '$got'"; fi
+  rm -f "$vdg" "$vdt" "$vdt2"
+  rm -f "$vdc" "$vds" "$vdb"
 else
   fail=$((fail+1)); echo "BŁĄD  brak funkcji vpp_conf_diff"
 fi

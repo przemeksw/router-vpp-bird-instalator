@@ -64,7 +64,7 @@
 			<oid>.1.3.6.1.4.1.8072.9999.9999.630.4.1.8</oid>
 		</rvPortPunt>
 		<rvPortHwDiscards>
-			<name>Odrzucenia sprzetowe karty (xstats discard, out_of_buffer)</name>
+			<name>Odrzucenia sprzetowe karty (xstats discard; rx_out_of_buffer = rvPortRxMiss)</name>
 			<method>walk</method>
 			<source>value</source>
 			<direction>output</direction>

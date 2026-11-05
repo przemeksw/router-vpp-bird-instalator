@@ -7,7 +7,7 @@
 #   * VPP 26.06 zbudowany ze źródeł (DPDK + sterownik mlx5), linux-cp, sFlow
 #   * BIRD 3 (repo CZ.NIC) w netns "dataplane"
 #   * SNMP: snmpd + vpp-snmp-agent (liczniki z VPP dla LibreNMS)
-#   * sFlow: hsflowd z modułem VPP (eksport próbek do FastNetMon / kolektora)
+#   * NetFlow/IPFIX: natywny eksport flowów z VPP (flowprobe) do FastNetMon / kolektora
 #   * strojenie: hugepages, izolacja rdzeni NUMA karty, moduły mlx5, irqbalance
 #   * etckeeper: historia zmian /etc w git (commit po każdym etapie)
 #   * automatyczny restart VPP i BIRD po awarii + alarm w logu
@@ -22,7 +22,7 @@
 #
 # Wszystko, co skrypt pobiera, kompiluje i loguje, trafia do:
 #   /root/router_install_data/
-#     src/      źródła (VPP, host-sflow, vpp-snmp-agent)
+#     src/      źródła (VPP, vpp-snmp-agent)
 #     debs/     zbudowane paczki .deb
 #     logs/     install.log + osobny log każdego etapu
 #     state/    znaczniki ukończonych etapów (wznawianie po błędzie)
@@ -54,13 +54,14 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.1"         # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.30"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
 VPP_WORKERS=auto               # auto = dobór do rdzeni i modelu karty; albo liczba, np. 12
-VPP_RX_DESC=4096               # deskryptory RX na kolejkę (DPDK mlx5)
-VPP_TX_DESC=1024               # deskryptory TX na kolejkę (1024 = bezpieczne; rzeczywista przyczyna -95 przy 4096 to był firmware 12.20, nie liczba deskryptorów)
+VPP_RX_DESC=16384              # deskryptory RX na kolejkę (DPDK mlx5; zapas na zrywy ruchu/DDoS — karta ConnectX obsługuje do 32768)
+VPP_TX_DESC=4096               # deskryptory TX na kolejkę (errno -95 przy wyższych wartościach to był stary firmware 12.20, nie liczba deskryptorów —
+                                # od firmware >= 12.21.1000 (audyt st_firmware/do_audit wymusza aktualizację) nieaktualne)
 VPP_NIC_DEVARGS=""             # dodatkowe devargs DPDK; przy firmware >= 12.28 niepotrzebne (potwierdzone na R630: bez devargs porty wstają)
 PORT_MTU=1500                  # MTU portów VPP i VLAN-ów: standard Ethernet (ustawiane przy starcie VPP, przed podniesieniem portu)
 ROUTER_ID=""                   # puste = adres loop0 (LOOP0_ADDR), a bez niego IPv4 interfejsu z trasą domyślną (eth2)
@@ -71,8 +72,55 @@ SSH_PASSWORD_AUTH=yes          # logowanie hasłem na sshd w dataplane (loop0): 
 SSH_ROOT_LOGIN=no              # PermitRootLogin na obu sshd (port zarządzający i loop0): no | prohibit-password | yes; "no" wymaga zwykłego użytkownika z sudo
 SNMP_COMMUNITY=""              # puste = wygeneruj losowe
 SNMP_ALLOW="192.168.80.0/24"   # skąd wolno odpytywać SNMP (IP/prefiks LibreNMS)
-SFLOW_COLLECTOR=""             # IP kolektora sFlow (FastNetMon); puste = brak
-SFLOW_SAMPLING=10000           # próbkowanie 1:N
+NETFLOW_ENABLE=yes             # yes/no — czy w ogóle budować eksport NetFlow/IPFIX (TAP, VRF, eksporter w VPP).
+                                #   Kosztuje realnie CPU na pakiet tranzytowy (ok. 2.7x mniej pps niż bez flowprobe
+                                #   na tym sprzęcie, patrz show runtime). Zmiana tutaj wymaga upgrade_script (albo
+                                #   set_workers) i restartu VPP. Do SZYBKIEGO włączania/wyłączania bez restartu VPP
+                                #   (gdy infrastruktura już istnieje) służy menu "router" → „SNMP, NetFlow i SSH”
+                                #   → „Włącz/Wyłącz NetFlow/IPFIX", albo wprost: router-ifaces netflow-on/netflow-off.
+                                #   UWAGA na mechanizm VPP: wyłączenie flowprobe na OSTATNIM interfejsie danej
+                                #   rodziny (licznik referencji spada do zera) wymusza w kodzie wtyczki
+                                #   (flowprobe_interface_add_del_feature) pełny eksport aktywnych flow i zdjęcie
+                                #   szablonu IPFIX — ścieżka dużo rzadziej testowana niż samo włączanie, i na tym
+                                #   routerze spowodowała kiedyś os_panic()/~4-minutowe zawieszenie VPP pod ruchem.
+                                #   Dlatego router-ifaces (plan()) trzyma flowprobe NA STAŁE włączony na loop0
+                                #   jako "kotwicę" — licznik referencji nigdy nie spada do zera, nawet gdy
+                                #   netflow-off wyłącza wszystkie prawdziwe porty/VLAN-y naraz. Koszt kotwicy jest
+                                #   pomijalny (ruch do samego routera: SSH/BGP/SNMP, nie tranzyt).
+NETFLOW_COLLECTORS=()          # kolektory NetFlow/IPFIX "IP:PORT" (FastNetMon, Akvorado…); puste = /etc/router/netflow.conf
+                                #   z przykładem do wypełnienia ręcznie (plik nie jest nadpisywany, jeśli już istnieje)
+NETFLOW_PORT=2055              # lokalny port, na którym VPP oddaje NetFlow/IPFIX; stąd router-netflow
+                                #   rozsyła kopię do każdego kolektora z /etc/router/netflow.conf — VPP obsługuje tylko
+                                #   jeden eksporter, kilka realnych kolektorów wymaga tej replikacji
+NETFLOW_ACTIVE_TIMER=60        # s — eksport długo trwającego flow co tyle sekund
+NETFLOW_PASSIVE_TIMER=60       # s — eksport zakończonego (wygasłego) flow po tylu sekundach bez pakietu, czyli
+                                #   też po tylu sekundach zwalnia się jego miejsce w tabeli flow VPP (twardy limit
+                                #   262144 wpisów/worker, wpisany na stałe w kodzie flowprobe — nie konfigurowalny
+                                #   inaczej). Im krótszy passive, tym mniej jednocześnie zajętych wpisów przy
+                                #   dużym ruchu (8 pełnych tablic + IX) — jedyna dostępna dźwignia bez łatania VPP.
+                                #   VPP wymaga passive >= active (inaczej "flowprobe params" jest cicho odrzucane
+                                #   i każde "flowprobe feature add-del" potem mówi "specify params record first")
+NETFLOW_TEMPLATE_INTERVAL=20   # s — jak często VPP powtarza szablon IPFIX kolektorowi
+NETFLOW_TAP_VPP="192.0.2.1"    # dedykowany TAP VPP<->netns dataplane (tylko eksport NetFlow/IPFIX), strona VPP;
+                                #   razem z NETFLOW_TAP_LINUX tworzy podsieć /30 (RFC 5737, dokumentacyjna, niczyja
+                                #   realna). Cel eksportu NIE może być adresem lokalnym VPP (np. ROUTER_ID/loop0):
+                                #   pakiet wygenerowany wewnętrznie przez eksporter ma w kodzie VPP na stałe
+                                #   sw_if_index[RX]=0 ("local0") — gdy trafi do ip4-local (bo cel jest lokalny),
+                                #   mechanizm punt-do-Linuksa (ten, z którego korzystają SSH/BGP/SNMP) nie ma dla
+                                #   "local0" żadnego zmapowanego TAP-a w netns i pakiet przepada bez widocznego
+                                #   błędu — potwierdzone licznikami na żywym routerze. Dedykowany TAP omija
+                                #   ip4-local całkowicie: pakiet idzie normalnym routingiem (jak zwykły ruch
+                                #   tranzytowy do sąsiada), nie przez "lokalną dostawę do samego routera".
+NETFLOW_TAP_LINUX="192.0.2.2"  # ...strona Linux/netns dataplane — tu nasłuchuje router-netflow (collector
+                                #   eksportera)
+NETFLOW_TAP_FIB=100             # osobna tabela routingu (VRF) w VPP tylko dla tap0 — ta podsieć NIE jest
+                                #   widoczna w głównej tabeli (tej, w której są hu0/hu1/VLAN-y), więc pakiet
+                                #   z internetu/od peera adresowany na NETFLOW_TAP_LINUX albo spoofujący
+                                #   NETFLOW_TAP_VPP jako src nie ma stąd żadnej trasy do tap0 — FIB 0 go po
+                                #   prostu nie przekaże. Sam eksporter dostaje "fib-id" i tak trafia do
+                                #   właściwej tabeli. Bez tego podsieć /30 na tap0 byłaby normalnie
+                                #   routowalna z zewnątrz jak każda inna podłączona sieć w FIB 0 — reguła
+                                #   firewalla (adres+interfejs) sama w sobie by nie wystarczyła.
 VPP_HANG_RESTART=1             # 1 = router-monitor restartuje VPP, gdy ten się zawiesi (30 s bez heartbeat)
 VPP_BUFFERS=auto               # auto = 8× zapotrzebowanie (porty × workery × deskryptory), pamięć hugepages dobierana do tego; max = tyle, ile mieści się w hugepages z 35% RAM; albo liczba
 HUGEPAGES_2M=auto              # auto = od zapotrzebowania buforów (VPP_BUFFERS=auto) albo 35% RAM (VPP_BUFFERS=max); albo liczba stron 2 MB, np. 12288
@@ -478,6 +526,66 @@ fi
 EOF
 }
 
+prog_router_netflow() {
+  cat <<EOF
+#!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+"""router-netflow — nasłuchuje NetFlow/IPFIX z VPP (lokalny port, w netns dataplane) i duplikuje
+każdy pakiet UDP do kolektorów z /etc/router/netflow.conf (jeden "IP:PORT" na linię, komentarz po #).
+VPP ma tylko jeden eksporter — to jedyny sposób na kilka realnych kolektorów naraz (np. FastNetMon +
+Akvorado), bez żadnej zewnętrznej zależności (replikacja w kilkunastu liniach Pythona).
+Po zmianie /etc/router/netflow.conf: systemctl restart router-netflow
+"""
+import os
+import socket
+import sys
+
+CONF = os.environ.get("ROUTER_NETFLOW_CONF", "/etc/router/netflow.conf")
+PORT = int(os.environ.get("ROUTER_NETFLOW_PORT", "$NETFLOW_PORT"))
+
+
+def load_dests():
+    dests = []
+    with open(CONF) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            host, _, port = line.partition(":")
+            dests.append((host.strip(), int(port)))
+    return dests
+
+
+def main():
+    try:
+        dests = load_dests()
+    except OSError as ex:
+        print("router-netflow: nie można odczytać %s: %s" % (CONF, ex), file=sys.stderr)
+        return 1
+    if not dests:
+        print("router-netflow: %s nie ma żadnego kolektora (IP:PORT, jeden na linię)" % CONF, file=sys.stderr)
+        return 1
+    print("router-netflow: nasłuch UDP %d -> kolektory: %s" % (PORT, dests))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", PORT))
+    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    while True:
+        try:
+            data, _addr = sock.recvfrom(65535)
+        except OSError:
+            continue
+        for host, port in dests:
+            try:
+                out.sendto(data, (host, port))
+            except OSError as ex:
+                print("router-netflow: nie wysłano do %s:%d: %s" % (host, port, ex), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+}
+
 prog_router_alert() {
   cat <<'EOF'
 #!/bin/sh
@@ -514,10 +622,20 @@ prog_router_ifaces() {
   router-ifaces optics       porty i wkładki: admin/link/prędkość z VPP, DDM z ethtool -m (moc TX/RX dBm, bias, temp.);
                              -w odświeża co 10 s (--interval SEK), --json
   router-ifaces errors       błędy portów (CRC, symbol, discards, rx-miss, drops…) z przyrostem; -w co 10 s
+  router-ifaces netflow-on   włącz eksport NetFlow/IPFIX (flowprobe) na portach/VLAN-ach i zastosuj od razu
+  router-ifaces netflow-off  wyłącz eksport NetFlow/IPFIX na portach/VLAN-ach i zastosuj od razu — bez
+                             restartu VPP (loop0 zostaje jako kotwica, znikomy koszt — patrz NETFLOW_ENABLE)
 
 Plik ifaces.conf jest jedynym źródłem prawdy: adres usunięty z pliku znika z VPP,
 VLAN usunięty z pliku jest kasowany, zmiana opisu trafia do SNMP (ifAlias) i Linuksa.
 Obiektów utworzonych ręcznie (vppctl), których nigdy nie było w pliku, skrypt nie rusza.
+
+NetFlow/IPFIX per interfejs: opis portu/VLAN-u może zaczynać się od słowa "netflow" albo "nonetflow" —
+wymusza monitorowanie (albo brak) na tym jednym interfejsie, niezależnie od globalnego przełącznika
+(netflow-on/netflow-off). Np.:
+  hu0   303  192.0.2.1/30  -   netflow Transit: EPIX AS62081
+  hu0   313  10.1.1.1/30   -   nonetflow Core: wewnętrzny link
+Bez tego słowa decyduje przełącznik globalny. loop0 go nie obsługuje (zawsze jest kotwicą).
 """
 import argparse
 import fcntl
@@ -547,10 +665,47 @@ LOG = LOGDIR + "/ifaces.log"
 MONLOG = LOGDIR + "/alarmy.log"
 LOCK = ROOT + "/run/router-ifaces.lock"
 NOTIFY = ROOT + "/opt/router/bin/router-notify"
+NETFLOW_STATE_FILE = ROOT + "/etc/router/netflow.enabled"   # "yes"/"no" — żywy włącznik (netflow-on/netflow-off)
 NETNS = "dataplane"
 VPPCTL = os.environ.get("ROUTER_IFACES_VPPCTL", "vppctl")
 IPCMD = os.environ.get("ROUTER_IFACES_IP", "ip")
 SYSTEMD = os.environ.get("ROUTER_IFACES_SYSTEMD", "1") == "1"
+# te dwie wartości muszą się zgadzać z NETFLOW_ACTIVE_TIMER/NETFLOW_PASSIVE_TIMER w install-router.sh —
+# używane tylko jako zabezpieczenie przed wyścigiem ze startem VPP (patrz plan(), "flowprobe params")
+FLOWPROBE_ACTIVE_TIMER = int(os.environ.get("ROUTER_IFACES_FLOWPROBE_ACTIVE", "60"))
+FLOWPROBE_PASSIVE_TIMER = int(os.environ.get("ROUTER_IFACES_FLOWPROBE_PASSIVE", "60"))
+
+
+def _inst_netflow_enable():
+    """NETFLOW_ENABLE z install-router.sh (zapisane do router.env jako INST_NETFLOW_ENABLE) — czy TAP/VRF/eksporter
+    IPFIX w ogóle istnieją w bootstrap.vpp. Gdy "no", nie ma czego włączać — ani na portach, ani na kotwicy."""
+    try:
+        with open(ENVF) as f:
+            m = re.search(r'^INST_NETFLOW_ENABLE=(yes|no)', f.read(), re.M)
+        return m is None or m.group(1) == "yes"
+    except OSError:
+        return True
+
+
+NETFLOW_INSTALLED = _inst_netflow_enable()   # instalacyjne: czy infrastruktura NetFlow w ogóle istnieje w VPP
+
+
+def _netflow_enabled():
+    """Czy flowprobe ma być włączony na PRAWDZIWYCH portach/VLAN-ach (nie na kotwicy loop0, patrz plan()) —
+    zależy od NETFLOW_INSTALLED i żywego przełącznika NETFLOW_STATE_FILE (netflow-on/netflow-off)."""
+    v = os.environ.get("ROUTER_IFACES_NETFLOW_ENABLE")
+    if v is not None:
+        return v == "1"
+    if not NETFLOW_INSTALLED:
+        return False
+    try:
+        with open(NETFLOW_STATE_FILE) as f:
+            return f.read().strip() != "no"
+    except OSError:
+        return True   # brak pliku = domyślnie włączone (tak jak instalator to zostawił)
+
+
+NETFLOW_ENABLED = _netflow_enabled()   # False = NETFLOW_ENABLE=no w install-router.sh albo netflow-off — porty/VLAN-y bez flowprobe (loop0-kotwica zostaje)
 
 ERR_RE = re.compile(r"unknown input|error|fail|invalid|conflict|not found|already|does not exist|not supported",
                     re.I)
@@ -619,6 +774,7 @@ class Entry:
         self.name, self.kind, self.lineno = name, kind, lineno
         self.parent, self.vlan, self.implicit = parent, vlan, implicit
         self.v4, self.v6, self.desc = [], [], ""
+        self.netflow_override = None   # None = globalny przełącznik; True/False = wymuszone w ifaces.conf
 
     @property
     def addrs(self):
@@ -676,6 +832,11 @@ def parse_conf(text, phys=None):
                         "MTU Ethernet 1500 (usuń '%s')" % (where, rest.split()[0]))
             continue
         desc = rest.strip()
+        netflow_override = None   # None = globalny przełącznik (netflow-on/off); True/False = wymuszone tu
+        m = re.match(r"^(nonetflow|netflow)\b\s*", desc, re.I)
+        if m:
+            netflow_override = m.group(1).lower() != "nonetflow"
+            desc = desc[m.end():].strip()
         if desc in ("-", '""', "''"):
             desc = ""
         if len(desc) > 200:
@@ -710,6 +871,12 @@ def parse_conf(text, phys=None):
                         % (where, e.name, ents[e.name].lineno))
             continue
         e.desc = desc
+        if netflow_override is not None:
+            if e.kind == "loop":
+                warns.append("%s: znacznik netflow na loopbacku nie ma znaczenia — loop0 jest zawsze "
+                              "kotwicą, gdy NetFlow jest zainstalowany" % where)
+            else:
+                e.netflow_override = netflow_override
         for col, ver, lst in ((c4, 4, e.v4), (c6, 6, e.v6)):
             if col == "-":
                 continue
@@ -787,6 +954,8 @@ class Actual:
         self.laddrs = {}   # nazwa w Linuksie -> set(ip_interface) (adresy globalne)
         self.ip6 = set()   # interfejsy VPP z włączonym IPv6 (show ip6 interface)
         self.lll = set()   # interfejsy w Linuksie z adresem link-local IPv6
+        self.flowprobe = {}   # nazwa -> "ip4"/"ip6"/"l2" (show flowprobe feature) — NetFlow/IPFIX
+        self.flowprobe_params_ok = False   # "flowprobe params" już ustawione (show flowprobe params ma l2/l3/l4)
 
 
 def cli(cmd, timeout=15):
@@ -843,6 +1012,22 @@ def read_vpp(with_alias=False):
             m = re.match(r"^(\S+) is admin (up|down)", line)
             if m:
                 st.ip6.add(m.group(1))
+    except VppError:
+        pass
+    try:
+        for line in cli("show flowprobe feature").splitlines():
+            t = line.split()
+            if len(t) >= 2:
+                st.flowprobe[t[0]] = t[1]
+    except VppError:
+        pass
+    try:
+        # bootstrap.vpp ustawia "flowprobe params" przy starcie VPP, ale router-ifaces.service rusza
+        # tylko po "vpp.service aktywny" — nie czeka, aż VPP skończy wykonywać bootstrap.vpp (wyścig).
+        # Bez tej kontroli "flowprobe feature add-del" dostałoby "specify params record first" i apply
+        # by się wywaliło (status NOPERMISSION), mimo że moment później parametry już są ustawione.
+        pline = cli("show flowprobe params")
+        st.flowprobe_params_ok = any(w in pline for w in (" l2", " l3", " l4"))
     except VppError:
         pass
     if with_alias:
@@ -923,6 +1108,9 @@ def plan(desired, act, managed, aliases=True):
             continue
         for a in sorted(act.addrs.get(name, set()), key=addr_key):
             cmds.append(Cmd("-", "vpp", "set interface ip address del %s %s" % (name, a), "usunięty z ifaces.conf"))
+        if name in act.flowprobe:
+            cmds.append(Cmd("-", "vpp", "flowprobe feature add-del %s %s disable" % (name, act.flowprobe[name]),
+                            "NetFlow/IPFIX: interfejs usunięty z ifaces.conf"))
         if kind in ("vlan", "loop"):
             if name in act.lcp:
                 cmds.append(Cmd("-", "vpp", "lcp delete %s" % name, "usunięty z ifaces.conf"))
@@ -932,6 +1120,32 @@ def plan(desired, act, managed, aliases=True):
                 cmds.append(Cmd("-", "vpp", "delete loopback interface intfc %s" % name,
                                 "loopback usunięty z ifaces.conf"))
     # 3. porty, loopbacki, VLAN-y
+    # Zabezpieczenie przed wyścigiem ze startem VPP: router-ifaces.service rusza, gdy systemd zgłosi
+    # "vpp.service aktywny", a nie, gdy VPP skończy wykonywać bootstrap.vpp (gdzie są "flowprobe params").
+    # Jeśli jeszcze nie zdążyło — ustaw je tu, żeby "flowprobe feature add-del" niżej się nie wywaliło.
+    if NETFLOW_INSTALLED and not act.flowprobe_params_ok and any(e.kind in ("phy", "vlan", "loop") for e in ents):
+        cmds.append(Cmd("+", "vpp", "flowprobe params record l2 l3 l4 active %d passive %d"
+                        % (FLOWPROBE_ACTIVE_TIMER, FLOWPROBE_PASSIVE_TIMER),
+                        "NetFlow/IPFIX: bootstrap.vpp jeszcze nie zdążył (wyścig ze startem VPP)"))
+    # Kotwica NetFlow/IPFIX: loop0 (ruch do samego routera — SSH/BGP/SNMP, znikomy wolumen) ma flowprobe
+    # włączony ZAWSZE, gdy infrastruktura istnieje (NETFLOW_INSTALLED) — niezależnie od żywego przełącznika
+    # netflow-on/netflow-off. MUSI się wykonać PRZED wyłączeniami na portach/VLAN-ach niżej, żeby licznik
+    # referencji flowprobe (ip4) nigdy nawet przejściowo nie spadł do zera — to ten moment wymusza w VPP
+    # pełny eksport aktywnych flow i zdjęcie szablonu IPFIX, co na tym routerze spowodowało os_panic() pod
+    # żywym ruchem (patrz komentarz przy NETFLOW_ENABLE w install-router.sh). Dla nowo tworzonego loop0
+    # (jeszcze nie istnieje w VPP) kotwica jest dopinana niżej, przy jego tworzeniu — kolejność bez znaczenia,
+    # bo wtedy licznik referencji i tak startuje od zera (nowa instalacja, nic wcześniej nie było włączone).
+    if NETFLOW_INSTALLED:
+        for e in ents:
+            if e.kind != "loop" or e.name not in act.ifaces:
+                continue
+            cur_fp = act.flowprobe.get(e.name)
+            if cur_fp != "ip4":
+                if cur_fp:
+                    cmds.append(Cmd("~", "vpp", "flowprobe feature add-del %s %s disable" % (e.name, cur_fp),
+                                    "NetFlow/IPFIX: inna rodzina włączona ręcznie na kotwicy — przełączam na ip4"))
+                cmds.append(Cmd("+", "vpp", "flowprobe feature add-del %s ip4 both" % e.name,
+                                "NetFlow/IPFIX: kotwica (licznik referencji nigdy nie spada do zera)"))
     for e in ents:
         new = e.name not in act.ifaces
         cur = act.ifaces.get(e.name, {})
@@ -949,6 +1163,9 @@ def plan(desired, act, managed, aliases=True):
                 cmds.append(Cmd("+", "vpp", "set interface state %s up" % e.name))
             if new or e.name not in act.lcp:
                 cmds.append(Cmd("+", "vpp", "lcp create %s host-if %s" % (e.name, e.name)))
+            if NETFLOW_INSTALLED and new:
+                cmds.append(Cmd("+", "vpp", "flowprobe feature add-del %s ip4 both" % e.name,
+                                "NetFlow/IPFIX: kotwica (licznik referencji nigdy nie spada do zera)"))
         else:
             if new:
                 cmds.append(Cmd("+", "vpp", "create sub-interfaces %s %d dot1q %d exact-match"
@@ -958,6 +1175,27 @@ def plan(desired, act, managed, aliases=True):
             # nowy VLAN dostaje parę w Linuksie automatycznie (lcp-auto-subint); brak → utwórz
             if not new and e.name not in act.lcp and e.parent in act.lcp:
                 cmds.append(Cmd("+", "vpp", "lcp create %s host-if %s" % (e.name, e.name)))
+        # NetFlow/IPFIX (flowprobe): monitorowanie ruchu tranzytowego — tylko porty i VLAN-y (loopbacki mają
+        # własną, osobną logikę kotwicy wyżej — to NIE jest o monitorowaniu ich ruchu, tylko o tym, żeby
+        # licznik referencji nigdy nie spadł do zera). VPP trzyma tylko jedną rodzinę (ip4 lub ip6) na
+        # interfejs — jeśli ktoś ręcznie włączył inną, najpierw ją wyłącz, inaczej "ip4" zostanie odrzucone.
+        # Domyślnie decyduje globalny przełącznik (NETFLOW_ENABLED, netflow-on/netflow-off), ale konkretna
+        # linia w ifaces.conf może to nadpisać słowem "netflow"/"nonetflow" na początku opisu —
+        # np. żeby monitorować tylko wybrane VLAN-y, niezależnie od stanu globalnego przełącznika.
+        if e.kind in ("phy", "vlan"):
+            want_fp = NETFLOW_INSTALLED and (NETFLOW_ENABLED if e.netflow_override is None else e.netflow_override)
+            cur_fp = act.flowprobe.get(e.name)
+            if want_fp:
+                if cur_fp and cur_fp != "ip4":
+                    cmds.append(Cmd("~", "vpp", "flowprobe feature add-del %s %s disable" % (e.name, cur_fp),
+                                    "NetFlow/IPFIX: inna rodzina włączona ręcznie — przełączam na ip4"))
+                    cur_fp = None
+                if cur_fp != "ip4":
+                    cmds.append(Cmd("+", "vpp", "flowprobe feature add-del %s ip4 both" % e.name,
+                                    "NetFlow/IPFIX: monitorowanie ruchu (router-netflow)"))
+            elif cur_fp:
+                cmds.append(Cmd("-", "vpp", "flowprobe feature add-del %s %s disable" % (e.name, cur_fp),
+                                "NetFlow/IPFIX: wyłączone (NETFLOW_ENABLE=no albo nonetflow w ifaces.conf)"))
         # 4. adresy do dodania
         if not e.implicit:
             have = set() if new else act.addrs.get(e.name, set())
@@ -1232,7 +1470,7 @@ def do_apply(args, boot=False):
     if cmds and not boot:
         print("Zmiany do wprowadzenia (%s → VPP):" % source)
         show_cmds(cmds)
-        if any(c.op == "-" for c in cmds):
+        if any(c.op == "-" and c.kind == "vpp" and "ip address del" in c.args for c in cmds):
             print(color("  Uwaga: usunięcie adresu zrywa sesje BGP, które z niego korzystają.", "33"))
         if sys.stdin.isatty() and not args.yes:
             try:
@@ -1321,6 +1559,31 @@ def unmanaged(act, desired):
     if extra:
         print(color("  Poza ifaces.conf (utworzone ręcznie, skrypt ich nie rusza): %s"
                     % ", ".join(sorted(extra, key=natkey)), "33"))
+
+
+def do_netflow(args, enable):
+    """netflow-on/netflow-off: żywy włącznik bez edycji install-router.sh i bez restartu VPP — zapisuje
+    NETFLOW_STATE_FILE i od razu dogania VPP (jak apply -y). Bezpieczne dzięki kotwicy na loop0 w plan():
+    licznik referencji flowprobe (ip4) nigdy nie spada do zera, nawet gdy to wyłącza wszystkie prawdziwe
+    porty/VLAN-y naraz — a to właśnie zero wyzwalało w VPP os_panic() pod żywym ruchem."""
+    global NETFLOW_ENABLED
+    if enable and not NETFLOW_INSTALLED:
+        print(color("NETFLOW_ENABLE=no w install-router.sh — TAP/VRF/eksporter IPFIX w ogóle nie istnieją w VPP.", "31"))
+        print("Ustaw NETFLOW_ENABLE=yes w install-router.sh, uruchom upgrade_script i zrestartuj VPP — "
+              "dopiero potem ten przełącznik zadziała.")
+        return 1
+    try:
+        os.makedirs(os.path.dirname(NETFLOW_STATE_FILE), exist_ok=True)
+        with open(NETFLOW_STATE_FILE, "w") as f:
+            f.write(("yes" if enable else "no") + "\n")
+    except OSError as ex:
+        print(color("nie można zapisać %s: %s" % (NETFLOW_STATE_FILE, ex), "31"))
+        return 1
+    NETFLOW_ENABLED = enable
+    print("NetFlow/IPFIX: %s na portach/VLAN-ach — zastosowuję (loop0 zostaje jako kotwica)"
+          % ("włączony" if enable else "wyłączony"))
+    args.yes = True
+    return do_apply(args)
 
 
 def do_check(args):
@@ -1417,16 +1680,18 @@ def do_snmp(args):
     return 0
 
 
-# --------------------------------------------------------------------------- wkładki: DDM (ethtool -m)
-ETHTOOL = os.environ.get("ROUTER_IFACES_ETHTOOL", "ethtool")
-SYSPCI = ROOT + "/sys/bus/pci/devices"
+# --------------------------------------------------------------------------- wkładki: DDM
+# Czytane przez "vppctl show interface transceiver <if> module diag verbose" — bezpośrednio przez DPDK,
+# niezależnie od kernelowego netdev karty. Wcześniej używaliśmy "ethtool -m" na netdev z /sys/.../net/
+# (tryb "bifurcated" mlx5), ale na tym sprzęcie, gdy VPP przejmie port, netdev (i rejestracja w devlink)
+# znika całkowicie z Linuksa — potwierdzone na żywym routerze (brak wpisów w /sys/.../net/, "devlink dev
+# show" puste). VPP i tak ma dostęp do modułu przez DPDK, więc to jest i prostsze, i niezawodne.
 KV_RE = re.compile(r"^\s*([^:]+?)\s*:\s*(.*?)\s*$")
-DBM_RE = re.compile(r"(-inf|[-+]?\d+(?:\.\d+)?)\s*dBm", re.I)
+DBM_RE = re.compile(r"(-inf|[-+]?\d*\.?\d+)\s*dBm", re.I)   # moduł czasem pomija wiodące zero: ".53", "-.03"
 NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-LANE_RE = re.compile(r"\(\s*(?:channel|chan|lane)\s*(\d+)\s*\)", re.I)
-INFO_KEYS = ("identifier", "vendor name", "vendor pn", "vendor sn", "laser wavelength", "transceiver type")
-LEVELS = ("high alarm", "low alarm", "high warning", "low warning")
+THR_RE = re.compile(r"^(Temperature|Voltage|Bias Current|TX Power|RX Power)\s+High:\s*(.+?),\s*Low:\s*(.+)$", re.I)
+THR_KIND = {"temperature": "temp", "voltage": "volt", "bias current": "bias", "tx power": "tx", "rx power": "rx"}
 
 
 def port_pci():
@@ -1439,14 +1704,6 @@ def port_pci():
     return {"hu%d" % i: p for i, p in enumerate(m.group(1).split())} if m else {}
 
 
-def pci_netdev(pci):
-    """mlx5 działa pod VPP w trybie bifurcated: netdev portu zostaje w Linuksie (główna przestrzeń)."""
-    try:
-        return sorted(os.listdir(os.path.join(SYSPCI, pci, "net")))[0]
-    except (OSError, IndexError):
-        return None
-
-
 def _dbm(v):
     m = DBM_RE.search(v)
     return None if not m else float("-inf") if m.group(1).lower() == "-inf" else float(m.group(1))
@@ -1457,54 +1714,71 @@ def _num(v):
     return float(m.group()) if m else None
 
 
-def _kind(kl):
-    """Wielkość, której dotyczy klucz ethtool (SFF-8472 SFP i SFF-8636 QSFP mają różne nazwy)."""
-    if "bias" in kl:
-        return "bias"
-    if "rx power" in kl or "rcvr" in kl or "receiver" in kl:
-        return "rx"
-    if "tx power" in kl or "output power" in kl or "transmit" in kl:
-        return "tx"
-    if "temperature" in kl:
-        return "temp"
-    if "voltage" in kl:
-        return "volt"
-    return None
-
-
-def parse_ethtool_m(text):
-    """Wynik `ethtool -m`: moduł, temperatura, napięcie, tory (tx/rx dBm, bias mA), progi i aktywne flagi."""
+def parse_transceiver(text):
+    """Wynik `show interface transceiver <if> module diag verbose`: moduł, temperatura, napięcie, tory
+    (tx/rx dBm, bias mA), progi — czytane bezpośrednio przez DPDK, bez udziału kernelowego netdev."""
     d = {"info": {}, "temp": None, "volt": None, "lanes": {}, "thr": {}, "flags": []}
-    for line in text.splitlines():
-        m = KV_RE.match(line)
+    section = None
+    lane = 1
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s == "Module Base Information:":
+            section = "base"
+            continue
+        if s == "Current Values:":
+            section, lane = "current", 1
+            continue
+        if s == "Alarm Thresholds:":
+            section = "alarm"
+            continue
+        if s == "Warning Thresholds:":
+            section = "warn"
+            continue
+        if s == "Module Diagnostics:" or s.startswith("Interface:") or s.startswith("EEPROM Type:"):
+            continue
+        lm = re.match(r"^Lane\s+(\d+):$", s, re.I)
+        if lm:
+            lane = int(lm.group(1))
+            d["lanes"].setdefault(lane, {})
+            continue
+        if section in ("alarm", "warn"):
+            tm = THR_RE.match(s)
+            if tm:
+                kind = THR_KIND.get(tm.group(1).lower())
+                if kind:
+                    hi = _dbm(tm.group(2)) if kind in ("tx", "rx") else _num(tm.group(2))
+                    lo = _dbm(tm.group(3)) if kind in ("tx", "rx") else _num(tm.group(3))
+                    pfx = "alarm" if section == "alarm" else "warning"
+                    if hi is not None:
+                        d["thr"].setdefault(kind, {})["high " + pfx] = hi
+                    if lo is not None:
+                        d["thr"].setdefault(kind, {})["low " + pfx] = lo
+            continue
+        m = KV_RE.match(s)
         if not m:
             continue
         k, v = m.group(1), m.group(2)
         kl = k.lower()
-        if kl in INFO_KEYS:
-            d["info"][kl] = v
-            continue
-        if v in ("On", "Off"):                                   # flagi alarmów modułu
-            if v == "On":
-                d["flags"].append(" ".join(k.split()))
-            continue
-        kind = _kind(kl)
-        if not kind:
-            continue
-        val = _dbm(v) if kind in ("rx", "tx") else _num(v)
-        if val is None:
-            continue
-        if "threshold" in kl:
-            lvl = next((x for x in LEVELS if x in kl), None)
-            if lvl:
-                d["thr"].setdefault(kind, {})[lvl] = val
-        elif kind == "temp":
-            d["temp"] = val
-        elif kind == "volt":
-            d["volt"] = val
-        else:
-            lm = LANE_RE.search(k)
-            d["lanes"].setdefault(int(lm.group(1)) if lm else 1, {})[kind] = val
+        if section == "base":
+            if kl == "vendor name":
+                d["info"]["vendor name"] = v
+            elif kl == "vendor part number":
+                d["info"]["vendor pn"] = v
+            elif kl == "identifier":
+                d["info"]["identifier"] = v
+        elif section == "current":
+            if kl == "temperature":
+                d["temp"] = _num(v)
+            elif kl == "supply voltage":
+                d["volt"] = _num(v)
+            elif kl == "tx bias current":
+                d["lanes"].setdefault(lane, {})["bias"] = _num(v)
+            elif kl == "tx average power":
+                d["lanes"].setdefault(lane, {})["tx"] = _dbm(v)
+            elif kl == "rx average power":
+                d["lanes"].setdefault(lane, {})["rx"] = _dbm(v)
     return d
 
 
@@ -1546,25 +1820,17 @@ def read_optics():
     res = []
     links = read_links()
     for port, pci in sorted(port_pci().items(), key=lambda x: int(x[0][2:])):
-        dev = pci_netdev(pci)
-        r = {"port": port, "pci": pci, "netdev": dev, "error": None}
+        r = {"port": port, "pci": pci, "error": None}
         r.update(links.get(port, {"admin": "?", "link": "?", "speed": None}))   # ? = VPP nie odpowiada
-        if not dev:
-            r["error"] = "brak netdeva dla %s" % pci
-        else:
-            try:
-                p = subprocess.run([ETHTOOL, "-m", dev], capture_output=True, text=True, timeout=10)
-                out = p.stdout if p.returncode == 0 else ""
-                err = (p.stderr or p.stdout).strip().splitlines()
-            except (OSError, subprocess.TimeoutExpired) as e:
-                out, err = "", [str(e)]
-            if not out:
-                e = err[-1] if err else ""
-                r["error"] = ("brak wkładki w gnieździe" if "input/output" in e.lower() else
-                              "moduł bez DDM (np. DAC)" if "not supported" in e.lower() else
-                              "brak danych z modułu: %s" % (e or "?"))
+        try:
+            out = cli("show interface transceiver %s module diag verbose" % port)
+        except VppError as ex:
+            out, r["error"] = "", "VPP nie odpowiada: %s" % ex
+        if not r["error"]:
+            if not out.strip():
+                r["error"] = "brak wkładki w gnieździe albo moduł bez DDM"
             else:
-                r.update(parse_ethtool_m(out))
+                r.update(parse_transceiver(out))
                 if not r["lanes"] and r["temp"] is None:
                     r["error"] = "moduł bez DDM (np. kabel DAC)"
         if not r["error"]:
@@ -1719,12 +1985,12 @@ def show_optics(args):
     if args.json:
         print(json.dumps(res, indent=2, ensure_ascii=False, default=lambda x: None))
         return 1 if any(r.get("state") == "ALARM" for r in res) else 0
-    hdr = ("Port", "Netdev", "Admin", "Link", "Prędk.", "Moduł", "Temp°C", "Zasil.V", "Tor", "TX dBm", "RX dBm", "Bias mA", "Stan")
+    hdr = ("Port", "Admin", "Link", "Prędk.", "Moduł", "Temp°C", "Zasil.V", "Tor", "TX dBm", "RX dBm", "Bias mA", "Stan")
     rows = []
     for r in res:
         lk = r["link"]
         lks = "ALARM" if r["admin"] == "up" and lk == "down" else ""
-        head = (r["port"], r["netdev"] or "-", r["admin"], _st(lk, lks), r["speed"] or "-")
+        head = (r["port"], r["admin"], _st(lk, lks), r["speed"] or "-")
         if r["error"]:
             rows.append((head + (r["error"],), None))
             continue
@@ -1735,18 +2001,18 @@ def show_optics(args):
         for no, ln in sorted(r["lanes"].items()) or [(1, {})]:
             lst = [ln.get(k + "_state", "") for k in ("tx", "rx", "bias")]
             st = "ALARM" if "ALARM" in lst else "WARN" if "WARN" in lst else "OK"
-            rows.append(((head if first else ("",) * 5) + (mod if first else "",
+            rows.append(((head if first else ("",) * 4) + (mod if first else "",
                           _st(_f(r["temp"], "%.1f"), ddm_state(r["temp"], r["thr"].get("temp"))) if first else "",
                           _st(_f(r["volt"], "%.2f"), ddm_state(r["volt"], r["thr"].get("volt"))) if first else "",
                           str(no), _st(_f(ln.get("tx"), "%.2f"), lst[0]), _st(_f(ln.get("rx"), "%.2f"), lst[1]),
                           _st(_f(ln.get("bias"), "%.2f"), lst[2]), _st(st, st)), r))
             first = False
-    w = [max([len(hdr[c])] + [len(ANSI_RE.sub("", x[0][c])) for x in rows if c < 5 or x[1]]) for c in range(len(hdr))]
+    w = [max([len(hdr[c])] + [len(ANSI_RE.sub("", x[0][c])) for x in rows if c < 4 or x[1]]) for c in range(len(hdr))]
     pad = lambda s, n: s + " " * (n - len(ANSI_RE.sub("", s)))  # noqa: E731
     print(color("  ".join(pad(h, w[c]) for c, h in enumerate(hdr)).rstrip(), "1"))
     for cols, r in rows:
         if r is None:
-            print("  ".join(pad(cols[c], w[c]) for c in range(5)) + "  " + color(cols[5], "2"))
+            print("  ".join(pad(cols[c], w[c]) for c in range(4)) + "  " + color(cols[4], "2"))
         else:
             print("  ".join(pad(x, w[c]) for c, x in enumerate(cols)).rstrip())
     for r in res:
@@ -1825,7 +2091,7 @@ def main():
     ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
     ap.add_argument("--version", action="version", version="router-ifaces — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
     ap.add_argument("cmd", nargs="?", default="show", choices=["show", "diff", "apply", "check", "render", "boot", "snmp",
-                                                          "optics", "errors"])
+                                                          "optics", "errors", "netflow-on", "netflow-off"])
     ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
     ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
     ap.add_argument("--timeout", type=int, default=180, help="boot: ile sekund czekać na VPP")
@@ -1836,7 +2102,8 @@ def main():
     if os.geteuid() != 0 and not ROOT:
         sys.exit("Uruchom jako root.")
     fn = {"show": do_show, "diff": do_diff, "check": do_check, "render": do_render, "snmp": do_snmp,
-          "optics": do_optics, "errors": do_errors, "apply": lambda a: do_apply(a), "boot": lambda a: do_apply(a, boot=True)}[args.cmd]
+          "optics": do_optics, "errors": do_errors, "apply": lambda a: do_apply(a), "boot": lambda a: do_apply(a, boot=True),
+          "netflow-on": lambda a: do_netflow(a, True), "netflow-off": lambda a: do_netflow(a, False)}[args.cmd]
     rc = fn(args)
     signature()
     sys.exit(rc)
@@ -1896,7 +2163,9 @@ prog_router_monitor() {
 # w stylu syslog Cisco (%FAC-SEV-MNEMONIC), np. przy krótkich DDoS-ach:
 #   %VPP-4-LOAD_HIGH     obciążenie workera (średni rozmiar wektora) ponad próg
 #   %VPP-2-RX_MISS       karta gubi pakiety, bo VPP nie nadąża (rx-miss / rx-no-buf)
-#   %VPP-3-NIC_DISCARD   karta odrzuca pakiety sprzętowo (limit karty / PCIe)
+#   %VPP-3-NIC_DISCARD   karta odrzuca pakiety sprzętowo (bufor PHY/priorytetu karty, PCIe)
+#   %VPP-3-WK_PREEMPT    worker VPP wywłaszczony z izolowanego rdzenia (coś poza VPP działa na jego CPU —
+#                        np. kcompactd/kswapd przypięte do całego węzła NUMA; grozi rx-miss na jego kolejce RX)
 #   %VPP-4-PUNT_HIGH     dużo ruchu do samego routera (atak na control plane)
 #   %VPP-1-HANG          VPP przestał odpowiadać (opcjonalny automatyczny restart)
 #   %SYS-4-CPU_HIGH      przeciążony rdzeń systemowy (BIRD, SNMP itd.)
@@ -1927,7 +2196,10 @@ CFG = {
     "VEC_WARN": 64.0,       # średni rozmiar wektora workera (1 = luz, 256 = nasycenie)
     "VEC_CRIT": 160.0,
     "RXMISS_PPS": 1.0,      # pkt/s zgubione przez kartę (rx-miss + rx-no-buf) => alarm
-    "NIC_DISCARD_PPS": 1.0, # pkt/s odrzucone sprzętowo (xstats *discard*/*out_of_buffer*)
+    "NIC_DISCARD_PPS": 1.0, # pkt/s odrzucone sprzętowo (xstats *discard*; rx_out_of_buffer to ten sam licznik co rx-miss)
+    "WK_PREEMPT": 1.0,      # wywłaszczenia workerów VPP na sekundę (nr_involuntary_switches) => alarm
+    "WK_GRACE": 120,        # s po starcie VPP bez alarmu WK_PREEMPT: każdy worker dostaje 2 wywłaszczenia przy
+                            # tworzeniu wątków i przypinaniu do rdzeni (po restarcie: 12 × "1×" dwa razy — szum)
     "PUNT_PPS": 20000.0,    # pkt/s do control plane
     "HK_CPU_PCT": 90.0,     # % zajętości rdzenia systemowego
     "HK_CPU_SECONDS": 5,    # przez ile sekund z rzędu
@@ -2102,12 +2374,16 @@ def parse_mdstat(text):
 
 
 HW_IF = re.compile(r"^(\S+)\s+\d+\s+(up|down)\b")
-HW_X = re.compile(r"^\s+([A-Za-z0-9_\[\]]*(?:discard|out_of_buffer)[A-Za-z0-9_\[\]]*)\s+(\d+)\s*$")
-XS_PATH = re.compile(r"^/interfaces/([^/.]+)/((?!tx_)[A-Za-z0-9_\[\]]*(?:discard|out_of_buffer)[A-Za-z0-9_\[\]]*)$")
+# tylko *discard* (rx_discards_phy, rx_prio0_buf_discard_packets…): to odrzucenia samej karty. rx_out_of_buffer
+# NIE jest tu liczony — w mlx5 to dokładnie ten licznik, który DPDK zgłasza jako rx-miss (imissed): karta nie
+# miała wolnego deskryptora, bo worker nie zdążył ich oddać. Liczony razem dawał dwa alarmy z jednego zdarzenia
+# i fałszywie wskazywał "sprzęt".
+HW_X = re.compile(r"^\s+([A-Za-z0-9_\[\]]*discard[A-Za-z0-9_\[\]]*)\s+(\d+)\s*$")
+XS_PATH = re.compile(r"^/interfaces/([^/.]+)/((?!tx_)[A-Za-z0-9_\[\]]*discard[A-Za-z0-9_\[\]]*)$")
 
 
 def stats_xstats(stats, paths):
-    """Liczniki *discard*/*out_of_buffer* kart z segmentu statystyk (/interfaces/<port>/<xstat>) — bez vppctl.
+    """Liczniki *discard* kart z segmentu statystyk (/interfaces/<port>/<xstat>) — bez vppctl.
     VPP (dpdk-process) odświeża je sam co ok. 10 s; odczyt nie zatrzymuje workerów (bez bariery)."""
     res = {}
     for p in paths:
@@ -2118,7 +2394,7 @@ def stats_xstats(stats, paths):
 
 
 def parse_hw_xstats(text):
-    """Z 'vppctl show hardware-interfaces' wyciąga liczniki *discard*/*out_of_buffer* per port."""
+    """Z 'vppctl show hardware-interfaces' wyciąga liczniki *discard* per port (bez tx_, bez rx_out_of_buffer)."""
     res, cur = {}, None
     for line in text.splitlines():
         m = HW_IF.match(line)
@@ -2146,20 +2422,29 @@ def read_proc_stat():
     return out
 
 
-def read_proc_cpu():
-    """Czas CPU procesów: {pid: (nazwa, ticki user+system)}; czytane tylko przy przeciążeniu rdzenia."""
+def read_proc_cpu(isolated=()):
+    """Czas CPU procesów na rdzeniach systemowych: {pid: (nazwa, ticki user+system)} — suma po wątkach,
+    z pominięciem wątków na izolowanych rdzeniach. Liczone per proces workery VPP (12 × 100% swojego rdzenia)
+    dawały w opisie przeciążonego rdzenia systemowego mylące "vpp_main(1526) 1310%" — teraz vpp_main pokazuje
+    tylko swój wątek główny (np. przy przeliczaniu FIB po wycofaniu pełnej tablicy BGP). Czytane tylko przy
+    przeciążeniu rdzenia."""
     out = {}
-    for pid in os.listdir("/proc"):
+    for pid in os.listdir(PROC):
         if not pid.isdigit():
             continue
         try:
-            with open("/proc/%s/stat" % pid) as f:
-                data = f.read()
-        except OSError:
+            name, _ = _stat_fields("%s/%s/stat" % (PROC, pid))
+            ticks = 0
+            for tid in os.listdir("%s/%s/task" % (PROC, pid)):
+                try:
+                    _, tf = _stat_fields("%s/%s/task/%s/stat" % (PROC, pid, tid))
+                except (OSError, IndexError):
+                    continue
+                if int(tf[36]) not in isolated:               # pole 39: procesor; 14/15: utime/stime
+                    ticks += int(tf[11]) + int(tf[12])
+        except (OSError, ValueError, IndexError):
             continue
-        i = data.rfind(")")
-        p = data[i + 2:].split()
-        out[int(pid)] = (data[data.find("(") + 1:i], int(p[11]) + int(p[12]))
+        out[int(pid)] = (name, ticks)
     return out
 
 
@@ -2204,6 +2489,76 @@ def phys_if(name):
     return not (name.startswith(("local", "tap", "loop", "lcp")) or "." in name or name == "")
 
 
+# ------------------------------------------------------------------ wywłaszczenia workerów
+# Worker VPP na izolowanym rdzeniu kręci pętlę DPDK i nigdy nie oddaje CPU sam (nr_voluntary_switches = 0).
+# Każde nr_involuntary_switches to coś, co kernel wpuścił na jego rdzeń mimo isolcpus: wątek kernela przypięty
+# do całego węzła NUMA (kcompactd, kswapd), kworker, obcy proces. W tym czasie kolejka RX tego workera stoi,
+# a karta gubi pakiety (rx_out_of_buffer = rx-miss) — bez śladu w przerwaniach (IPI/TLB) ani w buforach VPP.
+# Przykład: kcompactd1 na cpu 5 wywłaszczał vpp_wk_0 22 tys. razy (timer proaktywnej kompakcji co 500 ms).
+PROC = os.environ.get("ROUTER_MONITOR_PROC", "/proc")
+VPP_WK_RE = re.compile(r"^vpp_wk_(\d+)$")
+PERCPU_KTHREAD_RE = re.compile(r"/(\d+)(:|$)")   # ksoftirqd/5, kworker/5:1-events, migration/5 — stałe wątki per-CPU
+
+
+def _stat_fields(path):
+    """(nazwa, pola za ')' ) z /proc/<pid>/stat — nazwa może zawierać spacje i nawiasy."""
+    with open(path) as f:
+        head, rest = f.read().rsplit(")", 1)
+    return head.split("(", 1)[1], rest.split()
+
+
+def find_vpp_pid():
+    """PID VPP po nazwie wątku głównego (vpp_main) — VPP nie zapisuje pidfile; PID zmienia się po każdym restarcie."""
+    for pid in os.listdir(PROC):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("%s/%s/comm" % (PROC, pid)) as f:
+                if f.read().strip() == "vpp_main":
+                    return int(pid)
+        except OSError:
+            continue
+    return None
+
+
+def read_worker_preempt(pid):
+    """{nr workera: (cpu, nr_involuntary_switches)} z /proc/<pid>/task/*/sched dla wątków vpp_wk_N."""
+    res = {}
+    base = "%s/%d/task" % (PROC, pid)
+    for tid in os.listdir(base):
+        try:
+            with open("%s/%s/comm" % (base, tid)) as f:
+                m = VPP_WK_RE.match(f.read().strip())
+            if not m:
+                continue
+            cpu = int(_stat_fields("%s/%s/stat" % (base, tid))[1][36])   # pole 39: procesor
+            with open("%s/%s/sched" % (base, tid)) as f:
+                for line in f:
+                    if line.startswith("nr_involuntary_switches"):
+                        res[int(m.group(1))] = (cpu, int(line.split(":")[1]))
+                        break
+        except (OSError, ValueError, IndexError):
+            continue
+    return res
+
+
+def tasks_on_cpu(cpu, skip_pid=None, n=4):
+    """Nazwy wątków (poza VPP i poza stałymi wątkami per-CPU) stojących teraz na rdzeniu — podpowiedź, kto wywłaszcza."""
+    seen = set()
+    for pid in os.listdir(PROC):
+        if not pid.isdigit() or int(pid) == skip_pid:
+            continue
+        try:
+            for tid in os.listdir("%s/%s/task" % (PROC, pid)):
+                name, fields = _stat_fields("%s/%s/task/%s/stat" % (PROC, pid, tid))
+                m = PERCPU_KTHREAD_RE.search(name)
+                if int(fields[36]) == cpu and not (m and int(m.group(1)) == cpu):
+                    seen.add(name)
+        except (OSError, ValueError, IndexError):
+            continue
+    return ", ".join(sorted(seen)[:n])
+
+
 # ------------------------------------------------------------------ główna pętla
 def main():
     global LOG
@@ -2230,6 +2585,7 @@ def main():
     a_load = Alarm("VPP", 4, "LOAD_HIGH", "LOAD_NORMAL")
     a_miss = Alarm("VPP", 2, "RX_MISS", "RX_MISS_END")
     a_disc = Alarm("VPP", 3, "NIC_DISCARD", "NIC_DISCARD_END")
+    a_wk = Alarm("VPP", 3, "WK_PREEMPT", "WK_PREEMPT_END")
     a_punt = Alarm("VPP", 4, "PUNT_HIGH", "PUNT_NORMAL")
     a_down = Alarm("VPP", 2, "DOWN", "UP")
     a_hk = Alarm("SYS", 4, "CPU_HIGH", "CPU_NORMAL")
@@ -2244,6 +2600,7 @@ def main():
     hk_over = 0
     hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
+    vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -2372,11 +2729,38 @@ def main():
                     tot = sum(rates.values())
                     state["nic_discard_pps"] = tot
                     a_disc.update(t0, tot >= CFG["NIC_DISCARD_PPS"], tot,
-                                  "karta odrzuca pakiety sprzętowo: %s (limit karty/PCIe lub przepełnienie)"
+                                  "karta odrzuca pakiety sprzętowo: %s (bufor PHY/priorytetu karty, PCIe)"
                                   % ", ".join("%s %s pkt/s" % (k, fmt_num(v)) for k, v in rates.items() if v > 0))
                 xs_prev, xs_t = xs, t0
             except Exception:      # noqa: BLE001 — restart VPP w trakcie: nazwy liczników odczytamy od nowa
                 xs_t, xs_paths = t0, None
+
+        # ---------------------------------------------------------- wywłaszczenia workerów
+        if not a_down.active:
+            try:
+                if vpp_pid is None or not os.path.isdir("%s/%d/task" % (PROC, vpp_pid)):
+                    vpp_pid, wk_prev, vpp_seen_t = find_vpp_pid(), {}, t0
+                wk_now = read_worker_preempt(vpp_pid) if vpp_pid else {}
+            except OSError:
+                wk_now = {}
+            hits = sorted(((n - wk_prev[w][1], w, cpu) for w, (cpu, n) in wk_now.items()
+                           if w in wk_prev and n > wk_prev[w][1]), reverse=True)
+            wk_prev = wk_now
+            # tuż po starcie VPP workery dostają po 2 wywłaszczenia (tworzenie wątków, przypięcie do rdzeni) — nie alarm
+            if t0 - vpp_seen_t < CFG["WK_GRACE"]:
+                hits = []
+            tot = sum(h[0] for h in hits)
+            state["wk_preempt"] = tot
+            if hits and t0 - wk_who_t >= 10:          # kto stoi na tym rdzeniu — skan /proc tylko przy zdarzeniu
+                wk_who, wk_who_t = tasks_on_cpu(hits[0][2], vpp_pid), t0
+            a_wk.update(t0, tot >= CFG["WK_PREEMPT"], tot,
+                        "worker VPP wywłaszczony z izolowanego rdzenia: %s%s — coś poza VPP działa na jego CPU%s; "
+                        "kolejka RX tego workera stoi (grozi rx-miss). Sprawdź: router-kthreads -n; ps -eLo psr,comm"
+                        % (", ".join("vpp_wk_%d (cpu %d) %d×" % (w, cpu, d) for d, w, cpu in hits[:4]),
+                           " (+%d workerów)" % (len(hits) - 4) if len(hits) > 4 else "",
+                           " (na rdzeniu: %s)" % wk_who if wk_who else ""))
+            if not a_wk.active:
+                wk_who = ""
 
         # ---------------------------------------------------------- rdzenie systemowe
         hk_now = read_proc_stat()
@@ -2393,7 +2777,7 @@ def main():
         hk_over = hk_over + 1 if hk_max >= CFG["HK_CPU_PCT"] else 0
         # przy przeciążeniu: które procesy zjadają CPU (różnica czasu CPU z ostatniej sekundy)
         if hk_over:
-            procs = read_proc_cpu()
+            procs = read_proc_cpu(isolated)
             if hk_procs is not None:
                 hk_top = top_procs(hk_procs, procs, t0 - hk_procs_t) or hk_top
             hk_procs, hk_procs_t = procs, t0
@@ -2504,7 +2888,7 @@ CATEGORIES = [
     ("DISKS", "smartd: zdrowie dysków (S.M.A.R.T.)", r"^SMART-"),
     ("NIC_FW", "aktualizacja firmware karty", r"^SYS-NIC_FW_"),
     ("VPP_STATE", "VPP niedostępny, zawieszony, wznowiony", r"^VPP-(DOWN|UP|HANG|HANG_RESTART)$"),
-    ("VPP_DROPS", "utrata pakietów: rx-miss, odrzucenia na karcie", r"^VPP-(RX_MISS|NIC_DISCARD)"),
+    ("VPP_DROPS", "utrata pakietów: rx-miss, odrzucenia na karcie, wywłaszczony worker", r"^VPP-(RX_MISS|NIC_DISCARD|WK_PREEMPT)"),
     ("VPP_LOAD", "przeciążenie workerów VPP (LOAD_HIGH / LOAD_CRITICAL)", r"^VPP-LOAD_"),
     ("VPP_PUNT", "duży ruch do samego routera (atak na control plane)", r"^VPP-PUNT_"),
     ("SYS_CPU", "przeciążenie rdzeni systemowych (BIRD, SNMP)", r"^SYS-CPU_"),
@@ -2761,7 +3145,7 @@ prog_router_bootcheck() {
 # Przy zamykaniu systemu (ExecStop) wołany z --shutdown: zapisuje znacznik czystego wyłączenia.
 STATE=/var/lib/router
 LOG=/var/log/router/alarmy.log
-UNITS="netns-dataplane vpp router-ifaces @@BIRDUNIT@@ snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify"
+UNITS="netns-dataplane vpp router-ifaces @@BIRDUNIT@@ snmpd-dataplane vpp-snmp-agent router-netflow router-monitor router-notify"
 mkdir -p "$STATE" /var/log/router
 report() {
   logger -t router-bootcheck -p "$1" "$2"
@@ -5802,7 +6186,7 @@ SMART_EVERY = 600        # s, SMART dysków
 STALE_AFTER = 300        # s, po tylu sekundach bez odświeżenia pass przestaje oddawać dane (zostaje rvDataAge)
 MAX_ERRORS = 400         # najwięcej wierszy w tablicy liczników błędów VPP
 SERVICES = ["vpp", "bird", "bird3", "netns-dataplane", "router-ifaces", "router-fw", "router-guard", "router-monitor",
-            "router-notify", "snmpd-dataplane", "vpp-snmp-agent", "snmpd-mgmt", "sshd-dataplane", "hsflowd", "chrony",
+            "router-notify", "snmpd-dataplane", "vpp-snmp-agent", "router-netflow", "snmpd-mgmt", "sshd-dataplane", "chrony",
             "smartd", "mdmonitor", "router-snmp", "routinator", "router-rpki-link"]
 
 BASE = "1.3.6.1.4.1.8072.9999.9999.630"
@@ -5827,7 +6211,7 @@ SCALARS = [
         (3, "rvVppWorkers", "gauge", "", "Liczba workerow VPP"),
         (4, "rvVppPuntPps", "gauge", "pps", "Ruch do control plane (punt), pakiety/s"),
         (5, "rvVppRxMissPps", "gauge", "pps", "Pakiety gubione na wejsciu (rx-miss + rx-no-buf), pakiety/s"),
-        (6, "rvVppNicDiscardPps", "gauge", "pps", "Pakiety odrzucane sprzetowo przez karte, pakiety/s"),
+        (6, "rvVppNicDiscardPps", "gauge", "pps", "Pakiety odrzucane sprzetowo przez karte (xstats discard, bez rx_out_of_buffer), pakiety/s"),
         (7, "rvVppHkCpuMax", "gauge", "%", "Najbardziej zajety rdzen systemowy (BIRD, SNMP, system), %"),
         (8, "rvVppBufAvail", "gauge", "", "Bufory VPP wolne"),
         (9, "rvVppBufUsed", "gauge", "", "Bufory VPP zajete"),
@@ -5836,7 +6220,7 @@ SCALARS = [
         (12, "rvVppDrops", "counter64", "", "Suma licznikow drops interfejsow VPP"),
         (13, "rvVppRxMiss", "counter64", "", "Suma rx-miss i rx-no-buf portow"),
         (14, "rvVppPunt", "counter64", "", "Suma pakietow punt"),
-        (15, "rvVppErrors", "counter64", "", "Suma licznikow show errors o poziomie error"),
+        (15, "rvVppErrors", "counter64", "", "Suma licznikow show errors o poziomie error, bez licznikow objetosci (ACL permit/checked, odpowiedzi/zapytania wyslane)"),
         (16, "rvFib4Routes", "gauge", "", "Trasy IPv4 w FIB VPP (VRF 0)"),
         (17, "rvFib6Routes", "gauge", "", "Trasy IPv6 w FIB VPP (VRF 0)"),
         (18, "rvBird4Routes", "gauge", "", "Sieci IPv4 w tablicy master4 BIRD"),
@@ -5892,7 +6276,7 @@ TABLES = [
         (6, "rvPortTxErrors", "counter64", "", "tx-error"),
         (7, "rvPortDrops", "counter64", "", "drops"),
         (8, "rvPortPunt", "counter64", "", "punt (ruch do control plane)"),
-        (9, "rvPortHwDiscards", "counter64", "", "Odrzucenia sprzetowe karty (xstats discard, out_of_buffer)"),
+        (9, "rvPortHwDiscards", "counter64", "", "Odrzucenia sprzetowe karty (xstats discard; rx_out_of_buffer = rvPortRxMiss)"),
     ]),
     (5, "rvErrorTable", "rvErrorEntry", "Liczniki show errors VPP (tylko niezerowe)", [
         (1, "rvErrorIndex", "int", "", "Indeks"),
@@ -6046,11 +6430,13 @@ def parse_show_interface(text):
 
 
 HW_IF = re.compile(r"^(\S+)\s+\d+\s+(up|down)\b")
-HW_X = re.compile(r"^\s+([A-Za-z0-9_\[\]]*(?:discard|out_of_buffer)[A-Za-z0-9_\[\]]*)\s+(\d+)\s*$")
+# tylko *discard*: rx_out_of_buffer to w mlx5 ten sam licznik co rx-miss (rvPortRxMiss) — liczony tu podwójnie
+# udawał odrzucenia sprzętowe
+HW_X = re.compile(r"^\s+([A-Za-z0-9_\[\]]*discard[A-Za-z0-9_\[\]]*)\s+(\d+)\s*$")
 
 
 def parse_hw_xstats(text):
-    """'vppctl show hardware-interfaces' → {port: suma liczników *discard*/*out_of_buffer* (bez tx_)}."""
+    """'vppctl show hardware-interfaces' → {port: suma liczników *discard* (bez tx_, bez rx_out_of_buffer)}."""
     res, cur = {}, None
     for line in text.splitlines():
         m = HW_IF.match(line)
@@ -6066,6 +6452,12 @@ def parse_hw_xstats(text):
 
 
 ERR_LINE = re.compile(r"^\s*(\d+)\s+(\S+)\s+(.+?)(?:\s+(error|warn|info|debug|unknown))?\s*$")
+# VPP etykietuje severity="error" na WIELU licznikach węzłów, które wcale nie są błędem (to ogólny mechanizm
+# liczników, nie ocena stanu) — np. acl-plugin liczy tak każdy przepuszczony/sprawdzony pakiet (wolumen ruchu,
+# nie problem), arp-reply/ip4-icmp-input/ip4-glean tak samo przy zwykłych odpowiedziach/zapytaniach. Bez tego
+# filtra rvVppErrors rośnie do milionów przy normalnym ruchu i myli monitoring (np. Cacti) — potwierdzone na
+# żywym routerze: 20M+ "ACL permit/checked packets" vs dosłownie kilkaset realnych "ACL deny packets".
+BENIGN_ERR_RE = re.compile(r"permit packets|checked packets|replies sent|requests sent|responses? sent", re.I)
 
 
 def parse_show_errors(text):
@@ -6423,7 +6815,7 @@ class Collector:
         _, out = vppctl("show", "errors")
         errs = sorted(parse_show_errors(out), key=lambda e: -e[0])
         if out:
-            s["rvVppErrors"] = sum(e[0] for e in errs if e[3] == "error")
+            s["rvVppErrors"] = sum(e[0] for e in errs if e[3] == "error" and not BENIGN_ERR_RE.search(e[2]))
         for count, node, reason, sev in errs[:MAX_ERRORS]:
             if count > 0:
                 self.add_row(t, "rvErrorTable", "%s|%s" % (node, reason), {
@@ -6885,8 +7277,13 @@ def load_module(name, path):
 
 
 # --------------------------------------------------------------------------- karty 1 i 2: VPP, interfejsy
+# musi się zgadzać z parserem znacznika netflow/nonetflow w router-ifaces (ten sam plik ifaces.conf,
+# osobny, prosty parser tylko do wyświetlania — bez tego znacznik zostawał w opisie zamiast w swojej kolumnie)
+NETFLOW_TAG_RE = re.compile(r"^(nonetflow|netflow)\b\s*", re.I)
+
+
 def read_descs():
-    """Opisy z ifaces.conf: {nazwa VPP: opis}."""
+    """Opisy z ifaces.conf: {nazwa VPP: (netflow, opis)} — netflow: "netflow"/"nonetflow"/"" (bez znacznika)."""
     out = {}
     try:
         with open(IFACES_CONF) as f:
@@ -6894,7 +7291,9 @@ def read_descs():
                 t = raw.split("#", 1)[0].split(None, 4)
                 if len(t) >= 4:
                     name = t[0] if t[1] == "-" else "%s.%s" % (t[0], t[1])
-                    out[name] = t[4].strip() if len(t) == 5 else ""
+                    desc = t[4].strip() if len(t) == 5 else ""
+                    m = NETFLOW_TAG_RE.match(desc)
+                    out[name] = (m.group(1).lower() if m else "", desc[m.end():].strip() if m else desc)
     except OSError:
         pass
     return out
@@ -7006,17 +7405,18 @@ def screen_vpp(cur, prev, dt):
 
 def screen_ifaces(cur, prev, dt):
     descs = read_descs()
-    lines = [("  %-16s %-26s %13s %10s %13s %10s %10s" % ("interfejs", "opis", "RX", "RX pkt/s", "TX", "TX pkt/s",
-                                                             "zgub./s"), "head")]
+    lines = [("  %-16s %-9s %-26s %13s %10s %13s %10s %10s" % (
+        "interfejs", "netflow", "opis", "RX", "RX pkt/s", "TX", "TX pkt/s", "zgub./s"), "head")]
     rows, tot = if_rows(cur, prev, dt)
     for n, r in rows:
         label = n if "." not in n else " └ " + n
         style = "miss" if r[4] > 0 else ("" if "." in n else "bold")
-        lines.append(("  %-16s %-26s %13s %10s %13s %10s %10s" % (
-            label, descs.get(n, "")[:26], fmt_bps(r[1] * 8), fmt_pps(r[0]), fmt_bps(r[3] * 8), fmt_pps(r[2]),
+        nf, desc = descs.get(n, ("", ""))
+        lines.append(("  %-16s %-9s %-26s %13s %10s %13s %10s %10s" % (
+            label, nf or "-", desc[:26], fmt_bps(r[1] * 8), fmt_pps(r[0]), fmt_bps(r[3] * 8), fmt_pps(r[2]),
             fmt_pps(r[4]) if r[4] else "-"), style))
     lines.append(("", ""))
-    lines.append(("  %-43s %13s %10s %13s %10s %10s" % ("RAZEM (porty fizyczne)", fmt_bps(tot[1] * 8), fmt_pps(tot[0]),
+    lines.append(("  %-53s %13s %10s %13s %10s %10s" % ("RAZEM (porty fizyczne)", fmt_bps(tot[1] * 8), fmt_pps(tot[0]),
                                                          fmt_bps(tot[3] * 8), fmt_pps(tot[2]),
                                                          fmt_pps(tot[4]) if tot[4] else "-"), "bold"))
     lines.append(("  VLAN-y są wliczone w port fizyczny. „zgub./s” = pakiety zgubione przez kartę (VPP nie nadąża).",
@@ -7583,14 +7983,15 @@ AREAS = [
          A("Sprawdź konfigurację BIRD", "składnia bez przeładowania", ["birdc", "configure", "check"]),
          A("Przeładuj konfigurację BIRD", "wczytuje bird.conf bez zrywania sesji", ["birdc", "configure"], mode="write",
            preview=["birdc", "configure", "check"])]},
-    {"key": "access", "alias": "", "title": "SNMP, sFlow i SSH",
-     "desc": "dostęp zarządzający przez loop0 i port zarządzający, eksport sFlow",
+    {"key": "access", "alias": "", "title": "SNMP, NetFlow i SSH",
+     "desc": "dostęp zarządzający przez loop0 i port zarządzający, eksport NetFlow/IPFIX",
      "files": [
          F("/etc/snmp/snmpd.conf", "snmpd (dataplane)", "SNMP na loop0: liczniki portów VPP, community, zaufane sieci",
            "systemctl restart snmpd-dataplane"),
          F("/etc/snmp/snmpd-mgmt.conf", "snmpd (port zarządzający)", "SNMP hosta: Linux, RAID, dyski",
            "systemctl restart snmpd-mgmt"),
-         F("/etc/hsflowd.conf", "hsflowd", "kolektor sFlow (FastNetMon) i źródło próbek z VPP", "systemctl restart hsflowd"),
+         F("/etc/router/netflow.conf", "router-netflow", "kolektory NetFlow/IPFIX (FastNetMon, Akvorado…) — IP:PORT, jeden na linię",
+           "systemctl restart router-netflow"),
          F("/etc/ssh/sshd_config_dataplane", "sshd (dataplane)", "sshd na adresie loop0 (hasło lub klucz)",
            "sshd -t -f /etc/ssh/sshd_config_dataplane → systemctl restart sshd-dataplane"),
          F("/etc/ssh/sshd_config.d/00-router-access.conf", "sshd (port zarządzający)", "PermitRootLogin na porcie zarządzającym",
@@ -7604,7 +8005,20 @@ AREAS = [
            ["systemctl", "status", "snmpd-dataplane", "snmpd-mgmt", "vpp-snmp-agent", "router-snmp", "--no-pager"]),
          A("Dane SNMP routera", "BGP, zdrowie VPP, firewall, guard, RPKI, RAID, dyski — to, co widzi LibreNMS/Zabbix/Cacti",
            ["/opt/router/bin/router-snmp", "walk"]),
-         A("Stan sFlow", "hsflowd i wtyczka sFlow w VPP", ["systemctl", "status", "hsflowd", "--no-pager"]),
+         A("Stan NetFlow/IPFIX", "wtyczka flowprobe i eksporter IPFIX w VPP", ["vppctl", "show", "flowprobe", "params"]),
+         A("Stan replikacji NetFlow", "router-netflow: rozsyła do kolektorów z netflow.conf",
+           ["systemctl", "status", "router-netflow", "--no-pager"]),
+         A("Restart replikacji NetFlow", "restart router-netflow — uruchamia też, gdy jest zatrzymany "
+           "(po zmianie netflow.conf albo gdy usługa nie działa)",
+           ["systemctl", "restart", "router-netflow"], mode="write", confirm=True),
+         A("Zatrzymaj replikację NetFlow", "stop router-netflow — eksport z VPP dalej dociera do nf-export, "
+           "ale nikt go nie odbiera i nie rozsyła do kolektorów",
+           ["systemctl", "stop", "router-netflow"], mode="write", confirm=True),
+         A("Włącz NetFlow/IPFIX", "router-ifaces netflow-on: flowprobe na portach/VLAN-ach, bez restartu VPP",
+           ["/opt/router/bin/router-ifaces", "netflow-on"], mode="write", confirm=True),
+         A("Wyłącz NetFlow/IPFIX", "router-ifaces netflow-off: flowprobe wyłączony na portach/VLAN-ach, bez restartu VPP "
+           "(zwalnia CPU; loop0 zostaje jako kotwica, znikomy koszt)",
+           ["/opt/router/bin/router-ifaces", "netflow-off"], mode="write", confirm=True),
          A("Stan SSH w dataplane", "sshd na adresie loop0", ["systemctl", "status", "sshd-dataplane", "--no-pager"]),
          A("Gniazda nasłuchu w dataplane", "kto słucha na SSH (22) i SNMP (161) w namespace dataplane",
            ["ip", "netns", "exec", "dataplane", "ss", "-tulnp"]),
@@ -8208,6 +8622,27 @@ do_check() {
   else warn "brak nohz_full — workery VPP dostają tik zegara (install-router set_workers, potem restart serwera)"; fi
   if grep -q 'managed_irq' /proc/cmdline; then ok "przerwania sterowników poza rdzeniami VPP (managed_irq, irqaffinity)"
   else warn "brak isolcpus=managed_irq — przerwania sterowników mogą trafiać na rdzenie VPP"; fi
+  if [[ $(sysctl -n kernel.numa_balancing 2>/dev/null) == 0 ]]; then ok "numa_balancing wyłączony"
+  else warn "kernel.numa_balancing aktywny — może blokować workera VPP na dłużej niż zapełnienie ringu RX (install-router set_workers)"; fi
+  thp=$(grep -o '\[[a-z]*\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]')
+  if [[ $thp == madvise || $thp == never ]]; then ok "transparent hugepages: $thp"
+  else warn "transparent hugepages=$thp — khugepaged w tle może blokować workera VPP (install-router set_workers)"; fi
+  cp=$(sysctl -n vm.compaction_proactiveness 2>/dev/null)
+  if [[ -z $cp || $cp == 0 ]]; then ok "proaktywna kompakcja pamięci wyłączona (kcompactd nie budzi się cyklicznie)"
+  else warn "vm.compaction_proactiveness=$cp — kcompactd budzi się co 500 ms; na rdzeniu workera VPP = rx-miss (install-router set_workers)"; fi
+  if [[ -x /opt/router/bin/router-kthreads ]]; then
+    if /opt/router/bin/router-kthreads -n >/dev/null 2>&1; then ok "wątki kernela (kcompactd, kswapd) poza rdzeniami VPP"
+    else warn "wątki kernela z dostępem do rdzeni VPP — uruchom: router-kthreads (podgląd: router-kthreads -n)"; fi
+  else warn "brak /opt/router/bin/router-kthreads — kcompactd/kswapd mogą wywłaszczać workery VPP (install-router upgrade_script)"; fi
+  vpid=$(pgrep -x vpp_main 2>/dev/null | head -n1)
+  if [[ -n $vpid && -d /proc/$vpid/task ]]; then
+    pre=$(for t in /proc/"$vpid"/task/*; do
+            grep -q '^vpp_wk_' "$t/comm" 2>/dev/null || continue
+            awk -v n="$(cat "$t/comm")" '/^nr_involuntary_switches/ && $3 > 10 {printf "%s=%s ", n, $3}' "$t/sched" 2>/dev/null
+          done)
+    if [[ -z $pre ]]; then ok "workery VPP nie są wywłaszczane (nr_involuntary_switches ≤ 10 od startu VPP)"
+    else warn "workery VPP wywłaszczane (licznik od startu VPP, zeruje się po restarcie VPP): $pre— bieżące zdarzenia: %VPP-3-WK_PREEMPT w alarmy.log; kto siedzi na rdzeniu: ps -eLo psr,comm"; fi
+  fi
   for n in /sys/devices/system/node/node*; do
     printf '  %s: hugepages 2M total=%s free=%s\n' "$(basename "$n")" \
       "$(cat "$n/hugepages/hugepages-2048kB/nr_hugepages")" "$(cat "$n/hugepages/hugepages-2048kB/free_hugepages")"
@@ -8226,7 +8661,7 @@ do_check() {
   printf '\n%s== Usługi ==%s\n' "$c_hdr" "$c_off"
   local u
   [[ -e /etc/router/firewall.enabled ]] || say "router-fw: firewall nieaktywny (aktywacja: router-fw enable) — usługa celowo nie działa"
-  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent hsflowd router-monitor router-notify router-bootcheck mdmonitor smartd sshd-dataplane snmpd-mgmt router-snmp routinator router-rpki-link; do
+  for u in router.target netns-dataplane vpp router-ifaces router-fw router-guard "$(bird_unit)" rsyslog chrony router-dataplane-fw netfilter-persistent snmpd-dataplane vpp-snmp-agent router-netflow router-monitor router-notify router-bootcheck mdmonitor smartd sshd-dataplane snmpd-mgmt router-snmp routinator router-rpki-link; do
     if systemctl is-active --quiet "$u"; then ok "$u: active"; else warn "$u: $(systemctl is-active "$u" 2>/dev/null || true)"; fi
   done
 
@@ -8234,11 +8669,11 @@ do_check() {
   vppctl show version || true
   vppctl show threads || true
   vppctl show interface || true
-  vppctl show plugins 2>/dev/null | grep -E 'linux_cp|linux_nl|sflow|dpdk|synack_guard' || true
+  vppctl show plugins 2>/dev/null | grep -E 'linux_cp|linux_nl|flowprobe|dpdk|synack_guard' || true
   if grep -q '^nf_conntrack ' /proc/modules; then warn "conntrack załadowany w kernelu (powinien być wyłączony — po restarcie zniknie)"
   else ok "conntrack wyłączony"; fi
   guard_plugin_log
-  vppctl show sflow || true
+  vppctl show flowprobe params || true
 
   printf '\n%s== Interfejsy (/etc/router/ifaces.conf) ==%s\n' "$c_hdr" "$c_off"
   /opt/router/bin/router-ifaces show 2>&1 || true
@@ -8360,6 +8795,7 @@ Na co patrzeć w `alarmy.log`:
 |---|---|---|
 | `%VPP-4-LOAD_HIGH`, `%VPP-2-LOAD_CRITICAL` | workery VPP są obciążone (duży ruch / atak) | sprawdź ruch (sFlow), rozdział 7 |
 | `%VPP-2-RX_MISS`, `%VPP-3-NIC_DISCARD` | **gubione pakiety** — VPP lub karta nie nadąża | rozdział 7; jeśli stale — za mało workerów |
+| `%VPP-3-WK_PREEMPT` | **worker VPP wywłaszczony** — coś poza VPP działa na izolowanym rdzeniu | `router-kthreads -n`, `ps -eLo psr,comm`; rozdział 7 |
 | `%VPP-4-PUNT_HIGH` | dużo ruchu do samego routera (atak na control plane) | sprawdź źródła; netfilter w netns dataplane |
 | `%VPP-1-HANG`, `%VPP-2-DOWN` | VPP nie odpowiada / leży | rozdział 9 |
 | `%SYS-2-SERVICE_FAIL`, `%SYS-1-SERVICE_DOWN` | usługa padła (VPP, BIRD…) | `journalctl -u <usługa> -b` |
@@ -8566,6 +9002,7 @@ Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-
 | `VEC_WARN` / `VEC_CRIT` | 64 / 160 | obciążenie workera (wektor 1 = luz, 256 = pełne nasycenie) |
 | `RXMISS_PPS` | 1 | gubione pakiety na karcie |
 | `NIC_DISCARD_PPS` | 1 | odrzucenia sprzętowe karty |
+| `WK_PREEMPT` / `WK_GRACE` | 1 / 120 | wywłaszczenia workera VPP na sekundę (coś poza VPP na izolowanym rdzeniu); bez alarmu przez 120 s po starcie VPP |
 | `PUNT_PPS` | 20000 | ruch do samego routera |
 | `HK_CPU_PCT` / `HK_CPU_SECONDS` | 90 / 5 | przeciążony rdzeń systemowy |
 | `HANG_SECONDS` / `HANG_RESTART` | 30 / 1 | VPP nie odpowiada → po 30 s restart VPP |
@@ -8684,6 +9121,7 @@ birdc show protocols | configure check | configure
 
 systemctl status router.target            # wszystkie usługi routera
 router-history                            # kopie i historia zmian /etc: daty, podgląd, wyciągnięcie do katalogu
+router-kthreads -n                        # wątki kernela (kcompactd, kswapd) z dostępem do rdzeni VPP; bez -n przepina
 iptables -t raw -L PREROUTING -nv         # ochrona CPU: eth2
 ip netns exec dataplane iptables -t raw -L PREROUTING -nv   # ochrona CPU: adresy VPP, loop0
 chronyc sources                           # synchronizacja czasu
@@ -8691,8 +9129,152 @@ chronyc sources                           # synchronizacja czasu
 ROUTER_MANUAL_MD
 }
 
+prog_router_kthreads() {
+  cat <<'ROUTER_KTHREADS_PY'
+#!/usr/bin/python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+# router-kthreads — wątki kernela z dostępem do rdzeni VPP przypina do rdzeni systemowych.
+#
+#   router-kthreads        przepnij (uruchamiane przy starcie przez router-kthreads.service i po set_workers)
+#   router-kthreads -n     tylko pokaż, co zostałoby przepięte (nic nie zmienia; kod 1 = coś jest do przepięcia)
+#   router-kthreads --all  przepnij każdy wątek kernela, który ma w masce rdzenie VPP (styl tuned "realtime")
+#
+# Dlaczego: isolcpus/nohz_full chronią rdzenie workerów VPP przed procesami i przerwaniami, ale NIE przed wątkami
+# kernela, które dostają własną maskę CPU. kcompactdN i kswapdN (kompakcja i odzyskiwanie pamięci węzła NUMA N)
+# mają maskę całego węzła — łącznie z izolowanymi rdzeniami — i kernel potrafi je posadzić właśnie tam.
+# Na lodz2-vpp kcompactd1 siedział na cpu 5 i wywłaszczał vpp_wk_0 22 tys. razy (timer proaktywnej kompakcji,
+# vm.compaction_proactiveness=20): w tym czasie kolejka rx_q0 stała, a karta gubiła pakiety (rx_out_of_buffer),
+# bez śladu w przerwaniach (IPI/TLB) ani w buforach VPP. Objaw w router-monitor: %VPP-3-WK_PREEMPT.
+#
+# Co robi: czyta /sys/devices/system/cpu/isolated (rdzenie VPP) i present; dla każdego wątku kernela (flaga
+# PF_KTHREAD w /proc/<pid>/stat), który ma w masce izolowany rdzeń i (a) maskę węższą niż wszystkie CPU — czyli
+# przypięty celowo, jak kcompactd/kswapd — albo (b) stoi teraz na izolowanym rdzeniu, zawęża maskę do rdzeni
+# systemowych tego samego węzła NUMA (część wspólna starej maski i rdzeni systemowych; gdy pusta — wszystkie
+# systemowe). Wątki per-CPU (ksoftirqd/5, kworker/5:1, migration/5…) kernel i tak nie pozwala przepiąć
+# (PF_NO_SETAFFINITY) — są pomijane po nazwie. PID-y nie są nigdzie zapisane: po każdym starcie są inne,
+# dlatego program za każdym razem skanuje /proc.
+import os
+import re
+import sys
+
+SYS = os.environ.get("ROUTER_KTHREADS_SYS", "/sys")
+PROC = os.environ.get("ROUTER_KTHREADS_PROC", "/proc")
+PF_KTHREAD = 0x00200000
+PERCPU_RE = re.compile(r"/\d+(:|$)")
+
+
+def cpulist(text):
+    res = set()
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            res.update(range(int(a), int(b) + 1))
+        else:
+            res.add(int(part))
+    return res
+
+
+def fmt(cpus):
+    """{1,2,3,5} → '1-3,5'"""
+    out, cpus = [], sorted(cpus)
+    i = 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(str(cpus[i]) if i == j else "%d-%d" % (cpus[i], cpus[j]))
+        i = j + 1
+    return ",".join(out)
+
+
+def read_cpus(name):
+    try:
+        with open("%s/devices/system/cpu/%s" % (SYS, name)) as f:
+            return cpulist(f.read())
+    except OSError:
+        return set()
+
+
+def kthreads():
+    """[(pid, nazwa, cpu, maska)] wątków kernela (procesy; wątki per-CPU i tak nie dają się przepiąć)."""
+    res = []
+    for pid in os.listdir(PROC):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("%s/%s/stat" % (PROC, pid)) as f:
+                head, rest = f.read().rsplit(")", 1)
+            fields = rest.split()
+            if not int(fields[6]) & PF_KTHREAD:      # pole 9: flagi
+                continue
+            allowed = None
+            with open("%s/%s/status" % (PROC, pid)) as f:
+                for line in f:
+                    if line.startswith("Cpus_allowed_list:"):
+                        allowed = cpulist(line.split(":", 1)[1])
+                        break
+            if allowed is None:
+                continue
+            res.append((int(pid), head.split("(", 1)[1], int(fields[36]), allowed))   # pole 39: procesor
+        except (OSError, ValueError, IndexError):
+            continue
+    return res
+
+
+def plan(threads, isolated, present, everything=False):
+    """[(pid, nazwa, stara maska, nowa maska)] — co przepiąć."""
+    hk = present - isolated
+    out = []
+    for pid, name, cpu, allowed in threads:
+        if PERCPU_RE.search(name) or not (allowed & isolated):
+            continue
+        if not (everything or allowed != present or cpu in isolated):
+            continue
+        new = (allowed & hk) or hk
+        out.append((pid, name, allowed, new))
+    return out
+
+
+def main(argv):
+    dry = "-n" in argv
+    isolated, present = read_cpus("isolated"), read_cpus("present")
+    if not isolated:
+        print("brak izolowanych rdzeni (isolcpus) — nic do przepięcia")
+        return 0
+    todo = plan(kthreads(), isolated, present, everything="--all" in argv)
+    if not todo:
+        print("wątki kernela poza rdzeniami VPP (%s) — nic do przepięcia" % fmt(isolated))
+        return 0
+    moved = 0
+    for pid, name, old, new in todo:
+        print("%-24s pid %-7d %s → %s" % (name, pid, fmt(old), fmt(new)))
+        if dry:
+            continue
+        try:
+            os.sched_setaffinity(pid, new)
+            moved += 1
+        except (OSError, AttributeError) as e:
+            print("    nie przepięto: %s" % e)
+    if dry:
+        print("do przepięcia: %d (uruchom bez -n)" % len(todo))
+        return 1
+    print("przepięto: %d z %d" % (moved, len(todo)))
+    return 0 if moved == len(todo) else 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("-V", "--version", "-h", "--help"):
+        print(__doc__ or "router-kthreads — wątki kernela poza rdzeniami VPP (-n: tylko pokaż, --all: każdy wątek)\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        sys.exit(0)
+    sys.exit(main(sys.argv[1:]))
+ROUTER_KTHREADS_PY
+}
+
 UPGRADE_PROGRAMS=(
   "router-monitor|/opt/router/bin/router-monitor|755|prog_router_monitor|router-monitor.service"
+  "router-kthreads|/opt/router/bin/router-kthreads|755|prog_router_kthreads|router-kthreads.service"
   "router-notify|/opt/router/bin/router-notify|755|prog_router_notify|router-notify.service"
   "router-ifaces|/opt/router/bin/router-ifaces|755|prog_router_ifaces|"
   "router-fw|/opt/router/bin/router-fw|755|prog_router_fw|"
@@ -8707,6 +9289,7 @@ UPGRADE_PROGRAMS=(
   "mdadm-alert|/opt/router/bin/mdadm-alert|755|prog_mdadm_alert|"
   "smartd-alert|/opt/router/bin/smartd-alert|755|prog_smartd_alert|"
   "router-fw-update|/opt/router/bin/router-fw-update|755|prog_router_fw_update|"
+  "router-netflow|/opt/router/bin/router-netflow|755|prog_router_netflow|router-netflow.service"
   "router-check|/usr/local/sbin/router-check|755|prog_router_check|"
   "INSTRUKCJA.md|/etc/router/INSTRUKCJA.md|644|router_manual|"
 )
@@ -8892,6 +9475,7 @@ do_upgrade() {
   ln -sfn /opt/router/bin/router-ifaces /usr/local/sbin/router-ifaces
   ln -sfn /opt/router/bin/router-notify /usr/local/sbin/router-notify
   [[ -e /opt/router/bin/router-top ]] && ln -sfn /opt/router/bin/router-top /usr/local/sbin/router-top
+  [[ -e /opt/router/bin/router-kthreads ]] && ln -sfn /opt/router/bin/router-kthreads /usr/local/sbin/router-kthreads
   ln -sfn /opt/router/bin/router-fw-update /usr/local/sbin/router-fw-update
   ln -sfn /opt/router/install-router.sh /usr/local/sbin/install-router
   ln -sfn /opt/router/bin/router /usr/local/sbin/router
@@ -8926,16 +9510,50 @@ do_upgrade() {
   ok "gotowe — wersja na routerze: $SCRIPT_VERSION. Cofnięcie: skopiuj pliki z $bdir"
 }
 
-upgrade_isolation() {   # po upgrade_script: stary układ izolacji → nowy, bez restartu VPP (działa po restarcie serwera)
-  local g=/etc/default/grub.d/90-vpp.cfg
-  ((DRY_RUN)) && return 0
-  [[ -f $g && -x /opt/router/install-router.sh ]] || return 0
-  grep -q 'managed_irq' "$g" && grep -q 'nohz_full=' "$g" && return 0
-  say "izolacja rdzeni VPP w starym układzie — uzupełniam (ta sama liczba workerów, VPP bez restartu)"
-  /opt/router/install-router.sh set_workers || warn "nie udało się uzupełnić izolacji — uruchom: install-router set_workers"
+upgrade_remove_hsflowd() {   # sFlow/hsflowd zastąpione przez flowprobe (NetFlow/IPFIX) — usuń starą instalację
+  dpkg -l hsflowd 2>/dev/null | grep -q '^ii' || return 0
+  say "hsflowd (sFlow) nie jest już używany — usuwam, przechodzę na NetFlow/IPFIX (flowprobe)"
+  systemctl disable --now hsflowd >/dev/null 2>&1 || true
+  apt-mark unhold hsflowd >/dev/null 2>&1 || true
+  apt-get purge "${APT_OPTS[@]}" hsflowd >/dev/null 2>&1 || warn "nie udało się odinstalować hsflowd — usuń ręcznie: apt purge hsflowd"
+  rm -f /etc/hsflowd.conf
 }
 
-if [[ $MODE == upgrade ]]; then do_upgrade; upgrade_isolation; exit 0; fi
+upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (działa po restarcie serwera; restart VPP tylko jeśli desc/bufory/NetFlow też się zmieniły)
+  local g=/etc/default/grub.d/90-vpp.cfg thp cur_rx cur_tx netflow_ok=0
+  ((DRY_RUN)) && return 0
+  [[ -f $g && -x /opt/router/install-router.sh ]] || return 0
+  upgrade_remove_hsflowd
+  thp=$(grep -o '\[[a-z]*\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]')
+  # num-rx-desc/num-tx-desc i flowprobe nie są w vpp_conf_diff bez pełnego wykrywania sprzętu (które w trybie
+  # upgrade jeszcze nie jest zrobione) — porównanie wprost z żywym startup.conf/bootstrap.vpp, $VPP_RX_DESC/
+  # $VPP_TX_DESC są dostępne od razu, niezależnie od MODE; bez tego podbicie samych deskryptorów (bez zmiany
+  # numa_balancing/THP) nigdy nie wywołałoby set_workers, mimo że startup.conf jest nieaktualny
+  cur_rx=$(grep -oE 'num-rx-desc [0-9]+' /etc/vpp/startup.conf 2>/dev/null | head -n1 | awk '{print $2}')
+  cur_tx=$(grep -oE 'num-tx-desc [0-9]+' /etc/vpp/startup.conf 2>/dev/null | head -n1 | awk '{print $2}')
+  if [[ $NETFLOW_ENABLE == yes ]]; then
+    grep -qxF "flowprobe params record l2 l3 l4 active $NETFLOW_ACTIVE_TIMER passive $NETFLOW_PASSIVE_TIMER" \
+         /etc/vpp/bootstrap.vpp 2>/dev/null \
+      && grep -qxF "create tap id 0 host-if-name nf-export host-ns dataplane host-ip4-addr $NETFLOW_TAP_LINUX/30" \
+           /etc/vpp/bootstrap.vpp 2>/dev/null \
+      && grep -qxF "set ipfix exporter collector $NETFLOW_TAP_LINUX port $NETFLOW_PORT src $NETFLOW_TAP_VPP fib-id $NETFLOW_TAP_FIB template-interval $NETFLOW_TEMPLATE_INTERVAL" \
+           /etc/vpp/bootstrap.vpp 2>/dev/null \
+      && netflow_ok=1
+  else
+    grep -qF "create tap id 0 host-if-name nf-export" /etc/vpp/bootstrap.vpp 2>/dev/null || netflow_ok=1
+  fi
+  grep -q 'managed_irq' "$g" && grep -q 'nohz_full=' "$g" \
+    && [[ $(sysctl -n kernel.numa_balancing 2>/dev/null) == 0 ]] \
+    && [[ $(sysctl -n vm.compaction_proactiveness 2>/dev/null) == 0 ]] \
+    && [[ -f /etc/systemd/system/router-kthreads.service && -x /opt/router/bin/router-kthreads ]] \
+    && [[ $thp == madvise || $thp == never ]] \
+    && [[ -z $cur_rx || $cur_rx == "$VPP_RX_DESC" ]] && [[ -z $cur_tx || $cur_tx == "$VPP_TX_DESC" ]] \
+    && ((netflow_ok)) && return 0
+  say "izolacja rdzeni / wątki kernela / deskryptory / NetFlow VPP w starym układzie — uzupełniam (ta sama liczba workerów)"
+  /opt/router/install-router.sh set_workers || warn "nie udało się uzupełnić — uruchom: install-router set_workers"
+}
+
+if [[ $MODE == upgrade ]]; then do_upgrade; upgrade_vpp_sync; exit 0; fi
 
 # --- set_workers: zmiana liczby workerów VPP (rdzenie, izolacja, startup.conf) bez ponownej instalacji
 # różnice między /etc/vpp/startup.conf a tym, co wyliczył instalator (rdzenie, bufory, sterta, porty); kod 0 = są zmiany
@@ -8944,16 +9562,43 @@ vpp_conf_diff() {   # vpp_conf_diff [vpp] — "vpp": tylko startup.conf i hugepa
   cw=$(grep -oE 'corelist-workers [0-9,]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
   cb=$(grep -oE 'buffers-per-numa [0-9]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
   ch=$(grep -oE 'main-heap-size [^ }]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
-  cp=$(grep -oE 'dev [0-9a-fA-F:.]+' "$f" 2>/dev/null | cut -d' ' -f2 | tr '\n' ' ' | sed 's/ $//')
+  cp=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE 'dev [0-9a-fA-F:.]+' | cut -d' ' -f2 | tr '\n' ' ' | sed 's/ $//')
   chp=$(grep -oE 'vm.nr_hugepages *= *[0-9]+' "${VPP_SYSCTL_CONF:-/etc/sysctl.d/81-vpp-router.conf}" 2>/dev/null | head -n1 | grep -oE '[0-9]+$')
   [[ $chp == "$HUGEPAGES_2M" ]] || { echo "  zmiana: hugepages ${chp:-brak} → $HUGEPAGES_2M"; rc=0; }
   [[ $cw == "$WORKERS_CSV" ]] || { echo "  zmiana: rdzenie ${cw:-brak} → $WORKERS_CSV"; rc=0; }
   [[ $cb == "$BUFFERS" ]] || { echo "  zmiana: bufory ${cb:-brak} → $BUFFERS"; rc=0; }
   [[ $ch == "$MAIN_HEAP" ]] || { echo "  zmiana: sterta ${ch:-brak} → $MAIN_HEAP"; rc=0; }
   [[ $cp == "${NIC_PCI[*]}" ]] || { echo "  zmiana: porty ${cp:-brak} → ${NIC_PCI[*]}"; rc=0; }
+  if [[ $NETFLOW_ENABLE == yes ]]; then
+    { grep -qxF "flowprobe params record l2 l3 l4 active $NETFLOW_ACTIVE_TIMER passive $NETFLOW_PASSIVE_TIMER" \
+           "${VPP_BOOTSTRAP:-/etc/vpp/bootstrap.vpp}" 2>/dev/null \
+      && grep -qxF "create tap id 0 host-if-name nf-export host-ns dataplane host-ip4-addr $NETFLOW_TAP_LINUX/30" \
+           "${VPP_BOOTSTRAP:-/etc/vpp/bootstrap.vpp}" 2>/dev/null \
+      && grep -qxF "set ipfix exporter collector $NETFLOW_TAP_LINUX port $NETFLOW_PORT src $NETFLOW_TAP_VPP fib-id $NETFLOW_TAP_FIB template-interval $NETFLOW_TEMPLATE_INTERVAL" \
+           "${VPP_BOOTSTRAP:-/etc/vpp/bootstrap.vpp}" 2>/dev/null; } \
+      || { echo "  zmiana: eksport NetFlow/IPFIX (flowprobe) jeszcze nieskonfigurowany albo nieaktualny"; rc=0; }
+  else
+    grep -qF "create tap id 0 host-if-name nf-export" "${VPP_BOOTSTRAP:-/etc/vpp/bootstrap.vpp}" 2>/dev/null \
+      && { echo "  zmiana: NetFlow/IPFIX ma być wyłączony (NETFLOW_ENABLE=no), ale bootstrap.vpp go jeszcze konfiguruje"; rc=0; }
+  fi
   local g=${VPP_GRUB_CONF:-/etc/default/grub.d/90-vpp.cfg}
   if [[ ${1:-} != vpp && -n ${NOHZ_CSV:-} ]] && ! { grep -q "managed_irq" "$g" && grep -q "nohz_full=$NOHZ_CSV " "$g" && grep -q "irqaffinity=$HK_CSV " "$g"; } 2>/dev/null; then
     echo "  zmiana: izolacja rdzeni (isolcpus managed_irq, nohz_full=$NOHZ_CSV, irqaffinity=$HK_CSV)"; rc=0
+  fi
+  if [[ ${1:-} != vpp ]]; then
+    local nb=${VPP_NUMA_BALANCING-$(sysctl -n kernel.numa_balancing 2>/dev/null)}
+    [[ -z $nb || $nb == 0 ]] || { echo "  zmiana: kernel.numa_balancing → 0 (bez blokowania workerów VPP w tle)"; rc=0; }
+    local cp=${VPP_COMPACT_PROACTIVE-$(sysctl -n vm.compaction_proactiveness 2>/dev/null)}
+    [[ -z $cp || $cp == 0 ]] || { echo "  zmiana: vm.compaction_proactiveness → 0 (kcompactd nie budzi się co 500 ms na rdzeniu workera)"; rc=0; }
+    local ku=${VPP_KTHREADS_UNIT:-/etc/systemd/system/router-kthreads.service}
+    if [[ -n ${VPP_KTHREADS_UNIT:-} || -d /etc/systemd/system ]] && [[ ! -f $ku ]]; then
+      echo "  zmiana: router-kthreads.service (kcompactd/kswapd poza rdzeniami VPP) jeszcze nie zainstalowany"; rc=0
+    fi
+    local thpf=${VPP_THP_FILE:-/sys/kernel/mm/transparent_hugepage/enabled} thp
+    if [[ -f $thpf ]]; then
+      thp=$(grep -o '\[[a-z]*\]' "$thpf" 2>/dev/null | tr -d '[]')
+      [[ $thp == madvise || $thp == never ]] || { echo "  zmiana: transparent hugepages ${thp:-brak} → madvise"; rc=0; }
+    fi
   fi
   return $rc
 }
@@ -8993,13 +9638,18 @@ do_set_workers() {
     FROM_STAGE=6
     run_stage 06 "Izolacja rdzeni, taktowanie, panic (GRUB)" st_isolation
     ok "izolacja rdzeni zapisana (VPP bez restartu): $(isol_cmdline)"
-    warn "nowa izolacja działa po RESTARCIE SERWERA — zrób go w oknie serwisowym: systemctl reboot"
+    if grep -qE "isolcpus=managed_irq,domain,$ISOL_CSV( |$)" /proc/cmdline 2>/dev/null && grep -qE "nohz_full=$NOHZ_CSV( |$)" /proc/cmdline 2>/dev/null; then
+      ok "działający kernel ma już tę izolację — sysctl i router-kthreads działają od razu, restart serwera niepotrzebny"
+    else
+      warn "nowa izolacja działa po RESTARCIE SERWERA — zrób go w oknie serwisowym: systemctl reboot"
+    fi
     return 0
   fi
   FROM_STAGE=5
   run_stage 05 "Moduły mlx5, sysctl, hugepages" st_kernel
   run_stage 06 "Izolacja rdzeni, taktowanie, panic (GRUB)" st_isolation
   run_stage 09 "Konfiguracja VPP + automatyczny restart" st_vpp_config
+  run_stage 15 "NetFlow/IPFIX (flowprobe)" st_netflow
   ok "zapisano: $VPP_WORKERS workerów ($WORKERS_CSV), izolacja $ISOL_CSV — GRUB i /etc/vpp/startup.conf zaktualizowane"
   warn "RESTART SERWERA wymagany (isolcpus); do tego czasu VPP pracuje na starym układzie rdzeni. Restart: systemctl reboot"
   if ((REBOOT_AFTER)); then
@@ -9512,6 +10162,7 @@ INST_HUGEPAGES=$HUGEPAGES_2M
 INST_MAIN_HEAP=$MAIN_HEAP
 INST_EXTRA_CMDLINE="${EXTRA_CMDLINE[*]}"
 INST_ROUTER_ID=$ROUTER_ID
+INST_NETFLOW_ENABLE=$NETFLOW_ENABLE
 SNMP_COMMUNITY=$SNMP_COMMUNITY
 EOF
 chmod 600 "$ENV_FILE"
@@ -9615,14 +10266,47 @@ EOF
   else
     warn "Brak update-grub — dodaj ręcznie do linii kernela: $(isol_cmdline)"
   fi
-  put_file /etc/sysctl.d/85-router-isolation.conf "kernel: liczniki i watchdog tylko na rdzeniach systemowych" <<EOF
+  put_file /etc/sysctl.d/85-router-isolation.conf "kernel: liczniki, watchdog i numa_balancing nie zakłócają workerów VPP" <<EOF
 # install-router.sh: rdzenie VPP ($ISOL_CSV) bez okresowej pracy kernela
 # statystyki pamięci co 10 s zamiast co 1 s (mniej przerw na rdzeniach bez tiku zegara)
 vm.stat_interval = 10
 # watchdog zawieszeń kernela (softlockup/hardlockup) pilnuje rdzeni systemowych
 kernel.watchdog_cpumask = $HK_CSV
+# numa_balancing skanuje i migruje strony pamięci procesu w tle (globalnie, nie per-rdzeń) —
+# pojedynczy taki page fault w pętli DPDK worker'a to nawet kilka ms przestoju i przepełnienie
+# ringu RX karty, niezależnie od isolcpus/nohz_full (chronią tylko przed schedulerem procesów)
+kernel.numa_balancing = 0
+# proaktywna kompakcja pamięci: kcompactdN budzi się co 500 ms, żeby zbijać strony węzła NUMA N. Jego maska CPU
+# to cały węzeł — łącznie z rdzeniami workerów VPP — i każde wybudzenie na rdzeniu workera to wywłaszczenie pętli
+# DPDK i strata pakietów z jego kolejki RX (rx_out_of_buffer). Hugepages VPP są prealokowane przy starcie,
+# kompakcja nic nie daje. Samo przypięcie kcompactd poza rdzenie VPP robi router-kthreads.service.
+vm.compaction_proactiveness = 0
 EOF
   sysctl -q -p /etc/sysctl.d/85-router-isolation.conf || warn "część ustawień izolacji nie została przyjęta przez kernel"
+  ok "numa_balancing=$(sysctl -n kernel.numa_balancing) compaction_proactiveness=$(sysctl -n vm.compaction_proactiveness 2>/dev/null) watchdog_cpumask=$(sysctl -n kernel.watchdog_cpumask)"
+  # wątki kernela przypięte do całego węzła NUMA (kcompactd, kswapd) — poza rdzenie VPP; PID-y zmieniają się
+  # po każdym starcie, więc program skanuje /proc przy każdym uruchomieniu (start systemu, set_workers, ręcznie)
+  prog_router_kthreads | put_file /opt/router/bin/router-kthreads "router-kthreads: wątki kernela (kcompactd, kswapd) poza rdzeniami VPP" 755
+  ln -sfn /opt/router/bin/router-kthreads /usr/local/sbin/router-kthreads
+  put_file /etc/systemd/system/router-kthreads.service "przy starcie: wątki kernela poza rdzeniami VPP" <<'EOF'
+[Unit]
+Description=Wątki kernela (kcompactd, kswapd) poza rdzeniami VPP
+Documentation=file:/opt/router/README.md
+After=vpp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/router/bin/router-kthreads
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now router-kthreads.service >/dev/null 2>&1 || warn "router-kthreads.service nie wystartował — journalctl -u router-kthreads"
+  man_add service router-kthreads.service "przy starcie: kcompactd/kswapd poza rdzeniami VPP"
+  if /opt/router/bin/router-kthreads -n >/dev/null 2>&1; then ok "wątki kernela poza rdzeniami VPP"
+  else warn "część wątków kernela nadal ma dostęp do rdzeni VPP — sprawdź: router-kthreads -n"; fi
   put_file /etc/systemd/system.conf.d/90-router-cpu.conf "systemd: wszystkie usługi na rdzeniach systemowych" <<EOF
 # install-router.sh: BIRD, snmpd, Routinator, sshd, monitoring… tylko na rdzeniach systemowych ($HK_CSV);
 # rdzenie VPP ($ISOL_CSV) zostają dla VPP (vpp.service.d/05-cpu.conf)
@@ -9649,10 +10333,14 @@ EOF
     [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]] && echo "w /sys/devices/system/cpu/intel_pstate/no_turbo - - - - 0"
     # kolejki robocze kernela (workqueue bez przypisania) tylko na rdzeniach systemowych
     [[ -e /sys/devices/virtual/workqueue/cpumask ]] && echo "w /sys/devices/virtual/workqueue/cpumask - - - - $(cpu_mask "${HK[@]}")"
+    # transparent hugepages tylko na żądanie (madvise), nie "always": w tle khugepaged scala/defragmentuje
+    # strony całego procesu (nie tylko bufor pakietów) — blokujące na czas dłuższy niż zapełnienie ringu RX
+    [[ -e /sys/kernel/mm/transparent_hugepage/enabled ]] && echo "w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise"
     true
-  } | put_file /etc/tmpfiles.d/router-cpu.conf "taktowanie CPU (performance, turbo), workqueue kernela na rdzeniach systemowych"
+  } | put_file /etc/tmpfiles.d/router-cpu.conf "taktowanie CPU (performance, turbo), workqueue kernela na rdzeniach systemowych, THP madvise"
   systemd-tmpfiles --create /etc/tmpfiles.d/router-cpu.conf || warn "nie ustawiono governora (sterowanie przez BIOS?)"
   ok "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'BIOS')"
+  ok "THP: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o '\[[a-z]*\]' | tr -d '[]')"
   man_add service irqbalance.service "rozdział przerwań z pominięciem rdzeni VPP"
 }
 
@@ -9745,7 +10433,8 @@ plugins {
   plugin default { enable }
   plugin linux_cp_plugin.so { enable }
   plugin linux_nl_plugin.so { enable }
-  plugin sflow_plugin.so { enable }
+  plugin sflow_plugin.so { disable }
+  plugin flowprobe_plugin.so { enable }
 }
 
 linux-cp {
@@ -9768,12 +10457,33 @@ EOF
   {
     for i in "${IFNAMES[@]}"; do echo "set interface mtu $PORT_MTU $i"; done
     for i in "${IFNAMES[@]}"; do echo "set interface state $i up"; done
-    echo "sflow sampling-rate $SFLOW_SAMPLING"
-    echo "sflow polling-interval 20"
-    echo "sflow header-bytes 128"
-    for i in "${IFNAMES[@]}"; do echo "sflow enable-disable $i"; done
+    if [[ $NETFLOW_ENABLE == yes ]]; then
+      # Eksport NetFlow/IPFIX NIE może iść na loop0/$ROUTER_ID: pakiet eksportera ma w kodzie VPP na stałe
+      # sw_if_index[RX]=0 ("local0"); gdy trafia do ip4-local (cel lokalny), mechanizm punt-do-Linuksa
+      # (ten, z którego korzystają SSH/BGP/SNMP) nie ma dla "local0" zmapowanego TAP-a w netns i pakiet
+      # przepada bez widocznego błędu — potwierdzone licznikami na żywym routerze. Dedykowany TAP (tap0 na
+      # NETFLOW_TAP_VPP, nf-export w netns dataplane na NETFLOW_TAP_LINUX) omija ip4-local całkowicie:
+      # pakiet idzie normalnym routingiem, jak zwykły ruch tranzytowy do sąsiada. Tam router-netflow
+      # nasłuchuje i rozsyła kopię do kolektorów z netflow.conf (VPP ma tylko jeden eksporter — to jedyny
+      # sposób na kilka realnych kolektorów naraz, np. FastNetMon + Akvorado).
+      # tap0 jest w OSOBNEJ tabeli routingu (NETFLOW_TAP_FIB), nie w głównej (tej z hu0/hu1/VLAN-ami) —
+      # inaczej ta podsieć byłaby normalnie routowalna z zewnątrz, jak każda inna podłączona sieć w FIB 0,
+      # i ktoś mógłby z internetu/od peera wstrzyknąć spreparowany NetFlow (spoofing src+dst). "fib-id" przy
+      # eksporterze kieruje go do tej samej, odizolowanej tabeli.
+      echo "ip table add $NETFLOW_TAP_FIB"
+      echo "create tap id 0 host-if-name nf-export host-ns dataplane host-ip4-addr $NETFLOW_TAP_LINUX/30"
+      echo "set interface ip table tap0 $NETFLOW_TAP_FIB"
+      echo "set interface ip address tap0 $NETFLOW_TAP_VPP/30"
+      echo "set interface state tap0 up"
+      echo "set ipfix exporter collector $NETFLOW_TAP_LINUX port $NETFLOW_PORT src $NETFLOW_TAP_VPP fib-id $NETFLOW_TAP_FIB template-interval $NETFLOW_TEMPLATE_INTERVAL"
+      # Komendy flowprobe NIE mają "set" z przodu (inaczej niż ipfix exporter) — to osobna wtyczka.
+      # Włączanie per-interfejs (hu0/hu1, VLAN-y) robi router-ifaces przy "apply" — flowprobe trzyma
+      # tylko jedną rodzinę (ip4 LUB ip6) na interfejs, więc wymaga śledzenia stanu, nie jednorazowego
+      # wywołania tutaj (ifaces.conf może się zmieniać długo po starcie VPP).
+      echo "flowprobe params record l2 l3 l4 active $NETFLOW_ACTIVE_TIMER passive $NETFLOW_PASSIVE_TIMER"
+    fi
     neigh_vpp_cmds
-  } | put_file /etc/vpp/bootstrap.vpp "polecenia VPP wykonywane po starcie (MTU $PORT_MTU, porty up, sFlow)"
+  } | put_file /etc/vpp/bootstrap.vpp "polecenia VPP wykonywane po starcie (MTU $PORT_MTU, porty up, NetFlow/IPFIX)"
   put_file /etc/systemd/system/vpp.service.d/10-dataplane.conf "VPP startuje po netns dataplane" <<'EOF'
 [Unit]
 Requires=netns-dataplane.service
@@ -11504,7 +12214,7 @@ st_vpp_build() {
     echo "Brak synack_guard_plugin.so w paczce vpp-plugin-core — kompilacja wtyczki nie powiodła się (szukaj 'synack_guard' w wyjściu make)"
     return 1
   fi
-  man_add dir "$DEB_DIR" "zbudowane paczki .deb (VPP, hsflowd)"
+  man_add dir "$DEB_DIR" "zbudowane paczki .deb (VPP)"
   ok "VPP zbudowany, paczki w $DEB_DIR"
 }
 
@@ -11798,37 +12508,100 @@ EOF
   ok "SNMP gotowe (community w $ENV_FILE); szablony LibreNMS/Zabbix/Cacti: katalog templates/ instalatora"
 }
 
-st_sflow() {
-  local hdir=$SRC_DIR/host-sflow
-  if [[ -d $hdir/.git ]]; then git -C "$hdir" pull --ff-only || warn "nie zaktualizowano host-sflow"
-  else say "pobieram host-sflow do $hdir"; git clone https://github.com/sflow/host-sflow.git "$hdir"; fi
-  man_add dir "$hdir" "źródła hsflowd"
-  cd "$hdir"
-  make clean >/dev/null 2>&1 || true
-  rm -f hsflowd_*.deb
-  say "make deb FEATURES=VPP"
-  make deb FEATURES="VPP"
-  rm -f "$DEB_DIR"/hsflowd_*.deb
-  cp -f "$hdir"/hsflowd_*.deb "$DEB_DIR/"
-  apt-get install "${APT_OPTS[@]}" "$DEB_DIR"/hsflowd_*.deb
-  man_add pkg "hsflowd $(dpkg-query -W -f='${Version}' hsflowd)" "zbudowany z host-sflow (moduł VPP)"
-  {
-    echo "# install-router.sh — próbki z VPP (psample 3/4) wysyłane jako sFlow"
-    echo "sflow {"
-    if [[ -n $SFLOW_COLLECTOR ]]; then echo "  collector { ip=$SFLOW_COLLECTOR udpport=6343 }"
-    else
-      # hsflowd 2.x nie startuje bez kolektora ("no collectors are defined"), a nieuruchomiona usługa psuje router-check i BOOT_PROBLEM
-      echo "  collector { ip=127.0.0.1 udpport=6343 }   # TYMCZASOWO: nikt nie nasłuchuje — wpisz IP kolektora (FastNetMon)"
-    fi
-    echo "  psample { group=3 egress=on }"
-    echo "  vpp { osIndex=off }"
-    echo "}"
-  } | put_file /etc/hsflowd.conf "hsflowd: kolektor sFlow, źródło próbek z VPP"
-  systemctl enable hsflowd
-  systemctl restart hsflowd || warn "hsflowd nie wystartował — journalctl -u hsflowd"
-  man_add service hsflowd.service "eksport sFlow (próbki z VPP)"
-  [[ -n $SFLOW_COLLECTOR ]] || warn "SFLOW_COLLECTOR puste — w /etc/hsflowd.conf jest tymczasowy kolektor 127.0.0.1, wpisz prawdziwy (FastNetMon) i: systemctl restart hsflowd"
-  ok "sFlow gotowe"
+netflow_example_conf() {   # zawartość /etc/router/netflow.conf: kolektory z NETFLOW_COLLECTORS albo przykład
+  echo "# install-router.sh: kolektory NetFlow/IPFIX — jeden \"IP:PORT\" na linię, komentarz po #"
+  echo "# router-netflow duplikuje ruch z VPP do każdego z nich — kilka kolektorów naraz"
+  echo "# (np. FastNetMon + Akvorado), bo sam VPP ma tylko jeden eksporter."
+  echo "# Po zmianie: systemctl restart router-netflow"
+  local c
+  if ((${#NETFLOW_COLLECTORS[@]})); then
+    for c in "${NETFLOW_COLLECTORS[@]}"; do echo "$c"; done
+  else
+    echo "# 192.0.2.10:2055   # przykład: FastNetMon"
+    echo "# 192.0.2.20:2056   # przykład: Akvorado"
+  fi
+}
+
+netflow_fw_patch() {   # dataplane.rules.v4 bez reguły (albo ze starą, błędną: loop0/ROUTER_ID) — dopisz/zastąp
+  local f=/etc/iptables/dataplane.rules.v4 want
+  [[ -f $f ]] || return 0
+  want='-A PREROUTING -i nf-export -p udp --dport '"$NETFLOW_PORT"' -s '"$NETFLOW_TAP_VPP"' -d '"$NETFLOW_TAP_LINUX"' -m comment --comment "NetFlow/IPFIX: tylko z dedykowanego TAP" -j ACCEPT'
+  grep -qxF "$want" "$f" && return 0
+  say "dataplane.rules.v4 nie chroni jeszcze portu NetFlow/IPFIX ($NETFLOW_PORT) poprawną regułą — dopisuję (tylko z dedykowanego TAP)"
+  python3 - "$f" "$NETFLOW_PORT" "$NETFLOW_TAP_LINUX" "$NETFLOW_TAP_VPP" <<'PYEOF'
+import sys
+path, port, rid, src = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(path) as fh:
+    lines = fh.readlines()
+lines = [ln for ln in lines if "NetFlow/IPFIX" not in ln]   # usuń ewentualną starą (błędną) regułę
+new = [
+    '-A PREROUTING -i nf-export -p udp --dport %s -s %s -d %s -m comment --comment "NetFlow/IPFIX: tylko z dedykowanego TAP" -j ACCEPT\n' % (port, src, rid),
+    '-A PREROUTING -p udp --dport %s -m comment --comment "NetFlow/IPFIX: odrzucone (nie z dedykowanego TAP)" -j DROP\n' % port,
+]
+out, inserted = [], False
+for line in lines:
+    if not inserted and line.strip() == "-A PREROUTING -i lo -j ACCEPT":
+        out.append(line)
+        out.extend(new)
+        inserted = True
+        continue
+    out.append(line)
+if not inserted:   # brak znanego punktu wstawienia — dopisz przed pierwszym COMMIT (koniec tabeli raw)
+    out = []
+    for line in lines:
+        if not inserted and line.strip() == "COMMIT":
+            out.extend(new)
+            inserted = True
+        out.append(line)
+with open(path, "w") as fh:
+    fh.writelines(out)
+PYEOF
+  systemctl restart router-dataplane-fw 2>/dev/null || warn "nie udało się przeładować reguł — sprawdź ręcznie: /etc/iptables/dataplane.rules.v4, systemctl restart router-dataplane-fw"
+}
+
+st_netflow() {
+  if [[ $NETFLOW_ENABLE != yes ]]; then
+    systemctl disable --now router-netflow 2>/dev/null || true
+    say "NetFlow/IPFIX wyłączony (NETFLOW_ENABLE=no) — flowprobe nieaktywny, router-netflow zatrzymany"
+    return 0
+  fi
+  # eksport NetFlow/IPFIX (wtyczka flowprobe) jest skonfigurowany wprost w bootstrap.vpp (st_vpp_config),
+  # celem jest dedykowany TAP nf-export (NETFLOW_TAP_VPP/NETFLOW_TAP_LINUX) w netns dataplane — NIE loop0,
+  # bo pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm punt-do-Linuksa
+  # (patrz komentarz przy NETFLOW_TAP_VPP). Tam router-netflow (własny, kilkunastoliniowy Python — bez
+  # zewnętrznego pakietu) nasłuchuje i rozsyła kopię do każdego kolektora z netflow.conf (VPP ma tylko
+  # jeden eksporter — to jedyny sposób na kilka realnych kolektorów naraz).
+  if [[ -f /etc/router/netflow.conf ]]; then
+    say "zostawiam istniejący /etc/router/netflow.conf"
+  else
+    netflow_example_conf | put_file /etc/router/netflow.conf "kolektory NetFlow/IPFIX (FastNetMon, Akvorado…) — IP:PORT, jeden na linię" 644
+  fi
+  prog_router_netflow | put_file /opt/router/bin/router-netflow "replikacja NetFlow/IPFIX z VPP (lokalny port $NETFLOW_PORT) do kolektorów z netflow.conf" 755
+  ln -sfn /opt/router/bin/router-netflow /usr/local/sbin/router-netflow
+  put_file /etc/systemd/system/router-netflow.service "replikacja NetFlow/IPFIX do kolektorów z netflow.conf" <<'EOF'
+[Unit]
+Description=Router: replikacja NetFlow/IPFIX do kolektorów z /etc/router/netflow.conf
+Documentation=file:/opt/router/README.md
+Requires=netns-dataplane.service
+After=netns-dataplane.service
+
+[Service]
+ExecStart=/usr/sbin/ip netns exec dataplane /opt/router/bin/router-netflow
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable router-netflow >/dev/null 2>&1 || true
+  systemctl restart router-netflow || warn "router-netflow nie wystartował — journalctl -u router-netflow"
+  man_add service router-netflow.service "replikacja NetFlow/IPFIX do kilku kolektorów naraz"
+  netflow_fw_patch
+  if vppctl show plugins 2>/dev/null | grep -qi flowprobe; then ok "wtyczka flowprobe (NetFlow/IPFIX) załadowana w VPP"
+  else warn "wtyczka flowprobe jeszcze nie jest załadowana w działającym VPP — to zmiana w startup.conf, zadziała po najbliższym restarcie VPP (systemctl restart vpp albo reboot), nie trzeba przebudowywać VPP"
+  fi
+  ok "NetFlow/IPFIX gotowe — VPP → nf-export ($NETFLOW_TAP_LINUX:$NETFLOW_PORT) → router-netflow → kolektory w /etc/router/netflow.conf"
 }
 
 st_etckeeper() {
@@ -11902,6 +12675,10 @@ VEC_WARN=64
 VEC_CRIT=160
 # pakiety/s zgubione przez kartę, bo VPP nie nadąża (rx-miss + rx-no-buf)
 RXMISS_PPS=1
+# wywłaszczenia workera VPP na sekundę: coś poza VPP działa na izolowanym rdzeniu (router-kthreads -n);
+# WK_GRACE = sekundy po starcie VPP bez tego alarmu (start workerów to zawsze 2 wywłaszczenia na rdzeń)
+WK_PREEMPT=1
+WK_GRACE=120
 # pakiety/s odrzucone sprzętowo przez kartę (liczniki *discard*)
 NIC_DISCARD_PPS=1
 # pakiety/s do samego routera (control plane)
@@ -12066,11 +12843,11 @@ TimeoutStartSec=300
 WantedBy=multi-user.target
 EOF
 
-  local units=(netns-dataplane.service vpp.service router-ifaces.service "$bu.service" snmpd-dataplane.service
-               vpp-snmp-agent.service hsflowd.service router-monitor.service router-notify.service)
+  local units=(netns-dataplane.service vpp.service router-kthreads.service router-ifaces.service "$bu.service" snmpd-dataplane.service
+               vpp-snmp-agent.service router-netflow.service router-monitor.service router-notify.service)
   {
     echo "[Unit]"
-    echo "Description=Router BGP: VPP + BIRD + SNMP + sFlow + monitoring"
+    echo "Description=Router BGP: VPP + BIRD + SNMP + NetFlow/IPFIX + monitoring"
     echo "Documentation=file:/opt/router/README.md"
     echo "Wants=${units[*]}"
     echo "After=${units[*]}"
@@ -12102,7 +12879,7 @@ EOF
 
   say "blokada automatycznych aktualizacji VPP i BIRD (apt-mark hold)"
   local held
-  held=$(dpkg-query -W -f='${Package}\n' 'vpp*' 'libvppinfra' 'python3-vpp-api' bird3 hsflowd 2>/dev/null \
+  held=$(dpkg-query -W -f='${Package}\n' 'vpp*' 'libvppinfra' 'python3-vpp-api' bird3 2>/dev/null \
          | grep -v -e '-dbg$' -e '-dev$' || true)
   if [[ -n $held ]]; then
     # shellcheck disable=SC2086
@@ -12482,6 +13259,15 @@ fw_rules() {
 :OUTPUT ACCEPT [0:0]
 -A PREROUTING -i lo -j ACCEPT
 EOF
+  if [[ $v == 4 && $where == *dataplane* && $NETFLOW_ENABLE == yes ]]; then
+    # NetFlow/IPFIX (router-netflow) nasłuchuje na dedykowanym TAP nf-export (VPP<->netns, podsieć
+    # NETFLOW_TAP_VPP/NETFLOW_TAP_LINUX /30). Prawdziwa izolacja od ruchu z zewnątrz jest w VPP (tap0 w
+    # osobnej tabeli routingu NETFLOW_TAP_FIB, niewidocznej z hu0/hu1/VLAN-ów — patrz komentarz przy
+    # NETFLOW_TAP_FIB) — ta reguła to dodatkowa warstwa (-i nf-export + adresy), nie jedyna linia obrony.
+    printf -- '-A PREROUTING -i nf-export -p udp --dport %s -s %s -d %s -m comment --comment "NetFlow/IPFIX: tylko z dedykowanego TAP" -j ACCEPT\n' \
+      "$NETFLOW_PORT" "$NETFLOW_TAP_VPP" "$NETFLOW_TAP_LINUX"
+    printf -- '-A PREROUTING -p udp --dport %s -m comment --comment "NetFlow/IPFIX: odrzucone (nie z dedykowanego TAP)" -j DROP\n' "$NETFLOW_PORT"
+  fi
   for e in "${nets[@]}"; do
     printf -- '-A PREROUTING -s %s -m comment --comment "%s" -j ACCEPT\n' "${e%%|*}" "${e#*|}"
   done
@@ -13124,7 +13910,7 @@ st_docs() {
   router_manual | put_file /etc/router/INSTRUKCJA.md "instrukcja obsługi produkcyjnej: interfejsy, firewall, guard, alarmy, e-maile, awarie" 644
   local ifn=() i
   for i in "${!NIC_PCI[@]}"; do ifn+=("hu$i"); done
-  local readme
+  local readme nf_list
   shopt -u patsub_replacement 2>/dev/null || true
   cat >"$STATE_DIR/README.template" <<'READMEEOF'
 # Router BGP — R630 + ConnectX-4 (VPP + BIRD)
@@ -13157,14 +13943,16 @@ tail -f /var/log/router/alarmy.log   # alarmy na żywo
    │ VPP @@VPPVER@@  — forwarding pakietów                     │
    │   main-core @@MAIN@@, workery @@WORKERS@@ (NUMA @@NUMA@@)  │
    │   linux-cp: lustro interfejsów do netns "dataplane"       │
-   │   sflow: próbki 1:@@SAMPLING@@ → hsflowd                  │
+   │   NetFlow/IPFIX (flowprobe) → tap0/nf-export (dedykowany) │
    └───────┬───────────────────────────────┬──────────────────┘
-           │ TAP (linux-cp)                │ statystyki (/run/vpp/stats.sock)
+           │ TAP (linux-cp + nf-export)    │ statystyki (/run/vpp/stats.sock)
    ┌───────┴──────────────────────┐   ┌────┴─────────────────────────────┐
    │ netns "dataplane"             │   │ router-monitor (alarmy co 1 s)    │
    │   BIRD 3 (BGP)  → trasy do    │   │ vpp-snmp-agent (liczniki → SNMP)  │
-   │     kernela → linux-nl → VPP  │   │ hsflowd (sFlow → kolektor)        │
-   │   snmpd (UDP 161, LibreNMS)   │   └───────────────────────────────────┘
+   │     kernela → linux-nl → VPP  │   └───────────────────────────────────┘
+   │   snmpd (UDP 161, LibreNMS)   │
+   │   router-netflow               │
+   │     → FastNetMon, Akvorado…   │
    └───────────────────────────────┘
    Zarządzanie awaryjne: port 1G na płycie (eth2) + iDRAC — poza VPP.
 ```
@@ -13174,7 +13962,8 @@ Zasada działania:
 - **VPP** przekazuje cały ruch tranzytowy. Kernel Linuksa go nie widzi (dlatego iptables/nftables nie filtrują tranzytu — robią to ACL-e w VPP).
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
-- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@).
+- **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych, a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT` w router-monitor.
 
 ---
 
@@ -13191,7 +13980,7 @@ Po restarcie serwera wstają same, w tej kolejności:
 | 4 | `@@BIRDUNIT@@.service` | BGP (w netns dataplane), startuje po odtworzeniu interfejsów | restartuje się razem z VPP; po awarii restart po 5 s |
 | 5 | `snmpd-dataplane.service` | SNMP dla LibreNMS (UDP 161 w netns dataplane) | restart |
 | 6 | `vpp-snmp-agent.service` | liczniki interfejsów VPP → SNMP (AgentX), opisy z ifaces.conf | restart po 5 s |
-| 7 | `hsflowd.service` | eksport sFlow do kolektora | — |
+| 7 | `router-netflow.service` | replikacja NetFlow/IPFIX do kolektorów z `netflow.conf` | restart po 5 s |
 | 8 | `router-monitor.service` | alarmy obciążenia w czasie rzeczywistym | restart po 5 s |
 | 9 | `router-notify.service` | wysyła alarmy e-mailem (kolejka `/var/spool/router-notify`) | restart po 10 s |
 | — | `router-snmp.service` | co 30 s zbiera dane dla SNMP (BGP, VPP, firewall, guard, RPKI, RAID, dyski) do `/run/router-snmp/cache.json`; podgląd: `router-snmp walk` | restart po 10 s |
@@ -13232,6 +14021,7 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/opt/router/bin/smartd-alert` | alarm z smartd (zdrowie dysków) |
 | `/opt/router/bin/router-fw` | firewall tranzytu VPP (`router-fw check / diff / apply / block / counters`), konfiguracja `/etc/router/firewall.conf` |
 | `/opt/router/bin/router-top` | podgląd na żywo: obciążenie VPP, interfejsy (Gb/s, pkt/s), liczniki ACL, guard (rozdział 10d) |
+| `/opt/router/bin/router-kthreads` | wątki kernela (kcompactd, kswapd) poza rdzeniami VPP (`router-kthreads -n` = podgląd); przy starcie przez `router-kthreads.service` |
 | `/opt/router/bin/router-guard` | ochrona przed odbiciami SYN-ACK/RST/UDP w VPP (`router-guard on / off / status / enforce`), konfiguracja `/etc/router/synack-guard.conf` |
 | `/opt/router/bin/router-fw-update` | ręczna aktualizacja firmware karty (`router-fw-update`) |
 | `/opt/router/bin/router-ifaces` | interfejsy z `ifaces.conf` (`router-ifaces`, rozdział 10) |
@@ -13243,10 +14033,10 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/router/notify.conf` | SMTP i odbiorcy alarmów (tylko root, poza historią etckeeper — zawiera hasło) |
 | `/etc/router/hardware-audit.md` | wynik audytu sprzętu z instalacji |
 | `/etc/vpp/startup.conf` | konfiguracja VPP (rdzenie, pamięć, porty, linux-cp) |
-| `/etc/vpp/bootstrap.vpp` | polecenia VPP po starcie (MTU 1500, porty up, sFlow) |
+| `/etc/vpp/bootstrap.vpp` | polecenia VPP po starcie (MTU 1500, porty up, NetFlow/IPFIX) |
+| `/etc/router/netflow.conf` | kolektory NetFlow/IPFIX (FastNetMon, Akvorado…) — router-netflow |
 | `/etc/bird/bird.conf`, `/etc/bird/conf.d/` | BIRD (sesje BGP dokłada skrypt sieciowy w `conf.d/`) |
 | `/etc/snmp/snmpd.conf` | SNMP (community, AgentX, extend mdadm) |
-| `/etc/hsflowd.conf` | kolektor sFlow |
 | `/etc/systemd/system/router.target` | grupa usług routera |
 | `/etc/systemd/system/*.service`, `*.service.d/` | jednostki i nakładki systemd |
 | `/etc/sysctl.d/81-vpp-router.conf`, `82-router-neigh.conf` | hugepages, bufory netlink, tablice ARP/ND |
@@ -13255,8 +14045,10 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/mdadm/mdadm.conf` | `PROGRAM /opt/router/bin/mdadm-alert` |
 | `/etc/smartd.conf` | `-M exec /opt/router/bin/smartd-alert` |
 | `/etc/sysctl.d/83-router-panic.conf` | restart po kernel panic / oops / zawieszeniu kernela |
+| `/etc/sysctl.d/85-router-isolation.conf` | watchdog na rdzeniach systemowych, `numa_balancing` i `compaction_proactiveness` wyłączone |
+| `/etc/systemd/system/router-kthreads.service` | przy starcie: `router-kthreads` — kcompactd/kswapd poza rdzeniami VPP |
 | `/etc/systemd/system.conf.d/90-router-watchdog.conf` | watchdog sprzętowy (restart przy całkowitym zawieszeniu) |
-| `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo |
+| `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo, transparent hugepages `madvise` |
 | `/var/lib/router/` | znaczniki czystego wyłączenia (wykrywanie awarii), stan `router-ifaces` (`ifaces.state.json`, `ifaces.last-good.conf`) |
 | `/var/spool/router-notify/` | kolejka alarmów do wysłania e-mailem |
 | `/etc/iptables/rules.v4`, `rules.v6` | iptables portu zarządzającego (ochrona CPU, rozdział 10c) |
@@ -13312,7 +14104,8 @@ Workery VPP zawsze pokazują 100% CPU, bo bez przerwy odpytują kartę. Dlatego 
 |---|---|---|
 | Rozmiar wektora workera | `/sys/vector_rate_per_worker` w VPP | Ile pakietów VPP obrabia naraz: ~1 = luz, 256 = pełne nasycenie rdzenia. Najlepszy wskaźnik obciążenia VPP. |
 | rx-miss + rx-no-buf | liczniki interfejsów VPP | Pakiety, które karta odebrała, ale VPP nie zdążył ich zabrać (albo zabrakło buforów). **To jest realna utrata ruchu** — odpowiednik dropów QFP. |
-| Odrzucenia sprzętowe karty | `vppctl show hardware-interfaces` (liczniki `*discard*`, `*out_of_buffer*`) co 10 s | Karta odrzuca pakiety sama (limit karty/PCIe lub przepełnienie). |
+| Odrzucenia sprzętowe karty | liczniki `*discard*` karty (segment statystyk VPP) co 10 s | Karta odrzuca pakiety sama (bufor PHY/priorytetu, PCIe). `rx_out_of_buffer` tu nie wchodzi — to ten sam licznik co rx-miss. |
+| Wywłaszczenia workerów | `nr_involuntary_switches` wątków `vpp_wk_*` w `/proc` | Worker VPP nigdy sam nie oddaje CPU; każde wywłaszczenie = coś poza VPP na jego rdzeniu (np. `kcompactd`), kolejka RX stoi. |
 | Punt | licznik `/if/punt` | Ruch kierowany do samego routera (BGP, SSH, ICMP). Duża wartość = atak na control plane. |
 | Rdzenie systemowe | `/proc/stat` (rdzenie poza VPP) | Zajętość rdzeni BIRD/SNMP/systemu, np. przy przeliczaniu pełnej tablicy BGP. |
 | Heartbeat VPP | `/sys/heartbeat` | Czy VPP żyje. Brak przez @@HANG@@ s = zawieszenie. |
@@ -13325,10 +14118,11 @@ Format jak w syslogu Cisco: `%OBSZAR-POZIOM-ZDARZENIE: opis`. Poziom: 1 = alarm 
 | Komunikat | Znaczenie | Co zrobić |
 |---|---|---|
 | `%VPP-4-LOAD_HIGH` | wektor workera ≥ `VEC_WARN` | obserwować; przy częstych wystąpieniach rozważyć więcej workerów |
-| `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (sFlow/FastNetMon), ewentualnie blackhole |
+| `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (NetFlow/FastNetMon), ewentualnie blackhole |
 | `%VPP-5-LOAD_NORMAL` | koniec przeciążenia, z czasem trwania i szczytem | — |
 | `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: zidentyfikować cel ataku, RTBH/Flowspec u upstreamu |
-| `%VPP-3-NIC_DISCARD` | karta odrzuca pakiety sprzętowo | limit karty/PCIe; przy stałym występowaniu — ConnectX-5 |
+| `%VPP-3-NIC_DISCARD` | karta odrzuca pakiety sprzętowo (`*discard*`) | bufor PHY/priorytetu karty, PCIe; przy stałym występowaniu — ConnectX-5 |
+| `%VPP-3-WK_PREEMPT` | worker VPP wywłaszczony z izolowanego rdzenia (w opisie: który worker, cpu, co na nim siedzi) | `router-kthreads -n` i `router-kthreads`; jeśli to proces użytkownika — `ps -eLo psr,comm` i jego `CPUAffinity` |
 | `%VPP-4-PUNT_HIGH` | dużo ruchu do adresów routera | sprawdzić ACL i policer na control plane |
 | `%VPP-2-DOWN` / `%VPP-5-UP` | brak dostępu do statystyk VPP / powrót | zwykle restart VPP; patrz `journalctl -u vpp` |
 | `%VPP-1-HANG` | VPP żyje, ale nie odpowiada | monitor sam zrestartuje VPP (`HANG_RESTART=1`) |
@@ -13404,7 +14198,7 @@ Zmiany działają w ciągu 5 sekund (bez restartu). Test: `router-notify test`. 
 | `DISKS` | `%SMART-…` (zdrowie dysków) |
 | `NIC_FW` | `%SYS-5-NIC_FW_UPDATED`, `%SYS-3-NIC_FW_FAIL` |
 | `VPP_STATE` | `%VPP-2-DOWN`, `%VPP-5-UP`, `%VPP-1-HANG` |
-| `VPP_DROPS` | `%VPP-2-RX_MISS`, `%VPP-3-NIC_DISCARD` |
+| `VPP_DROPS` | `%VPP-2-RX_MISS`, `%VPP-3-NIC_DISCARD`, `%VPP-3-WK_PREEMPT` |
 | `VPP_LOAD` | `%VPP-4-LOAD_HIGH`, `%VPP-2-LOAD_CRITICAL` |
 | `VPP_PUNT` | `%VPP-4-PUNT_HIGH` |
 | `SYS_CPU` | `%SYS-4-CPU_HIGH` |
@@ -13836,7 +14630,7 @@ Instalator tworzy w VPP loopback **`loop0`** z adresem `LOOP0_ADDR` (domyślnie 
 | SNMP (`snmpd-mgmt`) | wszystkie adresy portu zarządzającego (przestrzeń główna) | host: interfejsy Linuksa, CPU, dyski, RAID |
 | SSH (zwykły `sshd`) | port zarządzający (przestrzeń główna) | droga awaryjna, bez zmian |
 
-Ruch do `loop0:22` i `loop0:161` filtruje `router-dataplane-fw` (tylko `TRUSTED_NETS`; LibreNMS z `SNMP_ALLOW` ma SNMP zawsze). Instalator nie dodaje tras do `loop0`: switch lub BNG musi mieć trasę `10.10.10.10/32` przez router (statyczną albo z BGP), żeby adres był osiągalny z zewnątrz. Kontrola: `router-check` (sekcja „Dostęp przez loop0”) oraz `ip netns exec dataplane ss -tlnp`. **Login roota przez SSH jest wyłączony na obu `sshd`** (`SSH_ROOT_LOGIN=no`; drop-in `/etc/ssh/sshd_config.d/00-router-access.conf` i blok w `sshd_config_dataplane`), ale tylko jeśli istnieje zwykły użytkownik z grupą `sudo` (UID ≥ 1000). Bez niego instalator zostawia root-a (`prohibit-password`: tylko klucz) i ostrzega, żeby nie odciąć dostępu; utwórz użytkownika (`adduser nazwa; usermod -aG sudo nazwa`) i uruchom `install-router.sh --from 26`. Na obu `sshd` działa hasło lub klucz. Wyłączenie funkcji: `LOOP0_ADDR=""`, `DATAPLANE_SSH=no`, `MGMT_SNMP=no`, `SSH_ROOT_LOGIN=prohibit-password` w ustawieniach skryptu.
+Ruch do `loop0:22` i `loop0:161` filtruje `router-dataplane-fw` (tylko `TRUSTED_NETS`; LibreNMS z `SNMP_ALLOW` ma SNMP zawsze). Port NetFlow/IPFIX (`@@NETFLOWPORT@@`, `router-netflow`) nasłuchuje na dedykowanym TAP-u `nf-export` — osobnym łączu VPP↔netns w odizolowanej tabeli routingu (VRF), niewidocznym z interfejsów zewnętrznych; firewall dodatkowo dopuszcza ten port tylko z interfejsu `nf-export` i tylko od adresu VPP-strony TAP-a, nie z `TRUSTED_NETS`. Eksport NetFlow/IPFIX kosztuje realnie CPU na pakiet tranzytowy — szybkie włączanie/wyłączanie, bez restartu VPP: menu `router` → „SNMP, NetFlow i SSH” → „Włącz/Wyłącz NetFlow/IPFIX” (albo wprost `router-ifaces netflow-on`/`netflow-off`). `router-ifaces` trzyma flowprobe na stałe włączony na `loop0` jako "kotwicę" (znikomy koszt — ruch do samego routera, nie tranzyt), żeby licznik referencji flowprobe nigdy nie spadł do zera: to właśnie ten moment wymusza w VPP pełny eksport aktywnych flow i zdjęcie szablonu IPFIX, co na tym routerze spowodowało kiedyś `os_panic()` pod ruchem. Ustawienie `NETFLOW_ENABLE=no` w skrypcie to coś innego: w ogóle nie buduje TAP-a/eksportera w VPP (trzeba `upgrade_script` + restart VPP) — używaj go, gdy wiesz, że NetFlow nie będzie Ci potrzebny na dłużej. Instalator nie dodaje tras do `loop0`: switch lub BNG musi mieć trasę `10.10.10.10/32` przez router (statyczną albo z BGP), żeby adres był osiągalny z zewnątrz. Kontrola: `router-check` (sekcja „Dostęp przez loop0”) oraz `ip netns exec dataplane ss -tlnp`. **Login roota przez SSH jest wyłączony na obu `sshd`** (`SSH_ROOT_LOGIN=no`; drop-in `/etc/ssh/sshd_config.d/00-router-access.conf` i blok w `sshd_config_dataplane`), ale tylko jeśli istnieje zwykły użytkownik z grupą `sudo` (UID ≥ 1000). Bez niego instalator zostawia root-a (`prohibit-password`: tylko klucz) i ostrzega, żeby nie odciąć dostępu; utwórz użytkownika (`adduser nazwa; usermod -aG sudo nazwa`) i uruchom `install-router.sh --from 26`. Na obu `sshd` działa hasło lub klucz. Wyłączenie funkcji: `LOOP0_ADDR=""`, `DATAPLANE_SSH=no`, `MGMT_SNMP=no`, `SSH_ROOT_LOGIN=prohibit-password` w ustawieniach skryptu.
 
 ---
 
@@ -13868,7 +14662,9 @@ router-ifaces                         # interfejsy: stan, adresy, opisy (rozdzia
 vppctl show interface                 # porty i liczniki
 vppctl show hardware-interfaces hu0   # szczegóły karty, liczniki sprzętowe
 vppctl show runtime                   # obciążenie workerów (kolumna Vectors/Call)
-vppctl show sflow
+vppctl show flowprobe params          # NetFlow/IPFIX: parametry eksportu
+vppctl show flowprobe statistics      # NetFlow/IPFIX: liczniki — czy coś realnie eksportuje
+systemctl status router-netflow       # replikacja do kolektorów z netflow.conf
 birdc show protocols                  # sesje BGP (birdc działa z każdego miejsca)
 birdc show route count
 ip netns exec dataplane ip addr       # interfejsy widziane przez BIRD/SNMP
@@ -13953,7 +14749,7 @@ apt-mark unhold bird3 && apt-get install bird3 && apt-mark hold bird3
 | Wersja VPP | @@VPPVER@@ |
 | Router ID BIRD | @@ROUTERID@@ (zmieni go skrypt sieciowy na adres loopbacka) |
 | SNMP — dozwolone źródło | @@SNMPALLOW@@ |
-| sFlow | 1:@@SAMPLING@@, kolektor: @@SFLOW@@ |
+| NetFlow/IPFIX | VPP → nf-export:@@NETFLOWPORT@@ → router-netflow → kolektory: @@NETFLOW@@ |
 | Hugepages | @@HUGEPAGES@@ × 2 MB |
 | Sterta VPP / bufory | @@HEAP@@ / @@BUFFERS@@ |
 | Alarmy e-mail | @@MAILTO@@ |
@@ -13976,8 +14772,9 @@ READMEEOF
   readme=${readme//@@VPPVER@@/$VPP_VERSION}
   readme=${readme//@@ROUTERID@@/$ROUTER_ID}
   readme=${readme//@@SNMPALLOW@@/$SNMP_ALLOW}
-  readme=${readme//@@SFLOW@@/${SFLOW_COLLECTOR:-brak (uzupełnij /etc/hsflowd.conf)}}
-  readme=${readme//@@SAMPLING@@/$SFLOW_SAMPLING}
+  nf_list=$(grep -v '^[[:space:]]*#' /etc/router/netflow.conf 2>/dev/null | paste -sd, -)
+  readme=${readme//@@NETFLOW@@/${nf_list:-brak (uzupełnij /etc/router/netflow.conf)}}
+  readme=${readme//@@NETFLOWPORT@@/$NETFLOW_PORT}
   readme=${readme//@@BIRDUNIT@@/$bu}
   readme=${readme//@@DATADIR@@/$DATA_DIR}
   readme=${readme//@@HANG@@/30}
@@ -14032,7 +14829,7 @@ st_report() {
     echo "  NUMA / rdzenie:   węzeł $NUMA, main $MAIN_CORE, workery $WORKERS_CSV"
     echo "  Router ID BIRD:   $ROUTER_ID"
     echo "  SNMP:             community w $ENV_FILE, dozwolone źródło $SNMP_ALLOW"
-    echo "  sFlow:            1:$SFLOW_SAMPLING, kolektor ${SFLOW_COLLECTOR:-(brak)}"
+    echo "  NetFlow/IPFIX:    VPP → nf-export:$NETFLOW_PORT → router-netflow → kolektory z /etc/router/netflow.conf"
     for kind in file service pkg dir backup other; do
       case $kind in
         file)    echo; echo "PLIKI KONFIGURACYJNE (ścieżka — opis — etap)";;
@@ -14061,10 +14858,10 @@ st_report() {
     ls -1 "$LOG_DIR"/[0-9]*.log 2>/dev/null | sed 's/^/  etap:    /'
     echo
     echo "PRZYDATNE POLECENIA"
-    echo "  vppctl show interface | show hardware-interfaces | show runtime | show sflow"
+    echo "  vppctl show interface | show hardware-interfaces | show runtime | show flowprobe params"
     echo "  birdc show protocols   (BIRD działa w netns dataplane, birdc działa z każdego miejsca)"
     echo "  ip netns exec dataplane ip addr      (interfejsy linux-cp widziane przez BIRD/SNMP)"
-    echo "  journalctl -u vpp -u $(bird_unit) -u snmpd-dataplane -u vpp-snmp-agent -u hsflowd"
+    echo "  journalctl -u vpp -u $(bird_unit) -u snmpd-dataplane -u vpp-snmp-agent -u router-netflow"
     echo "  router-ifaces [diff|apply|check]     (interfejsy z /etc/router/ifaces.conf)"
     echo "  router-check                         (pełna kontrola stanu)"
     echo "  systemctl status router.target       (wszystkie usługi routera)"
@@ -14090,7 +14887,7 @@ run_stage 11 "VPP — instalacja i start"               st_vpp_install
 run_stage 12 "BIRD 3"                                 st_bird
 run_stage 13 "Interfejsy: ifaces.conf + router-ifaces" st_ifaces
 run_stage 14 "SNMP (snmpd + vpp-snmp-agent + mdadm)"  st_snmp
-run_stage 15 "sFlow (hsflowd)"                        st_sflow
+run_stage 15 "NetFlow/IPFIX (flowprobe)"              st_netflow
 run_stage 16 "RAID i dyski (mdadm, smartd)"           st_raid
 run_stage 17 "Powiadomienia e-mail (router-notify)"   st_notify
 run_stage 18 "Monitor obciążenia (router-monitor)"    st_monitor
