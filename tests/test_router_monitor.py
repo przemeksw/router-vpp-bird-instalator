@@ -126,16 +126,21 @@ class TestWorkerPreempt(unittest.TestCase):
         path = os.path.join(self.tmp, "idle", "vpp-idle-loops.json")
         il = mon.IdleLoops(path)
         self.assertIsNone(il.busy(1, 1000))                     # nic nie zmierzone: nieznane, nie 0%
-        il.learn([0.0, 1.0, 50.0], [100, 4000000, 20000])       # worker 2 pod obciążeniem: nie uczy się
+        il.learn([0.0, 1.0, 1.0], [100, 7700000, 7700000], 0)   # bez ruchu (start, kolejki RX stoją): NIE uczy się
+        self.assertIsNone(il.busy(1, 1000))
+        il.learn([0.0, 1.0, 50.0], [100, 4000000, 20000], 50000)  # worker 2 pod obciążeniem: nie uczy się
         self.assertEqual(il.busy(1, 2000000), 50.0)
         self.assertEqual(il.busy(2, 1000000), 75.0)              # mediana innych workerów (4 M)
-        il.learn([0.0, 1.0, 1.0], [100, 3000000, 4200000])      # mniejsza wartość nie obniża maksimum
+        il.learn([0.0, 1.0, 1.0], [100, 3000000, 4200000], 50000)  # mniejsza wartość nie obniża maksimum
         self.assertEqual(il.base(1), 4000000)
         self.assertEqual(il.busy(2, 0), 100.0)
         il.save()
         self.assertEqual(mon.IdleLoops(path).base(2), 4200000)  # przetrwa restart router-monitor
+        with open(path, "w") as f:                               # stary plik bez wersji (uczony bez warunku ruchu)
+            json.dump({"idle": [100, 7700000, 7700000]}, f)
+        self.assertIsNone(mon.IdleLoops(path).busy(1, 4000000))  # odrzucony — nie daje fałszywych 45%
         il2 = mon.IdleLoops(path)
-        il2.learn([0.0, 1.0], [100, 3900000])                   # inna liczba wątków: od nowa
+        il2.learn([0.0, 1.0], [100, 3900000], 50000)            # inna liczba wątków: od nowa
         self.assertEqual(il2.idle, [100.0, 3900000.0])
 
     def test_read_smi_from_msr(self):

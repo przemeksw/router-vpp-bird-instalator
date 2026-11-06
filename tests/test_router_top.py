@@ -128,9 +128,9 @@ class TestIfacesScreen(unittest.TestCase):
         top.IDLE_LOCAL = []
         top.IDLE_FILE = self.root + "/idle.json"
         with open(top.IDLE_FILE, "w") as f:                    # router-monitor zmierzył luz: 4 M pętli/s
-            json.dump({"idle": [100000, 4000000, 4000000, 0]}, f)
+            json.dump({"v": 2, "idle": [100000, 4000000, 4000000, 0]}, f)
         cur = {"__workers__": [[1.0, 90000], [1.0, 2000000], [1.0, 400000], [2.0, 3000000]]}
-        lines = top.screen_load(cur["__workers__"])
+        lines = top.screen_load(cur["__workers__"], 50000)
         rows = {t.split("(")[0].strip(): (t, st) for t, st in lines if t.startswith("  worker ")}
         self.assertIn(" 50%", rows["worker 1"][0])            # 2 M z 4 M pętli = połowa czasu na pakietach
         self.assertIn(" 90%", rows["worker 2"][0])            # wektor wciąż 1.0, a worker prawie pełny
@@ -140,7 +140,9 @@ class TestIfacesScreen(unittest.TestCase):
         self.assertIn("zajętość: najwyżej 90%", "\n".join(t for t, _s in lines))
         # zmiana liczby workerów (set_workers): stary plik nie pasuje — uczymy się od nowa z próbki na luzie
         top.IDLE_LOCAL = []
-        lines = top.screen_load([[1.0, 50000], [1.0, 3500000]])
+        lines = top.screen_load([[1.0, 50000], [1.0, 3500000]], 0)
+        self.assertIn("?%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])   # bez ruchu: nie uczy się
+        lines = top.screen_load([[1.0, 50000], [1.0, 3500000]], 50000)
         self.assertIn("  0%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])
 
     def test_scrolling_keeps_table_header(self):

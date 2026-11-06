@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.40"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.41"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2698,6 +2698,11 @@ def tasks_on_cpu(cpu, skip_pid=None, n=4):
 # (te same rdzenie, ta sama konfiguracja), a bez żadnego pomiaru zajętość jest nieznana (None), nie zgadywana.
 IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", "/var/lib/router/vpp-idle-loops.json")
 IDLE_VEC = 1.1
+# Luz uczony TYLKO, gdy porty naprawdę odbierają (≥ IDLE_MIN_RX_PPS pkt/s łącznie). Bez ruchu (start VPP, porty
+# bez linku, kolejki RX, które się nie uzupełniają — num-rx-desc 32768 na lodz2-vpp) pusty obieg jest tańszy niż
+# w normalnej pracy: wyuczony wtedy "luz" (~7,7 M zamiast ~4,3 M pętli/s) dawał stałe ~45% zajętości bez ruchu.
+IDLE_MIN_RX_PPS = 1000.0
+IDLE_FMT = 2                                       # wersja pliku; starsze (uczone bez warunku ruchu) są odrzucane
 
 
 class IdleLoops:
@@ -2705,11 +2710,14 @@ class IdleLoops:
         self.path, self.idle, self.dirty = path, [], False
         try:
             with open(path) as f:
-                self.idle = [float(x) for x in json.load(f).get("idle", [])]
+                d = json.load(f)
+                self.idle = [float(x) for x in d.get("idle", [])] if d.get("v") == IDLE_FMT else []
         except (OSError, ValueError, TypeError, AttributeError):
             self.idle = []
 
-    def learn(self, vrow, lrow):
+    def learn(self, vrow, lrow, rx_pps):
+        if rx_pps is None or rx_pps < IDLE_MIN_RX_PPS:
+            return
         n = len(lrow)
         if len(self.idle) != n:                      # inna liczba wątków VPP (set_workers) — uczymy się od nowa
             self.idle, self.dirty = [0.0] * n, True
@@ -2739,7 +2747,7 @@ class IdleLoops:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"idle": self.idle, "time": int(time.time())}, f)
+                json.dump({"v": IDLE_FMT, "idle": self.idle, "time": int(time.time())}, f)
             os.replace(tmp, self.path)
             self.dirty = False
         except OSError:
@@ -2815,7 +2823,7 @@ def main():
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
     smi_prev, wk_last_t, smi_last_t, smi_hist = {}, 0.0, 0.0, []
-    idle_loops, idle_saved_t = IdleLoops(IDLE_FILE), 0.0   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
+    idle_loops, idle_saved_t, last_rx_pps = IdleLoops(IDLE_FILE), 0.0, None   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -2881,7 +2889,7 @@ def main():
                     sum(1 for _, v in workers if v >= CFG["VEC_WARN"]), len(workers))
                 state["vector_max"], state["vector_worker"] = wv, wi
                 state["vector_per_worker"] = [v for _, v in workers]
-                idle_loops.learn(vrow, lrow)
+                idle_loops.learn(vrow, lrow, last_rx_pps)
                 busy = [idle_loops.busy(i, lrow[i] if i < len(lrow) else 0) for i, _ in workers]
                 state["worker_busy"] = busy
                 known = [b for b in busy if b is not None]
@@ -2919,6 +2927,7 @@ def main():
                     tot_punt += d[5]
                 state["interfaces"] = ifs
                 state["rx_pps"], state["rx_bps"] = tot_pps, tot_bps
+                last_rx_pps = tot_pps
                 state["rx_miss_pps"], state["punt_pps"] = tot_miss, tot_punt
                 traffic = "rx %s pps / %sb/s" % (fmt_num(tot_pps), fmt_num(tot_bps))
                 # dlaczego: monitor ma już wszystkie dane, żeby nie zgadywać — przeciążenie (wektor), wywłaszczenie
@@ -7624,6 +7633,8 @@ def bar(frac, width=24):
 # więc działa na każdym serwerze bez ustawiania czegokolwiek. Bez pomiaru zajętość jest nieznana ("?").
 IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", ROOT + "/var/lib/router/vpp-idle-loops.json")
 IDLE_VEC = 1.1
+IDLE_MIN_RX_PPS = 1000.0                                               # luz tylko przy realnym ruchu (jak router-monitor)
+IDLE_FMT = 2
 IDLE_LOCAL = []                                                       # pomiary router-top (indeks = wątek VPP)
 BUSY_WARN, BUSY_CRIT = 70.0, 90.0
 
@@ -7632,7 +7643,8 @@ def idle_loops(n):
     """Pętle/s na luzie dla wątków 0..n-1: maksimum z IDLE_FILE i własnych pomiarów; brak → mediana innych workerów."""
     try:
         with open(IDLE_FILE) as f:
-            saved = [float(x) for x in json.load(f).get("idle", [])]
+            d = json.load(f)
+        saved = [float(x) for x in d.get("idle", [])] if d.get("v") == IDLE_FMT else []
     except (OSError, ValueError, TypeError, AttributeError):
         saved = []
     if len(saved) != n:
@@ -7643,8 +7655,10 @@ def idle_loops(n):
     return [x if x > 0 else med for x in out]
 
 
-def learn_idle(workers):
+def learn_idle(workers, rx_pps):
     global IDLE_LOCAL
+    if rx_pps is None or rx_pps < IDLE_MIN_RX_PPS:
+        return
     if len(IDLE_LOCAL) != len(workers):
         IDLE_LOCAL = [0.0] * len(workers)
     for i, (vecr, loops) in enumerate(workers):
@@ -7656,14 +7670,14 @@ def busy_pct(loops, base):
     return None if base <= 0 else 100.0 * max(0.0, min(1.0, 1.0 - float(loops) / base))
 
 
-def screen_load(workers):
+def screen_load(workers, rx_pps=None):
     """Obciążenie VPP (odpowiednik QFP): zajętość workera w % (z pętli) i średni rozmiar wektora (1 = luz, 256 = nasycenie)."""
     if not workers:
         return []
     warn = float(read_kv(MONITOR_CONF, "VEC_WARN", "64") or 64)
     crit = float(read_kv(MONITOR_CONF, "VEC_CRIT", "160") or 160)
     cores = [c for c in read_kv(ENV_FILE, "INST_WORKERS").split(",") if c]
-    learn_idle(workers)
+    learn_idle(workers, rx_pps)
     base = idle_loops(len(workers))
     rows = [(i, w) for i, w in enumerate(workers) if i > 0] or [(0, workers[0])]   # 0 = wątek główny
     lines = [("  OBCIĄŻENIE VPP (zajętość: z pętli/s względem luzu; wektor: 1 = luz, %d = alarm, %d = krytyczne, 256 = nasycenie)"
@@ -7711,10 +7725,10 @@ def if_rows(cur, prev, dt):
 
 
 def screen_vpp(cur, prev, dt):
-    lines = screen_load(cur.get("__workers__"))
+    rows, tot = if_rows(cur, prev, dt)
+    lines = screen_load(cur.get("__workers__"), tot[0] if prev is not cur else None)
     if not lines:
         lines = [("  Brak danych o workerach VPP.", "dim"), ("", "")]
-    rows, tot = if_rows(cur, prev, dt)
     nphys = sum(1 for n, _r in rows if "." not in n and not n.startswith("loop"))
     nvlan = sum(1 for n, _r in rows if "." in n)
     lines.append(("  RUCH ŁĄCZNIE (porty fizyczne: %d, VLAN-y: %d)" % (nphys, nvlan), "head"))

@@ -11,8 +11,10 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.40"                     '^SCRIPT_VERSION="1\.5\.40"' 1
-chk "router-monitor: pomiar luzu nie nadpisywany przez zmienną rdzeni systemowych" '^    idle_loops, idle_saved_t = IdleLoops|        for c, \(tot, idle\) in hk_now' 2
+chk "wersja skryptu 1.5.41"                     '^SCRIPT_VERSION="1\.5\.41"' 1
+chk "luz workerów uczony tylko przy realnym ruchu (monitor i top)" '^IDLE_MIN_RX_PPS = 1000\.0' 2
+chk "stary plik luzu (bez wersji) odrzucany" '^IDLE_FMT = 2' 2
+chk "router-monitor: pomiar luzu nie nadpisywany przez zmienną rdzeni systemowych" '^    idle_loops, idle_saved_t, last_rx_pps = IdleLoops|        for c, \(tot, idle\) in hk_now' 2
 chk "router-monitor: nikt nie woła metod na 'idle'" '\bidle\.(learn|busy|save)\(' 0
 chk "lspci: LnkSta z tabulatorem (wcześniej nic nie łapało)" "LnkSta:\\[\\[:space:\\]\\]\\*Speed" 3
 chk "vpp_conf_diff porównuje pierścienie RX/TX" 'zmiana: pierścień RX' 1
