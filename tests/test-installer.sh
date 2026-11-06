@@ -11,7 +11,11 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.37"                     '^SCRIPT_VERSION="1\.5\.37"' 1
+chk "wersja skryptu 1.5.38"                     '^SCRIPT_VERSION="1\.5\.38"' 1
+chk "lspci: LnkSta z tabulatorem (wcześniej nic nie łapało)" "LnkSta:\\[\\[:space:\\]\\]\\*Speed" 3
+chk "vpp_conf_diff porównuje pierścienie RX/TX" 'zmiana: pierścień RX' 1
+chk "router-kthreads: efektywna maska przerwań" 'effective_affinity_list' 2
+chk "SMI: średnia z okna, nie pojedyncza sekunda" '"SMI_WINDOW": 60,|^SMI_WINDOW=60$' 2
 chk "dobór workerów wg wydajności rdzenia"     'NEED_W=\$\(\( \(need_pps \+ PPS_W - 1\) / PPS_W \)\)' 1
 chk "workery: co najmniej NIC_CAP, najwyżej 2× i wolne rdzenie" 'want > NIC_CAP \* 2' 1
 chk "pojemność routera w raporcie i router.env" 'audit INFO "Pojemność \(szacunek\)"|^INST_CAPACITY=' 2
@@ -50,9 +54,9 @@ chk "router-kthreads-check.timer w st_isolation" 'systemctl enable --now router-
 chk "moduł msr ładowany przy starcie"         'put_file /etc/modules-load.d/router-msr.conf' 1
 chk "router-monitor: licznik SMI (MSR 0x34)"  '^MSR_SMI_COUNT = 0x34$' 1
 chk "router-monitor: alarm SMI"               'Alarm\("SYS", 3, "SMI", "SMI_END"\)' 1
-chk "router-monitor.conf: SMI_PER_S"          '^SMI_PER_S=1$' 1
+chk "router-monitor.conf: SMI_PER_S"          '^SMI_PER_S=5$' 1
 chk "router-notify: SMI i ISOL_FIX w VPP_DROPS" '\^SYS-\(SMI\|ISOL_FIX\)' 1
-chk "--check: SMI od bootu na rdzeniach workerów" 'SMI na rdzeniach workerów od bootu' 2
+chk "--check: częstość SMI z 5 s pomiaru"     'SMI na rdzeniu workera \(cpu \$c\)' 3
 chk "pierścień RX = maksimum ConnectX-4 (burst jednego przepływu)" '^VPP_RX_DESC=32768 ' 1
 chk "set_workers: sam startup.conf → tylko restart VPP" 'zmienił się tylko startup.conf' 1
 chk "router-monitor: WK_GRACE po starcie VPP (kod i konfiguracja)" '"WK_GRACE": 120,|^WK_GRACE=120$|t0 - vpp_seen_t < CFG\["WK_GRACE"\]' 3
@@ -370,6 +374,14 @@ EOC
   if [[ $got == *"compaction_proactiveness"*"router-kthreads.service / router-kthreads-check.timer"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff kompakcja/router-kthreads: jest '$got'"; fi
   got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 VPP_COMPACT_PROACTIVE=0 VPP_KTHREADS_UNIT=$vdt2 VPP_KTHREADS_TIMER=$vdt2 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
   if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff kompakcja=0 i router-kthreads.service jest: jest '$got'"; fi
+  # pierścienie: fixture startup.conf nie ma num-rx-desc → podbicie VPP_RX_DESC musi być zmianą (wcześniej "zgodny")
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,3,5,7,9 nohz_full=5,7,9 rcu_nocbs=3,5,7,9 irqaffinity=0-2 panic=10 rcupdate.rcu_normal_after_boot=1 iommu=pt skew_tick=1"' >"$vdg"
+  sed -i.bak 's/num-rx-queues 3 }/num-rx-queues 3 num-rx-desc 16384 num-tx-desc 4096 }/' "$vdc"
+  for want in "32768 rc=0" "16384 rc=1"; do
+    got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 VPP_COMPACT_PROACTIVE=0 VPP_KTHREADS_UNIT=$vdt2 VPP_KTHREADS_TIMER=$vdt2 VPP_RX_DESC=${want% *} VPP_TX_DESC=4096 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
+    if [[ $got == *"${want#* }"* && ( ${want% *} == 16384 || $got == *"pierścień RX 16384 → 32768"* ) ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff pierścień RX ${want% *}: jest '$got'"; fi
+  done
+  rm -f "$vdc.bak"
   rm -f "$vdg" "$vdt" "$vdt2"
   rm -f "$vdc" "$vds" "$vdb"
 else

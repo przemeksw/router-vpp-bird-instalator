@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.37"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.38"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2309,7 +2309,9 @@ CFG = {
     "WK_PREEMPT": 1.0,      # wywłaszczenia workerów VPP na sekundę (nr_involuntary_switches) => alarm
     "WK_GRACE": 120,        # s po starcie VPP bez alarmu WK_PREEMPT: każdy worker dostaje 2 wywłaszczenia przy
                             # tworzeniu wątków i przypinaniu do rdzeni (po restarcie: 12 × "1×" dwa razy — szum)
-    "SMI_PER_S": 1.0,       # SMI (MSR 0x34) na rdzeniach workerów na sekundę => alarm (0 = wyłącz)
+    "SMI_PER_S": 5.0,       # SMI na rdzeń workera na sekundę, średnio z SMI_WINDOW s => alarm (0 = wyłącz).
+                            # Serwery często mają stałe ~1 SMI/s z BIOS-u/BMC (Dell R630: ~1/s) — to tło, nie alarm
+    "SMI_WINDOW": 60,       # s, okno uśredniania SMI
     "PUNT_PPS": 20000.0,    # pkt/s do control plane
     "HK_CPU_PCT": 90.0,     # % zajętości rdzenia systemowego
     "HK_CPU_SECONDS": 5,    # przez ile sekund z rzędu
@@ -2805,7 +2807,7 @@ def main():
     hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
-    smi_prev, wk_last_t, smi_last_t = {}, 0.0, 0.0
+    smi_prev, wk_last_t, smi_last_t, smi_hist = {}, 0.0, 0.0, []
     idle, idle_saved_t = IdleLoops(IDLE_FILE), 0.0
     md_t = 0.0
     sum_t = time.time()
@@ -2994,16 +2996,20 @@ def main():
         if CFG["SMI_PER_S"] > 0:
             smi_now = read_smi(wcores or sorted(isolated))
             if smi_now and smi_prev:
-                smi_hits = sorted(((n - smi_prev[c], c) for c, n in smi_now.items() if c in smi_prev and n > smi_prev[c]),
-                                  reverse=True)
-                tot = sum(h[0] for h in smi_hits)
-                state["smi"] = tot
-                if smi_hits:
+                # SMI trafia zwykle do wszystkich rdzeni naraz — miarą jest przyrost na rdzeń (maksimum), nie suma
+                per_core = max((n - smi_prev[c] for c, n in smi_now.items() if c in smi_prev), default=0)
+                smi_hist.append((t0, max(0, per_core)))
+                while smi_hist and t0 - smi_hist[0][0] > CFG["SMI_WINDOW"]:
+                    smi_hist.pop(0)
+                span = max(1.0, t0 - smi_hist[0][0]) if len(smi_hist) > 1 else 1.0
+                rate = sum(d for _t, d in smi_hist[1:]) / span if len(smi_hist) > 1 else float(per_core)
+                state["smi"] = round(rate, 2)
+                if per_core > 0:
                     smi_last_t = t0
-                a_smi.update(t0, tot >= CFG["SMI_PER_S"], tot,
-                             "SMI (przerwanie BIOS-u) na rdzeniach workerów VPP: %s — rdzeń stoi poza kontrolą kernela "
-                             "(grozi rx-miss bez WK_PREEMPT). BIOS: System Profile = Performance, Memory Patrol/Demand Scrub = "
-                             "Disabled, USB legacy = Off" % ", ".join("cpu %d +%d" % (c, d) for d, c in smi_hits[:4]))
+                a_smi.update(t0, rate >= CFG["SMI_PER_S"], rate,
+                             "SMI (przerwania BIOS-u) na rdzeniach workerów VPP: %.1f/s średnio z %d s — rdzenie stoją poza "
+                             "kontrolą kernela (grozi rx-miss bez WK_PREEMPT). BIOS: System Profile = Performance, Memory "
+                             "Patrol/Demand Scrub = Disabled, USB legacy = Off" % (rate, CFG["SMI_WINDOW"]))
             smi_prev = smi_now
 
         # ---------------------------------------------------------- rdzenie systemowe
@@ -9034,17 +9040,17 @@ do_check() {
   # SMI: przerwania BIOS-u (patrol scrub pamięci, USB, zarządzanie energią) zatrzymują rdzeń niewidocznie dla kernela;
   # MSR 0x34 (Intel) liczy je od bootu — na rdzeniach workerów powinno stać w miejscu
   if [[ -c /dev/cpu/0/msr ]] || modprobe msr 2>/dev/null; then
-    smi=""
-    for part in $(tr ',' ' ' </sys/devices/system/cpu/nohz_full 2>/dev/null); do
-      if [[ $part == *-* ]]; then cs=$(seq "${part%-*}" "${part#*-}"); else cs=$part; fi
-      for c in $cs; do
-        v=$(dd if=/dev/cpu/"$c"/msr bs=8 count=1 skip=52 iflag=skip_bytes 2>/dev/null | od -An -tu8 | tr -d ' ')
-        [[ -n $v ]] && smi="$smi cpu$c=$((v & 0xFFFFFFFF))"
-      done
-    done
-    if [[ -z $smi ]]; then say "licznik SMI niedostępny (procesor bez MSR_SMI_COUNT albo brak /dev/cpu/*/msr)"
-    elif [[ $smi == *=[1-9]* ]]; then warn "SMI na rdzeniach workerów od bootu:$smi — BIOS zatrzymuje rdzenie poza kontrolą kernela (System Profile = Performance, Memory Patrol Scrub = Disabled; router-monitor: %SYS-3-SMI)"
-    else ok "SMI na rdzeniach workerów od bootu: 0 (BIOS nie przerywa workerów)"; fi
+    # częstość z 5 s pomiaru (licznik od bootu zawiera też tysiące SMI z POST/startu BIOS-u — nie świadczy o pracy)
+    c=$(tr ',' '\n' </sys/devices/system/cpu/nohz_full 2>/dev/null | head -n1); c=${c%%-*}
+    smi_rd() { dd if=/dev/cpu/"$c"/msr bs=8 count=1 skip=52 iflag=skip_bytes 2>/dev/null | od -An -tu8 | tr -d ' '; }
+    v1=$(smi_rd); [[ -n $v1 ]] && sleep 5; v2=$(smi_rd)
+    if [[ -z $c || -z $v1 || -z $v2 ]]; then say "licznik SMI niedostępny (procesor bez MSR_SMI_COUNT albo brak /dev/cpu/*/msr)"
+    else
+      r=$(awk -v a="$v1" -v b="$v2" 'BEGIN {printf "%.1f", ((b - a) % 4294967296) / 5}')
+      if awk -v r="$r" 'BEGIN {exit !(r >= 5)}'; then warn "SMI na rdzeniu workera (cpu $c): $r/s — BIOS często zatrzymuje rdzenie poza kontrolą kernela (System Profile = Performance, Memory Patrol Scrub = Disabled; router-monitor: %SYS-3-SMI)"
+      elif awk -v r="$r" 'BEGIN {exit !(r > 0)}'; then ok "SMI na rdzeniu workera (cpu $c): $r/s — stałe tło BIOS-u/BMC, poniżej progu alarmu (5/s)"
+      else ok "SMI na rdzeniu workera (cpu $c): 0/s (BIOS nie przerywa workerów)"; fi
+    fi
   else say "brak modułu msr — licznik SMI niedostępny"; fi
   vpid=$(pgrep -x vpp_main 2>/dev/null | head -n1)
   if [[ -n $vpid && -d /proc/$vpid/task ]]; then
@@ -9415,7 +9421,7 @@ Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-
 | `RXMISS_PPS` | 1 | gubione pakiety na karcie |
 | `NIC_DISCARD_PPS` | 1 | odrzucenia sprzętowe karty |
 | `WK_PREEMPT` / `WK_GRACE` | 1 / 120 | wywłaszczenia workera VPP na sekundę (coś poza VPP na izolowanym rdzeniu); bez alarmu przez 120 s po starcie VPP |
-| `SMI_PER_S` | 1 | przerwania BIOS-u (SMI, MSR 0x34) na rdzeniach workerów na sekundę; 0 = wyłącz |
+| `SMI_PER_S` / `SMI_WINDOW` | 5 / 60 | przerwania BIOS-u (SMI, MSR 0x34) na rdzeń workera na sekundę, średnio z 60 s; stałe ~1/s to tło; 0 = wyłącz |
 | `PUNT_PPS` | 20000 | ruch do samego routera |
 | `HK_CPU_PCT` / `HK_CPU_SECONDS` | 90 / 5 | przeciążony rdzeń systemowy |
 | `HK_GRACE` | 300 | sekundy od startu systemu bez `CPU_HIGH` (rozruch BIRD/Routinatora) |
@@ -9665,7 +9671,10 @@ def plan(threads, isolated, present, everything=False):
 
 
 def irqs():
-    """[(nr, nazwa, maska)] aktywnych przerwań sprzętowych (/proc/irq/N z co najmniej jednym sterownikiem)."""
+    """[(nr, nazwa, maska)] aktywnych przerwań sprzętowych (/proc/irq/N z co najmniej jednym sterownikiem).
+    Maska = effective_affinity_list (gdzie kernel NAPRAWDĘ dostarcza przerwanie), gdy jest. Wektory zarządzane
+    przez sterownik (mpt3sas, NVMe, mlx5 — po jednym na CPU) mają w smp_affinity_list rdzeń VPP, ale przy
+    isolcpus=managed_irq kernel kieruje je gdzie indziej — liczy się efektywna maska, nie deklarowana."""
     res = []
     base = "%s/irq" % PROC
     try:
@@ -9681,6 +9690,13 @@ def irqs():
                 continue
             with open("%s/%s/smp_affinity_list" % (base, n)) as f:
                 allowed = cpulist(f.read())
+            try:
+                with open("%s/%s/effective_affinity_list" % (base, n)) as f:
+                    eff = cpulist(f.read())
+                if eff:
+                    allowed = eff if not (eff & read_cpus("isolated")) else allowed
+            except OSError:
+                pass
         except (OSError, ValueError):
             continue
         res.append((int(n), ",".join(acts), allowed))
@@ -10072,6 +10088,13 @@ vpp_conf_diff() {   # vpp_conf_diff [vpp] — "vpp": tylko startup.conf i hugepa
   [[ $cb == "$BUFFERS" ]] || { echo "  zmiana: bufory ${cb:-brak} → $BUFFERS"; rc=0; }
   [[ $ch == "$MAIN_HEAP" ]] || { echo "  zmiana: sterta ${ch:-brak} → $MAIN_HEAP"; rc=0; }
   [[ $cp == "${NIC_PCI[*]}" ]] || { echo "  zmiana: porty ${cp:-brak} → ${NIC_PCI[*]}"; rc=0; }
+  # pierścienie RX/TX kart (num-rx-desc / num-tx-desc) — wcześniej nie były porównywane i podbicie VPP_RX_DESC
+  # przez upgrade_script kończyło się na "startup.conf zgodny", bez zapisu nowej wartości
+  local crx ctx
+  crx=$(grep -oE 'num-rx-desc [0-9]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
+  ctx=$(grep -oE 'num-tx-desc [0-9]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
+  [[ -z ${VPP_RX_DESC:-} || $crx == "$VPP_RX_DESC" ]] || { echo "  zmiana: pierścień RX ${crx:-brak} → $VPP_RX_DESC deskryptorów"; rc=0; }
+  [[ -z ${VPP_TX_DESC:-} || $ctx == "$VPP_TX_DESC" ]] || { echo "  zmiana: pierścień TX ${ctx:-brak} → $VPP_TX_DESC deskryptorów"; rc=0; }
   if [[ $NETFLOW_ENABLE == yes ]]; then
     { grep -qxF "flowprobe params record l2 l3 l4 active $NETFLOW_ACTIVE_TIMER passive $NETFLOW_PASSIVE_TIMER" \
            "${VPP_BOOTSTRAP:-/etc/vpp/bootstrap.vpp}" 2>/dev/null \
@@ -10201,7 +10224,7 @@ for p in "${NIC_PCI[@]}"; do
   if [[ -n $d ]] && ip -o addr show dev "$d" | grep -q 'inet '; then
     warn "$d ($p) ma adres IP w Linuksie — usuń go z /etc/network/interfaces, ten port przejmuje VPP"
   fi
-  ok "$p  netdev=${d:-?}  NUMA=$n  $(lspci -s "$p" -vv 2>/dev/null | grep -o 'LnkSta: Speed [^,]*, Width x[0-9]*' || true)"
+  ok "$p  netdev=${d:-?}  NUMA=$n  $(lspci -s "$p" -vv 2>/dev/null | grep -o 'LnkSta:[[:space:]]*Speed [^,]*, Width x[0-9]*' || true)"
 done
 
 # =============================================================================
@@ -10440,7 +10463,7 @@ for p in "${NIC_PCI[@]}"; do
   lnk=$(lspci -s "$p" -vv 2>/dev/null)
   cap_w=$(grep -o 'LnkCap:.*Width x[0-9]*' <<<"$lnk" | grep -o 'x[0-9]*$' || true)
   sta_w=$(grep -o 'LnkSta:.*Width x[0-9]*' <<<"$lnk" | grep -o 'x[0-9]*$' || true)
-  sta_s=$(grep -o 'LnkSta: Speed [0-9.]*GT/s' <<<"$lnk" | grep -o '[0-9.]*GT' || true)
+  sta_s=$(grep -o 'LnkSta:[[:space:]]*Speed [0-9.]*GT/s' <<<"$lnk" | grep -o '[0-9.]*GT' || true)
   if [[ -n $sta_w && $sta_w != "$cap_w" ]]; then
     audit WARN "PCIe $p" "$sta_w zamiast $cap_w" "karta w wolniejszym slocie"
     rec 1 "sprzęt" "Przełóż kartę do slotu x16 (R630: slot 1 low-profile → CPU2)" "w slocie x8 karta 100G zrobi najwyżej ~50 Gb/s"
@@ -10457,7 +10480,7 @@ for p in "${NIC_PCI[@]}"; do
   sp=$((sp + s1))
 done
 PORTS_MBPS=$sp
-gt=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta: Speed [0-9.]*GT/s' | grep -o '[0-9.]*' | head -n1)
+gt=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta:[[:space:]]*Speed [0-9.]*GT/s' | grep -oE '[0-9.]+GT' | grep -oE '[0-9.]+' | head -n1)
 w=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta:.*Width x[0-9]*' | grep -o '[0-9]*$' | head -n1)
 case ${gt:-0} in 2.5) per=2 ;; 5) per=4 ;; 8) per=8 ;; 16) per=16 ;; 32) per=32 ;; *) per=0 ;; esac
 bus=$(( per * ${w:-0} * 98 / 100 * 80 / 100 ))   # Gb/s użytkowe na kierunek: kodowanie 128b/130b i ~20% narzutu TLP/DMA
@@ -13335,8 +13358,10 @@ RXMISS_PPS=1
 # WK_GRACE = sekundy po starcie VPP bez tego alarmu (start workerów to zawsze 2 wywłaszczenia na rdzeń)
 WK_PREEMPT=1
 WK_GRACE=120
-# SMI (przerwania BIOS-u, MSR 0x34) na rdzeniach workerów na sekundę; 0 = wyłącz
-SMI_PER_S=1
+# SMI (przerwania BIOS-u, MSR 0x34) na rdzeń workera na sekundę, średnio z SMI_WINDOW s; 0 = wyłącz.
+# Stałe ~1/s z BIOS-u/BMC to tło na wielu serwerach — alarm dopiero przy wyraźnie większej częstości.
+SMI_PER_S=5
+SMI_WINDOW=60
 # pakiety/s odrzucone sprzętowo przez kartę (liczniki *discard*)
 NIC_DISCARD_PPS=1
 # pakiety/s do samego routera (control plane)

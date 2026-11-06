@@ -69,13 +69,16 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(got[0][3], present - isolated)
 
 
-def fake_irq(proc, n, actions, affinity):
+def fake_irq(proc, n, actions, affinity, effective=None):
     d = os.path.join(proc, "irq", str(n))
     os.makedirs(d, exist_ok=True)
     for a in actions:
         os.makedirs(os.path.join(d, a), exist_ok=True)
     with open(os.path.join(d, "smp_affinity_list"), "w") as f:
         f.write(affinity + "\n")
+    if effective is not None:
+        with open(os.path.join(d, "effective_affinity_list"), "w") as f:
+            f.write(effective + "\n")
 
 
 class TestProcScan(unittest.TestCase):
@@ -98,6 +101,7 @@ class TestProcScan(unittest.TestCase):
         fake_irq(self.proc, 40, ["eth2-rx-0"], "0-2,4,6,8,9")                 # poprawny
         fake_irq(self.proc, 50, [], "0-9")                                    # bez sterownika: pomijany
         fake_irq(self.proc, 60, ["ahci[0000:00:1f.2]"], "0-9")                # pełna maska obejmuje izolowane → zawęzić
+        fake_irq(self.proc, 70, ["mpt3sas0-msix5"], "5", effective="1")       # managed: kernel dostarcza na cpu 1 — OK
         self.env = dict(os.environ, ROUTER_KTHREADS_PROC=self.proc, ROUTER_KTHREADS_SYS=self.sys,
                         ROUTER_KTHREADS_LOG=self.log, ROUTER_KTHREADS_NOTIFY="/nonexistent/router-notify")
 
@@ -113,7 +117,8 @@ class TestProcScan(unittest.TestCase):
     def test_irqs_and_plan(self):
         kt.PROC = self.proc
         got = {n: (name, allowed) for n, name, allowed in kt.irqs()}
-        self.assertEqual(set(got), {33, 40, 60})
+        self.assertEqual(set(got), {33, 40, 60, 70})
+        self.assertEqual(got[70][1], {1})                                      # efektywna maska, nie deklarowana
         self.assertEqual(got[33], ("mlx5_async@pci:0000:82:00.0", {5}))
         plan = {n: new for n, _, _, new in kt.plan_irqs(kt.irqs(), {3, 5, 7}, set(range(10)))}
         self.assertEqual(plan, {33: {0, 1, 2, 4, 6, 8, 9}, 60: {0, 1, 2, 4, 6, 8, 9}})
@@ -127,6 +132,7 @@ class TestProcScan(unittest.TestCase):
         self.assertIn("irq 33", r.stdout)
         self.assertNotIn("irq 40", r.stdout)
         self.assertNotIn("irq 50", r.stdout)
+        self.assertNotIn("irq 70", r.stdout)                                   # wektor zarządzany: nie fałszywy alarm
         self.assertNotIn("ksoftirqd", r.stdout)
         self.assertNotIn("vpp_main", r.stdout)
         self.assertIn("do przepięcia: 3", r.stdout)

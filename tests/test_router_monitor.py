@@ -119,7 +119,7 @@ class TestWorkerPreempt(unittest.TestCase):
 
     def test_alarm_category_and_threshold(self):
         self.assertEqual(mon.CFG["WK_PREEMPT"], 1.0)
-        self.assertEqual(mon.CFG["SMI_PER_S"], 1.0)
+        self.assertEqual(mon.CFG["SMI_PER_S"], 5.0)
 
     def test_idle_loops_learning_and_busy(self):
         path = os.path.join(self.tmp, "idle", "vpp-idle-loops.json")
