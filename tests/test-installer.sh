@@ -11,7 +11,17 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.33"                     '^SCRIPT_VERSION="1\.5\.33"' 1
+chk "wersja skryptu 1.5.34"                     '^SCRIPT_VERSION="1\.5\.34"' 1
+chk "instalacja pyta o adres loop0"            'read -rp "  Adres loop0 \[\$\{LOOP0_ADDR:--\}\]: " ans' 1
+chk "loop0 z router.env przy kolejnych uruchomieniach" 'INST_LOOP0_ADDR="\$\{LOOP0_ADDR:--\}"|^INST_LOOP0_ADDR=' 1
+chk "loop0: odczyt INST_LOOP0_ADDR z router.env" "sed -n 's/\^INST_LOOP0_ADDR=" 1
+v32() { eval "$(sed -n '/^valid_ip4_32() {/,/^}/p' install-router.sh)"; valid_ip4_32 "$1"; }
+for a in 10.10.10.10/32 185.1.2.3/32 1.0.0.1/32; do
+  if v32 "$a"; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  valid_ip4_32 odrzuca poprawny $a"; fi
+done
+for a in 10.10.10.10 10.10.10.10/24 256.1.1.1/32 0.0.0.0/32 127.0.0.1/32 224.0.0.1/32 abc/32 "10.10.10.10/32 x"; do
+  if v32 "$a"; then fail=$((fail+1)); echo "BŁĄD  valid_ip4_32 przyjmuje zły '$a'"; else pass=$((pass+1)); fi
+done
 chk "router-top: karta 5 kolejki RX"           '5: \("Kolejki RX", QueueStats, screen_queues\)' 1
 chk "router-snmp: OID-y wywłaszczeń i SMI"     '\(22, "rvVppWkPreempt", "gauge"|\(23, "rvVppSmi", "gauge"' 2
 chk "router-monitor: RX_MISS z przyczyną"      'burst jednego przepływu na jednej kolejce RSS: worker nie był' 1
