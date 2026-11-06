@@ -245,15 +245,24 @@ vpp fake link-down >/dev/null
 echo "13b. alarm wkładek z timera (check --log)"
 ALOG=$W/root/var/log/router/alarmy.log
 $RI check --log >/dev/null 2>&1
+t "domyślnie wyłączony (odczyt DDM zatrzymuje ruch)" 1 grep -q 'OPTICS' "$ALOG"
+sed -i.bak 's#0.7000 mW (-1.55 dBm)#0.0000 mW (-inf dBm)#' "$W/ddm-hu0"
+$RI check --log >/dev/null 2>&1
+t "wyłączony: tor bez światła nie jest czytany" 1 grep -q 'OPTICS' "$ALOG"
+sed -i.bak 's#0.0000 mW (-inf dBm)#0.7000 mW (-1.55 dBm)#' "$W/ddm-hu0"
+mkdir -p "$W/root/etc/router"; echo 'OPTICS_CHECK_EVERY=1' >"$W/root/etc/router/router-monitor.conf"
+sleep 1.1; $RI check --log >/dev/null 2>&1
 t "wkładki w normie: bez OPTICS w logu"      1 grep -q 'OPTICS' "$ALOG"
 sed -i.bak 's#0.7000 mW (-1.55 dBm)#0.0000 mW (-inf dBm)#' "$W/ddm-hu0"       # tor 2 bez światła (oba porty mają ten plik)
 $RI check --log >/dev/null 2>&1
+t "w odstępie krótszym niż OPTICS_CHECK_EVERY nie czyta" 1 grep -q 'IFACE-3-OPTICS' "$ALOG"
+sleep 1.1; $RI check --log >/dev/null 2>&1
 t "tor bez światła → %IFACE-3-OPTICS"        0 grep -q 'IFACE-3-OPTICS' "$ALOG"
 t "OPTICS: port, tor i wartość w opisie"     0 grep -q 'hu0 \[ALARM\] RX tor 2 -inf dBm \[ALARM' "$ALOG"
-$RI check --log >/dev/null 2>&1
+sleep 1.1; $RI check --log >/dev/null 2>&1
 t "OPTICS logowany raz (bez powtórek co 5 min)" 0 test "$(grep -c 'IFACE-3-OPTICS' "$ALOG")" = 1
 sed -i.bak 's#0.0000 mW (-inf dBm)#0.7000 mW (-1.55 dBm)#' "$W/ddm-hu0"
-$RI check --log >/dev/null 2>&1
+sleep 1.1; $RI check --log >/dev/null 2>&1
 t "powrót do normy → OPTICS_END"             0 grep -q 'IFACE-5-OPTICS_END' "$ALOG"
 watch2() {   # optics -w: co najmniej dwa odświeżenia w ~2,5 s, Ctrl+C kończy z kodem 0
   python3 - "$@" <<'P'
@@ -263,7 +272,15 @@ time.sleep(2.5); p.send_signal(signal.SIGINT); out = p.communicate(timeout=10)[0
 sys.exit(0 if out.count("odświeżanie co 1 s") >= 2 and "hu0" in out and p.returncode == 0 else 1)
 P
 }
-t "optics -w: odświeża i kończy po Ctrl+C"  0 watch2 python3 $PWD/build/router-ifaces optics -w --interval 1
+watch_optics() {   # optics -w: najwyżej raz na minutę (każdy odczyt DDM to przerwa w ruchu) + ostrzeżenie; Ctrl+C kończy z kodem 0
+  python3 - "$@" <<'P'
+import signal, subprocess, sys, time
+p = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE, text=True)
+time.sleep(2.5); p.send_signal(signal.SIGINT); out = p.communicate(timeout=10)[0]
+sys.exit(0 if "odświeżanie co 60 s" in out and "zatrzymuje" in out and "hu0" in out and p.returncode == 0 else 1)
+P
+}
+t "optics -w: najwyżej raz na minutę, z ostrzeżeniem" 0 watch_optics python3 $PWD/build/router-ifaces optics -w --interval 1
 t "errors: brak błędów"                     0 has "brak błędów" $RI errors
 vpp fake hw-err hu0 rx_crc_errors_phy 5 >/dev/null
 t "errors: nowy licznik CRC"                0 has "rx_crc_errors_phy" $RI errors

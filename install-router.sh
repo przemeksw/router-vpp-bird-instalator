@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.45"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.46"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -1976,9 +1976,25 @@ def optics_summary(res):
     return out
 
 
+def optics_every():
+    """OPTICS_CHECK_EVERY z router-monitor.conf: co ile sekund timer sprawdza wkładki; 0 = nigdy (domyślnie)."""
+    try:
+        with open(ROOT + "/etc/router/router-monitor.conf") as f:
+            m = re.search(r"^OPTICS_CHECK_EVERY=(\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else 0
+    except OSError:
+        return 0
+
+
 def optics_check(state):
-    """Co 5 min (router-ifaces check --log): wkładki poza progami → %IFACE-3/4-OPTICS raz (do zmiany listy), powrót → OPTICS_END.
-    Spadająca moc RX na LR4 to typowy zwiastun awarii włókna/wkładki na tygodnie przed błędami CRC."""
+    """Z timera (router-ifaces check --log), najwyżej co OPTICS_CHECK_EVERY s: wkładki poza progami → %IFACE-3/4-OPTICS
+    raz (do zmiany listy), powrót → OPTICS_END. DOMYŚLNIE WYŁĄCZONE: odczyt EEPROM wkładki ("show interface transceiver
+    … module diag verbose", I2C przez firmware karty) VPP wykonuje w barierze — wszystkie workery stoją ~0,3–0,5 s na
+    port, a kolejki RX się przepełniają (lodz2-vpp: ~4 tys. zgubionych pakietów co 5 min przy 0,5 Mpps)."""
+    every = optics_every()
+    if every <= 0 or time.time() - state.get("optics_t", 0) < every:
+        return
+    state["optics_t"] = int(time.time())
     try:
         bad = optics_summary(read_optics())
     except Exception:          # noqa: BLE001 — VPP w restarcie albo brak INST_NIC_PCI: sprawdzimy następnym razem
@@ -2021,7 +2037,15 @@ def watch(fn, args):
         return 0
 
 
+OPTICS_WARN = ("Uwaga: odczyt DDM wkładek zatrzymuje na ~0,3–0,5 s na port przekazywanie pakietów (VPP czyta EEPROM "
+               "w barierze) — przy ruchu zgubi część pakietów. Używaj pojedynczo, nie w pętli.")
+
+
 def do_optics(args):
+    if not args.json:
+        print(color(OPTICS_WARN, "33"))
+    if args.watch and args.interval < 60:
+        args.interval = 60                       # tryb na żywo: najwyżej raz na minutę (każdy odczyt to przerwa w ruchu)
     return watch(show_optics, args)
 
 
@@ -8469,9 +8493,8 @@ AREAS = [
            mode="write", preview=["router-ifaces", "diff"]),
          A("Sprawdź rozjazd", "czy VPP zgadza się z ostatnio zastosowaną konfiguracją", ["router-ifaces", "check"]),
          A("Pokaż jako polecenia vppctl", "pełna konfiguracja zapisana jako polecenia VPP", ["router-ifaces", "render"]),
-         A("Wkładki optyczne (DDM)", "link up/down i prędkość, moc TX/RX w dBm, prąd lasera, temperatura, progi modułów",
+         A("Wkładki optyczne (DDM)", "moc TX/RX, prąd lasera, temperatura, progi — UWAGA: odczyt wstrzymuje ruch na ~0,5 s",
            ["router-ifaces", "optics"]),
-         A("Wkładki optyczne na żywo", "to samo, odświeżane co 10 s (Ctrl+C wraca do menu)", ["router-ifaces", "optics", "-w"]),
          A("Błędy portów na żywo", "CRC, symbol, discards, out_of_buffer, rx-miss, drops; przyrost co 10 s (Ctrl+C wraca)",
            ["router-ifaces", "errors", "-w"]),
          A("Odśwież opisy SNMP", "przebuduj plik opisów dla SNMP bez dotykania VPP", ["router-ifaces", "snmp"], mode="write",
@@ -13546,6 +13569,9 @@ VEC_WARN=64
 VEC_CRIT=160
 # pakiety/s zgubione przez kartę, bo VPP nie nadąża (rx-miss + rx-no-buf)
 RXMISS_PPS=1
+# co ile sekund router-ifaces-check sprawdza DDM wkładek (alarm %IFACE-OPTICS); 0 = nigdy. Każdy odczyt zatrzymuje
+# workery VPP na ~0,3–0,5 s na port (EEPROM w barierze) i gubi pakiety — włączaj świadomie, np. 86400 (raz na dobę)
+OPTICS_CHECK_EVERY=0
 # wywłaszczenia workerów VPP w oknie WK_WINDOW s: coś poza VPP działa na izolowanym rdzeniu (router-kthreads -n);
 # pojedyncze (wątek kernela tego rdzenia, µs) to nie problem. WK_GRACE = sekundy po starcie VPP bez tego alarmu
 WK_PREEMPT=5
@@ -15197,7 +15223,7 @@ Po restarcie:
 
 Wykrywanie rozjazdu: co 5 minut `router-ifaces-check.timer` porównuje VPP z ostatnio zastosowaną konfiguracją. Gdy ktoś zmieni coś ręcznie albo odtworzenie się nie uda, w logu pojawi się `%IFACE-4-DRIFT` (raz, z listą różnic), a po naprawie `%IFACE-5-DRIFT_END`. Sama edycja pliku bez `apply` nie jest rozjazdem — w logu jest tylko informacja `%IFACE-6-PENDING`.
 
-Ten sam timer pilnuje **wkładek**: gdy DDM modułu (moc RX/TX, bias, temperatura, zasilanie) wyjdzie poza progi zapisane w samym module albo włączony port nie ma linku, w logu pojawia się `%IFACE-4-OPTICS` (ostrzeżenie) lub `%IFACE-3-OPTICS` (alarm modułu) — raz, z wartością i zakresem — a po powrocie `%IFACE-5-OPTICS_END`. Spadająca moc RX na LR4 to typowy zwiastun problemu z włóknem na tygodnie przed błędami CRC; szczegóły: `router-ifaces optics`.
+Ten sam timer może pilnować **wkładek** — domyślnie WYŁĄCZONE (`OPTICS_CHECK_EVERY=0` w `/etc/router/router-monitor.conf`), bo odczyt DDM (EEPROM wkładki przez firmware karty) VPP wykonuje w barierze: wszystkie workery stoją ~0,3–0,5 s na port i kolejki RX gubią pakiety. Po włączeniu (np. `OPTICS_CHECK_EVERY=86400`, raz na dobę): gdy DDM modułu (moc RX/TX, bias, temperatura, zasilanie) wyjdzie poza progi zapisane w samym module albo włączony port nie ma linku, w logu pojawia się `%IFACE-4-OPTICS` (ostrzeżenie) lub `%IFACE-3-OPTICS` (alarm modułu) — raz, z wartością i zakresem — a po powrocie `%IFACE-5-OPTICS_END`. Spadająca moc RX na LR4 to typowy zwiastun problemu z włóknem na tygodnie przed błędami CRC; szczegóły: `router-ifaces optics`.
 
 | Komunikat | Znaczenie |
 |---|---|
