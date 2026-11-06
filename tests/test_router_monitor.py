@@ -119,6 +119,22 @@ class TestWorkerPreempt(unittest.TestCase):
 
     def test_alarm_category_and_threshold(self):
         self.assertEqual(mon.CFG["WK_PREEMPT"], 1.0)
+        self.assertEqual(mon.CFG["SMI_PER_S"], 1.0)
+
+    def test_read_smi_from_msr(self):
+        dev = os.path.join(self.tmp, "dev")
+        for cpu, count in ((5, 17), (7, 0)):
+            os.makedirs(os.path.join(dev, "cpu", str(cpu)))
+            with open(os.path.join(dev, "cpu", str(cpu), "msr"), "wb") as f:
+                f.write(b"\0" * mon.MSR_SMI_COUNT + count.to_bytes(8, "little"))
+        saved = mon.DEV
+        mon.DEV = dev
+        try:
+            self.assertEqual(mon.read_smi([5, 7, 9]), {5: 17, 7: 0})     # cpu 9 bez pliku msr: pomijany
+            mon.DEV = os.path.join(self.tmp, "nodev")
+            self.assertEqual(mon.read_smi([5]), {})                       # brak modułu msr / AMD: pusto, bez wyjątku
+        finally:
+            mon.DEV = saved
 
 
 if __name__ == "__main__":

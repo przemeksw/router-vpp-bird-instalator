@@ -54,12 +54,17 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.30"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.32"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
 VPP_WORKERS=auto               # auto = dobór do rdzeni i modelu karty; albo liczba, np. 12
-VPP_RX_DESC=16384              # deskryptory RX na kolejkę (DPDK mlx5; zapas na zrywy ruchu/DDoS — karta ConnectX obsługuje do 32768)
+VPP_RX_DESC=32768              # deskryptory RX na kolejkę = maksimum ConnectX-4 (show hardware-interfaces: "desc … max 32768").
+                                # Jeden duży przepływ TCP (ten sam 5-tuple → zawsze ta sama kolejka RSS → jeden worker) od nadawcy
+                                # z kartą 100G wysyła okno 20–30 MB z prędkością łącza (~10 Mpps przy 1200 B), a worker zdejmuje
+                                # ~1–2 Mpps: pierścień 16384 przepełniał się w ~1,7 ms i karta gubiła kilkaset pakietów
+                                # (rx_out_of_buffer = rx-miss) bez żadnego sygnału po stronie CPU. 32768 podwaja tolerowany
+                                # burst (~40 MB); koszt: +16384 buforów na kolejkę (12 kolejek × 2 porty ≈ 393 tys. z puli).
 VPP_TX_DESC=4096               # deskryptory TX na kolejkę (errno -95 przy wyższych wartościach to był stary firmware 12.20, nie liczba deskryptorów —
                                 # od firmware >= 12.21.1000 (audyt st_firmware/do_audit wymusza aktualizację) nieaktualne)
 VPP_NIC_DEVARGS=""             # dodatkowe devargs DPDK; przy firmware >= 12.28 niepotrzebne (potwierdzone na R630: bez devargs porty wstają)
@@ -2166,6 +2171,7 @@ prog_router_monitor() {
 #   %VPP-3-NIC_DISCARD   karta odrzuca pakiety sprzętowo (bufor PHY/priorytetu karty, PCIe)
 #   %VPP-3-WK_PREEMPT    worker VPP wywłaszczony z izolowanego rdzenia (coś poza VPP działa na jego CPU —
 #                        np. kcompactd/kswapd przypięte do całego węzła NUMA; grozi rx-miss na jego kolejce RX)
+#   %SYS-3-SMI           przerwanie BIOS-u (SMI) na rdzeniu workera — rdzeń stoi niewidocznie dla kernela
 #   %VPP-4-PUNT_HIGH     dużo ruchu do samego routera (atak na control plane)
 #   %VPP-1-HANG          VPP przestał odpowiadać (opcjonalny automatyczny restart)
 #   %SYS-4-CPU_HIGH      przeciążony rdzeń systemowy (BIRD, SNMP itd.)
@@ -2200,6 +2206,7 @@ CFG = {
     "WK_PREEMPT": 1.0,      # wywłaszczenia workerów VPP na sekundę (nr_involuntary_switches) => alarm
     "WK_GRACE": 120,        # s po starcie VPP bez alarmu WK_PREEMPT: każdy worker dostaje 2 wywłaszczenia przy
                             # tworzeniu wątków i przypinaniu do rdzeni (po restarcie: 12 × "1×" dwa razy — szum)
+    "SMI_PER_S": 1.0,       # SMI (MSR 0x34) na rdzeniach workerów na sekundę => alarm (0 = wyłącz)
     "PUNT_PPS": 20000.0,    # pkt/s do control plane
     "HK_CPU_PCT": 90.0,     # % zajętości rdzenia systemowego
     "HK_CPU_SECONDS": 5,    # przez ile sekund z rzędu
@@ -2559,6 +2566,31 @@ def tasks_on_cpu(cpu, skip_pid=None, n=4):
     return ", ".join(sorted(seen)[:n])
 
 
+# ------------------------------------------------------------------ SMI (przerwania BIOS-u)
+# SMI zatrzymuje rdzeń na setki µs–ms poza kontrolą kernela: bez wywłaszczenia (WK_PREEMPT tego nie widzi),
+# bez wpisu w /proc/interrupts. Źródła: patrol/demand scrub pamięci, emulacja USB, zarządzanie energią, iDRAC/BMC.
+# Jedyny ślad to MSR_SMI_COUNT (0x34, Intel) — liczony od bootu, na rdzeniach workerów ma stać w miejscu.
+DEV = os.environ.get("ROUTER_MONITOR_DEV", "/dev")
+MSR_SMI_COUNT = 0x34
+
+
+def read_smi(cpus):
+    """{cpu: SMI od bootu} z /dev/cpu/N/msr (modprobe msr); brak MSR (AMD, VM, brak modułu) → {}."""
+    out = {}
+    for c in cpus:
+        try:
+            fd = os.open("%s/cpu/%d/msr" % (DEV, c), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            out[c] = int.from_bytes(os.pread(fd, 8, MSR_SMI_COUNT), "little") & 0xFFFFFFFF
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return out
+
+
 # ------------------------------------------------------------------ główna pętla
 def main():
     global LOG
@@ -2586,6 +2618,7 @@ def main():
     a_miss = Alarm("VPP", 2, "RX_MISS", "RX_MISS_END")
     a_disc = Alarm("VPP", 3, "NIC_DISCARD", "NIC_DISCARD_END")
     a_wk = Alarm("VPP", 3, "WK_PREEMPT", "WK_PREEMPT_END")
+    a_smi = Alarm("SYS", 3, "SMI", "SMI_END")
     a_punt = Alarm("VPP", 4, "PUNT_HIGH", "PUNT_NORMAL")
     a_down = Alarm("VPP", 2, "DOWN", "UP")
     a_hk = Alarm("SYS", 4, "CPU_HIGH", "CPU_NORMAL")
@@ -2601,6 +2634,7 @@ def main():
     hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
+    smi_prev = {}
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -2762,6 +2796,20 @@ def main():
             if not a_wk.active:
                 wk_who = ""
 
+        # ---------------------------------------------------------- SMI na rdzeniach workerów
+        if CFG["SMI_PER_S"] > 0:
+            smi_now = read_smi(wcores or sorted(isolated))
+            if smi_now and smi_prev:
+                smi_hits = sorted(((n - smi_prev[c], c) for c, n in smi_now.items() if c in smi_prev and n > smi_prev[c]),
+                                  reverse=True)
+                tot = sum(h[0] for h in smi_hits)
+                state["smi"] = tot
+                a_smi.update(t0, tot >= CFG["SMI_PER_S"], tot,
+                             "SMI (przerwanie BIOS-u) na rdzeniach workerów VPP: %s — rdzeń stoi poza kontrolą kernela "
+                             "(grozi rx-miss bez WK_PREEMPT). BIOS: System Profile = Performance, Memory Patrol/Demand Scrub = "
+                             "Disabled, USB legacy = Off" % ", ".join("cpu %d +%d" % (c, d) for d, c in smi_hits[:4]))
+            smi_prev = smi_now
+
         # ---------------------------------------------------------- rdzenie systemowe
         hk_now = read_proc_stat()
         hk_max, hk_core = 0.0, None
@@ -2888,7 +2936,8 @@ CATEGORIES = [
     ("DISKS", "smartd: zdrowie dysków (S.M.A.R.T.)", r"^SMART-"),
     ("NIC_FW", "aktualizacja firmware karty", r"^SYS-NIC_FW_"),
     ("VPP_STATE", "VPP niedostępny, zawieszony, wznowiony", r"^VPP-(DOWN|UP|HANG|HANG_RESTART)$"),
-    ("VPP_DROPS", "utrata pakietów: rx-miss, odrzucenia na karcie, wywłaszczony worker", r"^VPP-(RX_MISS|NIC_DISCARD|WK_PREEMPT)"),
+    ("VPP_DROPS", "utrata pakietów i zagrożenia dla workerów: rx-miss, odrzucenia na karcie, wywłaszczenie, SMI, przepięte wątki/przerwania",
+     r"^VPP-(RX_MISS|NIC_DISCARD|WK_PREEMPT)|^SYS-(SMI|ISOL_FIX)"),
     ("VPP_LOAD", "przeciążenie workerów VPP (LOAD_HIGH / LOAD_CRITICAL)", r"^VPP-LOAD_"),
     ("VPP_PUNT", "duży ruch do samego routera (atak na control plane)", r"^VPP-PUNT_"),
     ("SYS_CPU", "przeciążenie rdzeni systemowych (BIRD, SNMP)", r"^SYS-CPU_"),
@@ -8631,9 +8680,26 @@ do_check() {
   if [[ -z $cp || $cp == 0 ]]; then ok "proaktywna kompakcja pamięci wyłączona (kcompactd nie budzi się cyklicznie)"
   else warn "vm.compaction_proactiveness=$cp — kcompactd budzi się co 500 ms; na rdzeniu workera VPP = rx-miss (install-router set_workers)"; fi
   if [[ -x /opt/router/bin/router-kthreads ]]; then
-    if /opt/router/bin/router-kthreads -n >/dev/null 2>&1; then ok "wątki kernela (kcompactd, kswapd) poza rdzeniami VPP"
-    else warn "wątki kernela z dostępem do rdzeni VPP — uruchom: router-kthreads (podgląd: router-kthreads -n)"; fi
+    if /opt/router/bin/router-kthreads -n >/dev/null 2>&1; then ok "wątki kernela (kcompactd, kswapd) i przerwania poza rdzeniami VPP"
+    else warn "wątki kernela/przerwania z dostępem do rdzeni VPP — uruchom: router-kthreads (podgląd: router-kthreads -n)"; fi
+    systemctl is-active --quiet router-kthreads-check.timer 2>/dev/null && ok "router-kthreads-check.timer: kontrola co 5 min" \
+      || warn "router-kthreads-check.timer nieaktywny — nowe urządzenie/wątek mogłyby trafić na rdzeń VPP (install-router upgrade_script)"
   else warn "brak /opt/router/bin/router-kthreads — kcompactd/kswapd mogą wywłaszczać workery VPP (install-router upgrade_script)"; fi
+  # SMI: przerwania BIOS-u (patrol scrub pamięci, USB, zarządzanie energią) zatrzymują rdzeń niewidocznie dla kernela;
+  # MSR 0x34 (Intel) liczy je od bootu — na rdzeniach workerów powinno stać w miejscu
+  if [[ -c /dev/cpu/0/msr ]] || modprobe msr 2>/dev/null; then
+    smi=""
+    for part in $(tr ',' ' ' </sys/devices/system/cpu/nohz_full 2>/dev/null); do
+      if [[ $part == *-* ]]; then cs=$(seq "${part%-*}" "${part#*-}"); else cs=$part; fi
+      for c in $cs; do
+        v=$(dd if=/dev/cpu/"$c"/msr bs=8 count=1 skip=52 iflag=skip_bytes 2>/dev/null | od -An -tu8 | tr -d ' ')
+        [[ -n $v ]] && smi="$smi cpu$c=$((v & 0xFFFFFFFF))"
+      done
+    done
+    if [[ -z $smi ]]; then say "licznik SMI niedostępny (procesor bez MSR_SMI_COUNT albo brak /dev/cpu/*/msr)"
+    elif [[ $smi == *=[1-9]* ]]; then warn "SMI na rdzeniach workerów od bootu:$smi — BIOS zatrzymuje rdzenie poza kontrolą kernela (System Profile = Performance, Memory Patrol Scrub = Disabled; router-monitor: %SYS-3-SMI)"
+    else ok "SMI na rdzeniach workerów od bootu: 0 (BIOS nie przerywa workerów)"; fi
+  else say "brak modułu msr — licznik SMI niedostępny"; fi
   vpid=$(pgrep -x vpp_main 2>/dev/null | head -n1)
   if [[ -n $vpid && -d /proc/$vpid/task ]]; then
     pre=$(for t in /proc/"$vpid"/task/*; do
@@ -9003,6 +9069,7 @@ Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-
 | `RXMISS_PPS` | 1 | gubione pakiety na karcie |
 | `NIC_DISCARD_PPS` | 1 | odrzucenia sprzętowe karty |
 | `WK_PREEMPT` / `WK_GRACE` | 1 / 120 | wywłaszczenia workera VPP na sekundę (coś poza VPP na izolowanym rdzeniu); bez alarmu przez 120 s po starcie VPP |
+| `SMI_PER_S` | 1 | przerwania BIOS-u (SMI, MSR 0x34) na rdzeniach workerów na sekundę; 0 = wyłącz |
 | `PUNT_PPS` | 20000 | ruch do samego routera |
 | `HK_CPU_PCT` / `HK_CPU_SECONDS` | 90 / 5 | przeciążony rdzeń systemowy |
 | `HANG_SECONDS` / `HANG_RESTART` | 30 / 1 | VPP nie odpowiada → po 30 s restart VPP |
@@ -9121,7 +9188,7 @@ birdc show protocols | configure check | configure
 
 systemctl status router.target            # wszystkie usługi routera
 router-history                            # kopie i historia zmian /etc: daty, podgląd, wyciągnięcie do katalogu
-router-kthreads -n                        # wątki kernela (kcompactd, kswapd) z dostępem do rdzeni VPP; bez -n przepina
+router-kthreads -n                        # wątki kernela (kcompactd, kswapd) i przerwania z dostępem do rdzeni VPP; bez -n przepina
 iptables -t raw -L PREROUTING -nv         # ochrona CPU: eth2
 ip netns exec dataplane iptables -t raw -L PREROUTING -nv   # ochrona CPU: adresy VPP, loop0
 chronyc sources                           # synchronizacja czasu
@@ -9133,11 +9200,20 @@ prog_router_kthreads() {
   cat <<'ROUTER_KTHREADS_PY'
 #!/usr/bin/python3
 # Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
-# router-kthreads — wątki kernela z dostępem do rdzeni VPP przypina do rdzeni systemowych.
+# router-kthreads — wątki kernela i przerwania z dostępem do rdzeni VPP przypina do rdzeni systemowych.
 #
-#   router-kthreads        przepnij (uruchamiane przy starcie przez router-kthreads.service i po set_workers)
-#   router-kthreads -n     tylko pokaż, co zostałoby przepięte (nic nie zmienia; kod 1 = coś jest do przepięcia)
-#   router-kthreads --all  przepnij każdy wątek kernela, który ma w masce rdzenie VPP (styl tuned "realtime")
+#   router-kthreads          przepnij (uruchamiane przy starcie przez router-kthreads.service i po set_workers)
+#   router-kthreads -n       tylko pokaż, co zostałoby przepięte (nic nie zmienia; kod 1 = coś jest do przepięcia)
+#   router-kthreads --quiet  tryb timera (co 5 min): nic nie wypisuje, gdy jest czysto; gdy coś przepiął —
+#                            %SYS-4-ISOL_FIX w logu (nowe urządzenie, nowy wątek, ręczna zmiana)
+#   router-kthreads --all    przepnij każdy wątek kernela, który ma w masce rdzenie VPP (styl tuned "realtime")
+#
+# Przerwania: sterowniki z "managed IRQ" (NVMe, mpt3sas, mlx5…) respektują isolcpus=managed_irq, a reszta
+# dostaje irqaffinity= z linii kernela — ale wektor ustawiony później ręcznie, przez irqbalance innej wersji
+# albo przez sterownik ignorujący obie rzeczy może trafić na rdzeń workera. Program przechodzi po
+# /proc/irq/N/smp_affinity_list każdego aktywnego wektora i wyrzuca z maski izolowane rdzenie (managed IRQ
+# nie dają się zmienić — EIO — i nie muszą). Nic tu nie zależy od modelu serwera: lista izolowanych rdzeni,
+# węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu.
 #
 # Dlaczego: isolcpus/nohz_full chronią rdzenie workerów VPP przed procesami i przerwaniami, ale NIE przed wątkami
 # kernela, które dostają własną maskę CPU. kcompactdN i kswapdN (kompakcja i odzyskiwanie pamięci węzła NUMA N)
@@ -9155,10 +9231,14 @@ prog_router_kthreads() {
 # dlatego program za każdym razem skanuje /proc.
 import os
 import re
+import subprocess
 import sys
+import time
 
 SYS = os.environ.get("ROUTER_KTHREADS_SYS", "/sys")
 PROC = os.environ.get("ROUTER_KTHREADS_PROC", "/proc")
+LOG = os.environ.get("ROUTER_KTHREADS_LOG", "/var/log/router/alarmy.log")
+NOTIFY = os.environ.get("ROUTER_KTHREADS_NOTIFY", "/opt/router/bin/router-notify")
 PF_KTHREAD = 0x00200000
 PERCPU_RE = re.compile(r"/\d+(:|$)")
 
@@ -9237,36 +9317,107 @@ def plan(threads, isolated, present, everything=False):
     return out
 
 
+def irqs():
+    """[(nr, nazwa, maska)] aktywnych przerwań sprzętowych (/proc/irq/N z co najmniej jednym sterownikiem)."""
+    res = []
+    base = "%s/irq" % PROC
+    try:
+        nums = os.listdir(base)
+    except OSError:
+        return res
+    for n in nums:
+        if not n.isdigit():
+            continue
+        try:
+            acts = sorted(d for d in os.listdir("%s/%s" % (base, n)) if os.path.isdir("%s/%s/%s" % (base, n, d)))
+            if not acts:
+                continue
+            with open("%s/%s/smp_affinity_list" % (base, n)) as f:
+                allowed = cpulist(f.read())
+        except (OSError, ValueError):
+            continue
+        res.append((int(n), ",".join(acts), allowed))
+    return res
+
+
+def plan_irqs(irqlist, isolated, present):
+    """[(nr, nazwa, stara maska, nowa maska)] — wektory z izolowanym rdzeniem w masce."""
+    hk = present - isolated
+    return [(n, name, allowed, (allowed & hk) or hk) for n, name, allowed in irqlist if allowed & isolated]
+
+
+def set_irq(n, cpus):
+    with open("%s/irq/%d/smp_affinity_list" % (PROC, n), "w") as f:
+        f.write(fmt(cpus))
+
+
+def alarm(msg):
+    """%SYS-4-ISOL_FIX do sysloga, alarmy.log i kolejki e-mail (tylko w trybie --quiet, gdy coś przepięto)."""
+    line = "%SYS-4-ISOL_FIX: " + msg
+    try:
+        subprocess.run(["logger", "-t", "router-kthreads", "-p", "local0.warning", line], check=False)
+    except OSError:
+        pass
+    try:
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+    except OSError:
+        pass
+    try:
+        subprocess.run([NOTIFY, "queue", line], check=False, capture_output=True)
+    except OSError:
+        pass
+
+
 def main(argv):
-    dry = "-n" in argv
+    dry, quiet = "-n" in argv, "--quiet" in argv
     isolated, present = read_cpus("isolated"), read_cpus("present")
     if not isolated:
-        print("brak izolowanych rdzeni (isolcpus) — nic do przepięcia")
+        quiet or print("brak izolowanych rdzeni (isolcpus) — nic do przepięcia")
         return 0
     todo = plan(kthreads(), isolated, present, everything="--all" in argv)
-    if not todo:
-        print("wątki kernela poza rdzeniami VPP (%s) — nic do przepięcia" % fmt(isolated))
+    todo_irq = plan_irqs(irqs(), isolated, present)
+    if not todo and not todo_irq:
+        quiet or print("wątki kernela i przerwania poza rdzeniami VPP (%s) — nic do przepięcia" % fmt(isolated))
         return 0
-    moved = 0
+    moved, done = 0, []
     for pid, name, old, new in todo:
-        print("%-24s pid %-7d %s → %s" % (name, pid, fmt(old), fmt(new)))
+        quiet or print("wątek     %-24s pid %-7d %s → %s" % (name, pid, fmt(old), fmt(new)))
         if dry:
             continue
         try:
             os.sched_setaffinity(pid, new)
             moved += 1
+            done.append("wątek %s(%d)" % (name, pid))
         except (OSError, AttributeError) as e:
-            print("    nie przepięto: %s" % e)
+            quiet or print("    nie przepięto: %s" % e)
+    managed = 0
+    for n, name, old, new in todo_irq:
+        quiet or print("przerwanie %-23s irq %-7d %s → %s" % (name, n, fmt(old), fmt(new)))
+        if dry:
+            continue
+        try:
+            set_irq(n, new)
+            moved += 1
+            done.append("irq %d %s" % (n, name))
+        except OSError as e:
+            managed += 1       # managed IRQ (EIO): kernel sam trzyma go poza isolcpus=managed_irq; EPERM: bez roota
+            quiet or print("    nie przepięto (%s) — wektor zarządzany przez sterownik, respektuje isolcpus=managed_irq" % e.strerror)
+    total = len(todo) + len(todo_irq)
     if dry:
-        print("do przepięcia: %d (uruchom bez -n)" % len(todo))
+        print("do przepięcia: %d (uruchom bez -n)" % total)
         return 1
-    print("przepięto: %d z %d" % (moved, len(todo)))
-    return 0 if moved == len(todo) else 1
+    if quiet:
+        if done:
+            alarm("przepięto z rdzeni VPP (%s): %s" % (fmt(isolated), ", ".join(done)))
+        return 0
+    print("przepięto: %d z %d%s" % (moved, total, " (%d wektorów zarządzanych pominięto)" % managed if managed else ""))
+    return 0 if moved + managed == total else 1
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("-V", "--version", "-h", "--help"):
-        print(__doc__ or "router-kthreads — wątki kernela poza rdzeniami VPP (-n: tylko pokaż, --all: każdy wątek)\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
+        print("router-kthreads — wątki kernela i przerwania poza rdzeniami VPP (-n: tylko pokaż, --quiet: tryb timera, --all: każdy wątek)\nAutor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
         sys.exit(0)
     sys.exit(main(sys.argv[1:]))
 ROUTER_KTHREADS_PY
@@ -9545,7 +9696,7 @@ upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (
   grep -q 'managed_irq' "$g" && grep -q 'nohz_full=' "$g" \
     && [[ $(sysctl -n kernel.numa_balancing 2>/dev/null) == 0 ]] \
     && [[ $(sysctl -n vm.compaction_proactiveness 2>/dev/null) == 0 ]] \
-    && [[ -f /etc/systemd/system/router-kthreads.service && -x /opt/router/bin/router-kthreads ]] \
+    && [[ -f /etc/systemd/system/router-kthreads.service && -f /etc/systemd/system/router-kthreads-check.timer && -x /opt/router/bin/router-kthreads ]] \
     && [[ $thp == madvise || $thp == never ]] \
     && [[ -z $cur_rx || $cur_rx == "$VPP_RX_DESC" ]] && [[ -z $cur_tx || $cur_tx == "$VPP_TX_DESC" ]] \
     && ((netflow_ok)) && return 0
@@ -9591,8 +9742,9 @@ vpp_conf_diff() {   # vpp_conf_diff [vpp] — "vpp": tylko startup.conf i hugepa
     local cp=${VPP_COMPACT_PROACTIVE-$(sysctl -n vm.compaction_proactiveness 2>/dev/null)}
     [[ -z $cp || $cp == 0 ]] || { echo "  zmiana: vm.compaction_proactiveness → 0 (kcompactd nie budzi się co 500 ms na rdzeniu workera)"; rc=0; }
     local ku=${VPP_KTHREADS_UNIT:-/etc/systemd/system/router-kthreads.service}
-    if [[ -n ${VPP_KTHREADS_UNIT:-} || -d /etc/systemd/system ]] && [[ ! -f $ku ]]; then
-      echo "  zmiana: router-kthreads.service (kcompactd/kswapd poza rdzeniami VPP) jeszcze nie zainstalowany"; rc=0
+    local kt=${VPP_KTHREADS_TIMER:-/etc/systemd/system/router-kthreads-check.timer}
+    if [[ -n ${VPP_KTHREADS_UNIT:-} || -d /etc/systemd/system ]] && [[ ! -f $ku || ! -f $kt ]]; then
+      echo "  zmiana: router-kthreads.service / router-kthreads-check.timer (wątki kernela i przerwania poza rdzeniami VPP) jeszcze nie zainstalowane"; rc=0
     fi
     local thpf=${VPP_THP_FILE:-/sys/kernel/mm/transparent_hugepage/enabled} thp
     if [[ -f $thpf ]]; then
@@ -9651,7 +9803,13 @@ do_set_workers() {
   run_stage 09 "Konfiguracja VPP + automatyczny restart" st_vpp_config
   run_stage 15 "NetFlow/IPFIX (flowprobe)" st_netflow
   ok "zapisano: $VPP_WORKERS workerów ($WORKERS_CSV), izolacja $ISOL_CSV — GRUB i /etc/vpp/startup.conf zaktualizowane"
-  warn "RESTART SERWERA wymagany (isolcpus); do tego czasu VPP pracuje na starym układzie rdzeni. Restart: systemctl reboot"
+  if grep -qE "isolcpus=managed_irq,domain,$ISOL_CSV( |$)" /proc/cmdline 2>/dev/null && grep -qE "nohz_full=$NOHZ_CSV( |$)" /proc/cmdline 2>/dev/null \
+     && [[ $(awk '/HugePages_Total/ {print $2}' /proc/meminfo 2>/dev/null) == "$HUGEPAGES_2M" ]]; then
+    # rdzenie i hugepages bez zmian: nowy startup.conf (deskryptory, bufory, NetFlow) wymaga tylko restartu VPP
+    warn "zmienił się tylko startup.conf — VPP pracuje jeszcze na starej konfiguracji. W oknie serwisowym: systemctl restart vpp (przerwa w ruchu + ponowne sesje BGP)"
+  else
+    warn "RESTART SERWERA wymagany (isolcpus/hugepages); do tego czasu VPP pracuje na starym układzie rdzeni. Restart: systemctl reboot"
+  fi
   if ((REBOOT_AFTER)); then
     printf '\n%sRestart serwera za 15 s (Ctrl+C przerywa)...%s\n' "$c_warn" "$c_off"
     sleep 15
@@ -10302,11 +10460,41 @@ ExecStart=/opt/router/bin/router-kthreads
 [Install]
 WantedBy=multi-user.target
 EOF
+  # co 5 min: nowe urządzenie (USB, wirtualne media iDRAC), nowy wątek (vhost nowego TAP-a), ręczna zmiana maski —
+  # przepięcie i %SYS-4-ISOL_FIX w logu; gdy czysto, nic nie robi
+  put_file /etc/systemd/system/router-kthreads-check.service "co 5 min: wątki kernela i przerwania poza rdzeniami VPP" <<'EOF'
+[Unit]
+Description=Router: kontrola wątków kernela i przerwań na rdzeniach VPP
+Documentation=file:/opt/router/README.md
+After=router-kthreads.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/router/bin/router-kthreads --quiet
+EOF
+  put_file /etc/systemd/system/router-kthreads-check.timer "co 5 minut: kontrola izolacji rdzeni VPP" <<'EOF'
+[Unit]
+Description=Router: co 5 minut kontrola wątków kernela i przerwań na rdzeniach VPP
+Documentation=file:/opt/router/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+  # licznik SMI (MSR 0x34, Intel) dla router-monitor i --check: przerwania BIOS-u niewidoczne dla kernela
+  echo msr | put_file /etc/modules-load.d/router-msr.conf "moduł msr: odczyt licznika SMI (MSR_SMI_COUNT) na rdzeniach VPP"
+  modprobe msr 2>/dev/null || true
   systemctl daemon-reload
   systemctl enable --now router-kthreads.service >/dev/null 2>&1 || warn "router-kthreads.service nie wystartował — journalctl -u router-kthreads"
-  man_add service router-kthreads.service "przy starcie: kcompactd/kswapd poza rdzeniami VPP"
-  if /opt/router/bin/router-kthreads -n >/dev/null 2>&1; then ok "wątki kernela poza rdzeniami VPP"
-  else warn "część wątków kernela nadal ma dostęp do rdzeni VPP — sprawdź: router-kthreads -n"; fi
+  systemctl enable --now router-kthreads-check.timer >/dev/null 2>&1 || warn "nie włączono router-kthreads-check.timer"
+  man_add service router-kthreads.service "przy starcie: kcompactd/kswapd i przerwania poza rdzeniami VPP"
+  man_add service router-kthreads-check.timer "co 5 min: wątki kernela i przerwania na rdzeniach VPP → %SYS-4-ISOL_FIX"
+  if /opt/router/bin/router-kthreads -n >/dev/null 2>&1; then ok "wątki kernela i przerwania poza rdzeniami VPP"
+  else warn "część wątków kernela/przerwań nadal ma dostęp do rdzeni VPP — sprawdź: router-kthreads -n"; fi
   put_file /etc/systemd/system.conf.d/90-router-cpu.conf "systemd: wszystkie usługi na rdzeniach systemowych" <<EOF
 # install-router.sh: BIRD, snmpd, Routinator, sshd, monitoring… tylko na rdzeniach systemowych ($HK_CSV);
 # rdzenie VPP ($ISOL_CSV) zostają dla VPP (vpp.service.d/05-cpu.conf)
@@ -12679,6 +12867,8 @@ RXMISS_PPS=1
 # WK_GRACE = sekundy po starcie VPP bez tego alarmu (start workerów to zawsze 2 wywłaszczenia na rdzeń)
 WK_PREEMPT=1
 WK_GRACE=120
+# SMI (przerwania BIOS-u, MSR 0x34) na rdzeniach workerów na sekundę; 0 = wyłącz
+SMI_PER_S=1
 # pakiety/s odrzucone sprzętowo przez kartę (liczniki *discard*)
 NIC_DISCARD_PPS=1
 # pakiety/s do samego routera (control plane)
@@ -13963,7 +14153,7 @@ Zasada działania:
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
 - **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
-- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych, a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT` w router-monitor.
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
 
 ---
 
@@ -14021,7 +14211,7 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/opt/router/bin/smartd-alert` | alarm z smartd (zdrowie dysków) |
 | `/opt/router/bin/router-fw` | firewall tranzytu VPP (`router-fw check / diff / apply / block / counters`), konfiguracja `/etc/router/firewall.conf` |
 | `/opt/router/bin/router-top` | podgląd na żywo: obciążenie VPP, interfejsy (Gb/s, pkt/s), liczniki ACL, guard (rozdział 10d) |
-| `/opt/router/bin/router-kthreads` | wątki kernela (kcompactd, kswapd) poza rdzeniami VPP (`router-kthreads -n` = podgląd); przy starcie przez `router-kthreads.service` |
+| `/opt/router/bin/router-kthreads` | wątki kernela (kcompactd, kswapd) i przerwania poza rdzeniami VPP (`router-kthreads -n` = podgląd); przy starcie przez `router-kthreads.service`, co 5 min przez `router-kthreads-check.timer` |
 | `/opt/router/bin/router-guard` | ochrona przed odbiciami SYN-ACK/RST/UDP w VPP (`router-guard on / off / status / enforce`), konfiguracja `/etc/router/synack-guard.conf` |
 | `/opt/router/bin/router-fw-update` | ręczna aktualizacja firmware karty (`router-fw-update`) |
 | `/opt/router/bin/router-ifaces` | interfejsy z `ifaces.conf` (`router-ifaces`, rozdział 10) |
@@ -14046,7 +14236,9 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/etc/smartd.conf` | `-M exec /opt/router/bin/smartd-alert` |
 | `/etc/sysctl.d/83-router-panic.conf` | restart po kernel panic / oops / zawieszeniu kernela |
 | `/etc/sysctl.d/85-router-isolation.conf` | watchdog na rdzeniach systemowych, `numa_balancing` i `compaction_proactiveness` wyłączone |
-| `/etc/systemd/system/router-kthreads.service` | przy starcie: `router-kthreads` — kcompactd/kswapd poza rdzeniami VPP |
+| `/etc/systemd/system/router-kthreads.service` | przy starcie: `router-kthreads` — kcompactd/kswapd i przerwania poza rdzeniami VPP |
+| `/etc/systemd/system/router-kthreads-check.timer` | co 5 min: to samo dla nowych wątków/urządzeń (`%SYS-4-ISOL_FIX`) |
+| `/etc/modules-load.d/router-msr.conf` | moduł `msr`: licznik SMI (MSR 0x34) dla router-monitor i `--check` |
 | `/etc/systemd/system.conf.d/90-router-watchdog.conf` | watchdog sprzętowy (restart przy całkowitym zawieszeniu) |
 | `/etc/tmpfiles.d/router-cpu.conf` | governor `performance`, turbo, transparent hugepages `madvise` |
 | `/var/lib/router/` | znaczniki czystego wyłączenia (wykrywanie awarii), stan `router-ifaces` (`ifaces.state.json`, `ifaces.last-good.conf`) |
@@ -14106,6 +14298,7 @@ Workery VPP zawsze pokazują 100% CPU, bo bez przerwy odpytują kartę. Dlatego 
 | rx-miss + rx-no-buf | liczniki interfejsów VPP | Pakiety, które karta odebrała, ale VPP nie zdążył ich zabrać (albo zabrakło buforów). **To jest realna utrata ruchu** — odpowiednik dropów QFP. |
 | Odrzucenia sprzętowe karty | liczniki `*discard*` karty (segment statystyk VPP) co 10 s | Karta odrzuca pakiety sama (bufor PHY/priorytetu, PCIe). `rx_out_of_buffer` tu nie wchodzi — to ten sam licznik co rx-miss. |
 | Wywłaszczenia workerów | `nr_involuntary_switches` wątków `vpp_wk_*` w `/proc` | Worker VPP nigdy sam nie oddaje CPU; każde wywłaszczenie = coś poza VPP na jego rdzeniu (np. `kcompactd`), kolejka RX stoi. |
+| SMI na rdzeniach workerów | `MSR_SMI_COUNT` (0x34) przez `/dev/cpu/N/msr` | Przerwania BIOS-u zatrzymują rdzeń poza kontrolą kernela — jedyny ślad to ten licznik. Brak na AMD/VM = pomijane. |
 | Punt | licznik `/if/punt` | Ruch kierowany do samego routera (BGP, SSH, ICMP). Duża wartość = atak na control plane. |
 | Rdzenie systemowe | `/proc/stat` (rdzenie poza VPP) | Zajętość rdzeni BIRD/SNMP/systemu, np. przy przeliczaniu pełnej tablicy BGP. |
 | Heartbeat VPP | `/sys/heartbeat` | Czy VPP żyje. Brak przez @@HANG@@ s = zawieszenie. |
@@ -14120,9 +14313,11 @@ Format jak w syslogu Cisco: `%OBSZAR-POZIOM-ZDARZENIE: opis`. Poziom: 1 = alarm 
 | `%VPP-4-LOAD_HIGH` | wektor workera ≥ `VEC_WARN` | obserwować; przy częstych wystąpieniach rozważyć więcej workerów |
 | `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (NetFlow/FastNetMon), ewentualnie blackhole |
 | `%VPP-5-LOAD_NORMAL` | koniec przeciążenia, z czasem trwania i szczytem | — |
-| `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: zidentyfikować cel ataku, RTBH/Flowspec u upstreamu |
+| `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: przy dużym ruchu — zidentyfikować cel ataku, RTBH/Flowspec u upstreamu. Pojedyncze sekundy z kilkuset pakietami przy małym ruchu, bez `LOAD_HIGH` i bez `WK_PREEMPT` = burst jednego przepływu na jednej kolejce RSS (pierścień `VPP_RX_DESC`; 32768 to maksimum ConnectX-4) |
 | `%VPP-3-NIC_DISCARD` | karta odrzuca pakiety sprzętowo (`*discard*`) | bufor PHY/priorytetu karty, PCIe; przy stałym występowaniu — ConnectX-5 |
 | `%VPP-3-WK_PREEMPT` | worker VPP wywłaszczony z izolowanego rdzenia (w opisie: który worker, cpu, co na nim siedzi) | `router-kthreads -n` i `router-kthreads`; jeśli to proces użytkownika — `ps -eLo psr,comm` i jego `CPUAffinity` |
+| `%SYS-3-SMI` | przerwania BIOS-u (SMI) na rdzeniach workerów — rdzeń stoi poza kontrolą kernela, bez śladu w `/proc/interrupts` | BIOS: System Profile = Performance, Memory Patrol/Demand Scrub = Disabled, USB legacy = Off; iDRAC/BMC bez cyklicznych odpytań |
+| `%SYS-4-ISOL_FIX` | `router-kthreads-check.timer` (co 5 min) przepiął nowy wątek kernela albo przerwanie z rdzenia VPP | informacyjne — w opisie co i skąd; jeśli się powtarza, znaleźć, kto to ustawia |
 | `%VPP-4-PUNT_HIGH` | dużo ruchu do adresów routera | sprawdzić ACL i policer na control plane |
 | `%VPP-2-DOWN` / `%VPP-5-UP` | brak dostępu do statystyk VPP / powrót | zwykle restart VPP; patrz `journalctl -u vpp` |
 | `%VPP-1-HANG` | VPP żyje, ale nie odpowiada | monitor sam zrestartuje VPP (`HANG_RESTART=1`) |
@@ -14198,7 +14393,7 @@ Zmiany działają w ciągu 5 sekund (bez restartu). Test: `router-notify test`. 
 | `DISKS` | `%SMART-…` (zdrowie dysków) |
 | `NIC_FW` | `%SYS-5-NIC_FW_UPDATED`, `%SYS-3-NIC_FW_FAIL` |
 | `VPP_STATE` | `%VPP-2-DOWN`, `%VPP-5-UP`, `%VPP-1-HANG` |
-| `VPP_DROPS` | `%VPP-2-RX_MISS`, `%VPP-3-NIC_DISCARD`, `%VPP-3-WK_PREEMPT` |
+| `VPP_DROPS` | `%VPP-2-RX_MISS`, `%VPP-3-NIC_DISCARD`, `%VPP-3-WK_PREEMPT`, `%SYS-3-SMI`, `%SYS-4-ISOL_FIX` |
 | `VPP_LOAD` | `%VPP-4-LOAD_HIGH`, `%VPP-2-LOAD_CRITICAL` |
 | `VPP_PUNT` | `%VPP-4-PUNT_HIGH` |
 | `SYS_CPU` | `%SYS-4-CPU_HIGH` |
