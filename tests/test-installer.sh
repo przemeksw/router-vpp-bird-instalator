@@ -11,7 +11,15 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.35"                     '^SCRIPT_VERSION="1\.5\.35"' 1
+chk "wersja skryptu 1.5.36"                     '^SCRIPT_VERSION="1\.5\.36"' 1
+chk "kernel: parametry przeciw zakłóceniom"      '^KERNEL_JITTER_PARAMS="rcupdate\.rcu_normal_after_boot=1 iommu=pt skew_tick=1"$' 1
+chk "kernel: tsc=reliable tylko przy stabilnym TSC" 'EXTRA_CMDLINE\+=\(tsc=reliable\)' 1
+chk "upgrade/--check/set_workers sprawdzają parametry kernela" 'kernel_params_ok' 6
+chk "jeden procesor: co najmniej 2 rdzenie dla systemu" 'HK_RES=\$\(\( \(\$\{#PHYS\[@\]\} \+ 7\) / 8 \)\); \(\(HK_RES < 2\)\) && HK_RES=2' 1
+chk "rdzeń główny i workery po rdzeniach systemowych" 'MAIN_CORE=\$\{PHYS\[HK_RES\]\}' 1
+chk "pierścień RX dopasowany do buforów" 'while \(\( BUFFERS > 0 && \$\(rings_need\) > BUFFERS' 1
+chk "zmniejszony pierścień nie jest rozjazdem przy upgrade" 'INST_RX_DESC_CAP' 3
+chk "BIRD: priorytet na rdzeniach systemowych" '15-priority.conf' 2
 chk "router-monitor: zajętość workerów z pętli (IdleLoops)" '^class IdleLoops:' 1
 chk "router-top: kolumna zajętości i pasek %"  '^def busy_pct\(loops, base\):' 1
 chk "luz uczony, nie wpisany na sztywno (router-monitor i router-top)" '^IDLE_VEC = 1\.1$' 2
@@ -236,7 +244,7 @@ chk "upgrade_script uzupełnia izolację"       '^if \[\[ \$MODE == upgrade \]\]
 chk "set_workers nie wymaga internetu"        '^\[\[ \$MODE == workers \]\] \|\| timeout 10 getent' 1
 chk "bufory liczone funkcją calc_buffers"      '^calc_buffers\(\) \{' 1
 chk "bufory VPP z liczby workerów i portów"   'BUFFERS=\$\(calc_buffers "\$\{#NIC_PCI\[@\]\}" "\$VPP_WORKERS"' 1
-chk "plan set_workers pokazuje bufory"        'bufory .*\$BUFFERS' 4
+chk "plan set_workers pokazuje bufory"        'bufory .*\$BUFFERS' 5
 # calc_buffers: test funkcjonalny (czysta arytmetyka, wyciągnięta z instalatora)
 cb=$(sed -n '/^calc_buffers() {/,/^}/p' install-router.sh)
 if [[ -n $cb ]]; then
@@ -303,7 +311,7 @@ else
   fail=$((fail+1)); echo "BŁĄD  brak list_mlx5_ports/choose_nic do testu"
 fi
 # set_workers: rozpoznanie zmian w startup.conf (rdzenie, bufory, sterta, porty), nie tylko rdzeni
-vd=$(sed -n '/^vpp_conf_diff() {/,/^}/p' install-router.sh)
+vd=$(sed -n '/^KERNEL_JITTER_PARAMS=/p; /^kernel_params_ok() {/,/^}/p; /^vpp_conf_diff() {/,/^}/p' install-router.sh)
 if [[ -n $vd ]]; then
   vdc=$(mktemp)
   cat >"$vdc" <<'EOC'
@@ -335,9 +343,13 @@ EOC
   vdg=$(mktemp); echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=3,5,7,9 rcu_nocbs=3,5,7,9 panic=10"' >"$vdg"
   got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
   if [[ $got == *"izolacja rdzeni"*"rc=0"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff stara izolacja: jest '$got'"; fi
-  echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,3,5,7,9 nohz_full=5,7,9 rcu_nocbs=3,5,7,9 irqaffinity=0-2 panic=10"' >"$vdg"
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,3,5,7,9 nohz_full=5,7,9 rcu_nocbs=3,5,7,9 irqaffinity=0-2 panic=10 rcupdate.rcu_normal_after_boot=1 iommu=pt skew_tick=1"' >"$vdg"
   got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
   if [[ $got == "rc=1 " ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff nowa izolacja: jest '$got'"; fi
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,3,5,7,9 nohz_full=5,7,9 rcu_nocbs=3,5,7,9 irqaffinity=0-2 panic=10"' >"$vdg.old"
+  got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg.old WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff; echo "rc=$?" ) | tr '\n' ' ' )
+  if [[ $got == *"parametry kernela"*"iommu=pt"*"rc=0"* && $got != *"izolacja rdzeni"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff brak parametrów kernela: jest '$got'"; fi
+  rm -f "$vdg.old"
   cm=$(eval "$(sed -n '/^cpu_mask() {/,/^}/p' install-router.sh)"; cpu_mask 0 1 40)
   if [[ $cm == "00000100,00000003" ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  cpu_mask: jest '$cm'"; fi
   got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=/nonexistent WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )

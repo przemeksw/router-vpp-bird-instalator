@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.35"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.36"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -194,6 +194,20 @@ if [[ $LOOP0_ADDR == "10.10.10.10/32" ]]; then
   if [[ $_l == - ]]; then LOOP0_ADDR=""; elif [[ -n $_l ]]; then LOOP0_ADDR=$_l; fi
   unset _l
 fi
+
+# Parametry kernela przeciw zakłóceniom rdzeni workerów (jak profil tuned "cpu-partitioning", standard dla DPDK):
+#   rcupdate.rcu_normal_after_boot=1  bez przyspieszonego RCU: synchronize_rcu_expedited() (netlink, usuwanie
+#                                     interfejsów) wysyła IPI do KAŻDEGO rdzenia, także izolowanego (~1 CAL/s)
+#   iommu=pt                          DMA karty bez tłumaczenia adresów przez IOMMU (brak chybień IOTLB przy 100G);
+#                                     urządzenia w VM/vfio nadal izolowane, reszta systemu jak bez IOMMU
+#   skew_tick=1                       tiki zegara rdzeni rozsunięte w czasie — bez rywalizacji o blokady jiffies
+# tsc=reliable dokładane osobno, tylko gdy wszystkie CPU mają constant_tsc i nonstop_tsc (bez watchdoga
+# zegara, który odwiedza po kolei wszystkie rdzenie).
+KERNEL_JITTER_PARAMS="rcupdate.rcu_normal_after_boot=1 iommu=pt skew_tick=1"
+kernel_params_ok() {   # kernel_params_ok PLIK_GRUB — czy GRUB ma już wszystkie parametry przeciw zakłóceniom
+  local p
+  for p in $KERNEL_JITTER_PARAMS; do grep -q -- "$p" "$1" 2>/dev/null || return 1; done
+}
 
 valid_ip4_32() {   # a.b.c.d/32 — adres loop0: IPv4 hosta z maską /32, nie 0.0.0.0, nie 127/8, nie multicast
   local ip=${1%/32} o
@@ -8995,6 +9009,8 @@ do_check() {
   if grep -q isolcpus /proc/cmdline; then ok "cmdline: $(grep -o 'isolcpus=[^ ]*' /proc/cmdline)"; else warn "brak isolcpus w /proc/cmdline — zrób restart"; fi
   if grep -q 'nohz_full=' /proc/cmdline; then ok "bez tiku zegara: $(cat /sys/devices/system/cpu/nohz_full 2>/dev/null)"
   else warn "brak nohz_full — workery VPP dostają tik zegara (install-router set_workers, potem restart serwera)"; fi
+  if kernel_params_ok /proc/cmdline; then ok "kernel bez IPI RCU, IOMMU w trybie pass-through ($KERNEL_JITTER_PARAMS)"
+  else warn "brak części parametrów kernela ($KERNEL_JITTER_PARAMS) — install-router upgrade_script, potem restart serwera"; fi
   if grep -q 'managed_irq' /proc/cmdline; then ok "przerwania sterowników poza rdzeniami VPP (managed_irq, irqaffinity)"
   else warn "brak isolcpus=managed_irq — przerwania sterowników mogą trafiać na rdzenie VPP"; fi
   if [[ $(sysctl -n kernel.numa_balancing 2>/dev/null) == 0 ]]; then ok "numa_balancing wyłączony"
@@ -9998,7 +10014,7 @@ upgrade_remove_hsflowd() {   # sFlow/hsflowd zastąpione przez flowprobe (NetFlo
 }
 
 upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (działa po restarcie serwera; restart VPP tylko jeśli desc/bufory/NetFlow też się zmieniły)
-  local g=/etc/default/grub.d/90-vpp.cfg thp cur_rx cur_tx netflow_ok=0
+  local g=/etc/default/grub.d/90-vpp.cfg thp cur_rx cur_tx netflow_ok=0 want_rx=$VPP_RX_DESC cap_rx
   ((DRY_RUN)) && return 0
   [[ -f $g && -x /opt/router/install-router.sh ]] || return 0
   upgrade_remove_hsflowd
@@ -10008,6 +10024,9 @@ upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (
   # $VPP_TX_DESC są dostępne od razu, niezależnie od MODE; bez tego podbicie samych deskryptorów (bez zmiany
   # numa_balancing/THP) nigdy nie wywołałoby set_workers, mimo że startup.conf jest nieaktualny
   cur_rx=$(grep -oE 'num-rx-desc [0-9]+' /etc/vpp/startup.conf 2>/dev/null | head -n1 | awk '{print $2}')
+  # pierścień zmniejszony przy instalacji, bo nie mieścił się w RAM (INST_RX_DESC_CAP) — to nie jest rozjazd
+  cap_rx=$(sed -n 's/^INST_RX_DESC_CAP=\([0-9]*\)$/\1/p' /etc/router/router.env 2>/dev/null)
+  [[ -n $cap_rx ]] && ((cap_rx < want_rx)) && want_rx=$cap_rx
   cur_tx=$(grep -oE 'num-tx-desc [0-9]+' /etc/vpp/startup.conf 2>/dev/null | head -n1 | awk '{print $2}')
   if [[ $NETFLOW_ENABLE == yes ]]; then
     grep -qxF "flowprobe params record l2 l3 l4 active $NETFLOW_ACTIVE_TIMER passive $NETFLOW_PASSIVE_TIMER" \
@@ -10024,8 +10043,10 @@ upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (
     && [[ $(sysctl -n kernel.numa_balancing 2>/dev/null) == 0 ]] \
     && [[ $(sysctl -n vm.compaction_proactiveness 2>/dev/null) == 0 ]] \
     && [[ -f /etc/systemd/system/router-kthreads.service && -f /etc/systemd/system/router-kthreads-check.timer && -x /opt/router/bin/router-kthreads ]] \
+    && compgen -G "/etc/systemd/system/bird*.service.d/15-priority.conf" >/dev/null \
     && [[ $thp == madvise || $thp == never ]] \
-    && [[ -z $cur_rx || $cur_rx == "$VPP_RX_DESC" ]] && [[ -z $cur_tx || $cur_tx == "$VPP_TX_DESC" ]] \
+    && [[ -z $cur_rx || $cur_rx == "$want_rx" ]] && [[ -z $cur_tx || $cur_tx == "$VPP_TX_DESC" ]] \
+    && kernel_params_ok "$g" \
     && ((netflow_ok)) && return 0
   say "izolacja rdzeni / wątki kernela / deskryptory / NetFlow VPP w starym układzie — uzupełniam (ta sama liczba workerów)"
   /opt/router/install-router.sh set_workers || warn "nie udało się uzupełnić — uruchom: install-router set_workers"
@@ -10063,6 +10084,9 @@ vpp_conf_diff() {   # vpp_conf_diff [vpp] — "vpp": tylko startup.conf i hugepa
   if [[ ${1:-} != vpp && -n ${NOHZ_CSV:-} ]] && ! { grep -q "managed_irq" "$g" && grep -q "nohz_full=$NOHZ_CSV " "$g" && grep -q "irqaffinity=$HK_CSV " "$g"; } 2>/dev/null; then
     echo "  zmiana: izolacja rdzeni (isolcpus managed_irq, nohz_full=$NOHZ_CSV, irqaffinity=$HK_CSV)"; rc=0
   fi
+  if [[ ${1:-} != vpp && -n ${NOHZ_CSV:-} ]] && ! kernel_params_ok "$g"; then
+    echo "  zmiana: parametry kernela przeciw zakłóceniom workerów ($KERNEL_JITTER_PARAMS)"; rc=0
+  fi
   if [[ ${1:-} != vpp ]]; then
     local nb=${VPP_NUMA_BALANCING-$(sysctl -n kernel.numa_balancing 2>/dev/null)}
     [[ -z $nb || $nb == 0 ]] || { echo "  zmiana: kernel.numa_balancing → 0 (bez blokowania workerów VPP w tle)"; rc=0; }
@@ -10089,7 +10113,7 @@ workers_plan() {
   printf '  obecnie (startup.conf):    %s\n' "${cur:-brak}"
   printf '  po zmianie:                %d workerów na rdzeniach %s (rdzeń główny VPP: %s)\n' "$VPP_WORKERS" "$WORKERS_CSV" "$MAIN_CORE"
   printf '  izolowane rdzenie:         %s\n' "$ISOL_CSV"
-  printf '  maksimum na węźle %s:      %d (rdzenie fizyczne bez systemowego i głównego VPP)\n' "$NUMA" "$avail_w"
+  printf '  maksimum na węźle %s:      %d (rdzenie fizyczne bez %d systemowych i głównego VPP)\n' "$NUMA" "$avail_w" "$HK_RES"
   printf '  zalecane dla %s:   %d\n' "$NIC_MODEL" "$NIC_CAP"
   printf '  porty VPP (%d): %s — bufory i kolejki RX liczone dla każdego; inny port: install-router set_workers N --choose-nic\n' \
     "${#NIC_PCI[@]}" "${NIC_PCI[*]}"
@@ -10117,7 +10141,8 @@ do_set_workers() {
     FROM_STAGE=6
     run_stage 06 "Izolacja rdzeni, taktowanie, panic (GRUB)" st_isolation
     ok "izolacja rdzeni zapisana (VPP bez restartu): $(isol_cmdline)"
-    if grep -qE "isolcpus=managed_irq,domain,$ISOL_CSV( |$)" /proc/cmdline 2>/dev/null && grep -qE "nohz_full=$NOHZ_CSV( |$)" /proc/cmdline 2>/dev/null; then
+    if grep -qE "isolcpus=managed_irq,domain,$ISOL_CSV( |$)" /proc/cmdline 2>/dev/null && grep -qE "nohz_full=$NOHZ_CSV( |$)" /proc/cmdline 2>/dev/null \
+       && kernel_params_ok /proc/cmdline; then
       ok "działający kernel ma już tę izolację — sysctl i router-kthreads działają od razu, restart serwera niepotrzebny"
     else
       warn "nowa izolacja działa po RESTARCIE SERWERA — zrób go w oknie serwisowym: systemctl reboot"
@@ -10131,7 +10156,7 @@ do_set_workers() {
   run_stage 15 "NetFlow/IPFIX (flowprobe)" st_netflow
   ok "zapisano: $VPP_WORKERS workerów ($WORKERS_CSV), izolacja $ISOL_CSV — GRUB i /etc/vpp/startup.conf zaktualizowane"
   if grep -qE "isolcpus=managed_irq,domain,$ISOL_CSV( |$)" /proc/cmdline 2>/dev/null && grep -qE "nohz_full=$NOHZ_CSV( |$)" /proc/cmdline 2>/dev/null \
-     && [[ $(awk '/HugePages_Total/ {print $2}' /proc/meminfo 2>/dev/null) == "$HUGEPAGES_2M" ]]; then
+     && kernel_params_ok /proc/cmdline && [[ $(awk '/HugePages_Total/ {print $2}' /proc/meminfo 2>/dev/null) == "$HUGEPAGES_2M" ]]; then
     # rdzenie i hugepages bez zmian: nowy startup.conf (deskryptory, bufory, NetFlow) wymaga tylko restartu VPP
     warn "zmienił się tylko startup.conf — VPP pracuje jeszcze na starej konfiguracji. W oknie serwisowym: systemctl restart vpp (przerwa w ruchu + ponowne sesje BGP)"
   else
@@ -10417,6 +10442,18 @@ for p in "${NIC_PCI[@]}"; do
     audit OK "PCIe $p" "${sta_s:-?}/s ${sta_w:-?}" ""
   fi
 done
+# Dwa porty na jednej karcie dzielą jedno złącze PCIe: Gen3 x16 ≈ 100 Gb/s, Gen4 x16 ≈ 200 Gb/s na kierunek.
+if ((${#NIC_PCI[@]} > 1)); then
+  sp=0; for p in "${NIC_PCI[@]}"; do d=$(netdev_of "$p"); s1=$(cat "/sys/class/net/$d/speed" 2>/dev/null || echo 0); ((s1 > 0)) && sp=$((sp + s1)); done
+  gt=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta: Speed [0-9.]*GT/s' | grep -o '[0-9.]*' | head -n1)
+  w=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta:.*Width x[0-9]*' | grep -o '[0-9]*$' | head -n1)
+  case ${gt:-0} in 2.5) per=2 ;; 5) per=4 ;; 8) per=8 ;; 16) per=16 ;; 32) per=32 ;; *) per=0 ;; esac
+  bus=$(( per * ${w:-0} * 98 / 100 ))           # Gb/s użytkowe na kierunek (kodowanie 128b/130b), bez narzutu TLP
+  if ((bus > 0 && sp / 1000 > bus)); then
+    audit INFO "Przepustowość PCIe" "porty razem $((sp / 1000)) Gb/s, złącze ~${bus} Gb/s na kierunek (${gt} GT/s x${w})" \
+      "przy pełnym obciążeniu obu portów limitem jest złącze, nie CPU — na 2×100G pełną prędkość daje PCIe Gen4 (ConnectX-6) albo dwie karty"
+  fi
+fi
 if [[ $NIC_PSID == DEL* ]]; then
   audit WARN "Firmware" "${NIC_FW:-?} (karta z firmware Della)" "aktualizacja tylko pakietem Della"
   rec 2 "dell.com/support" "Zaktualizuj firmware karty pakietem Della dla PSID $NIC_PSID" "narzędzie NVIDIA mlxup nie obsługuje kart z PSID Della"
@@ -10477,8 +10514,14 @@ audit INFO "Watchdog sprzętowy" "${wd:-jeszcze nieaktywny}" "skrypt załaduje s
 
 # ------------------------------------------------------------- dobór parametrów VPP
 sect "Dobór parametrów VPP"
-avail_w=$(( ${#PHYS[@]} - 2 ))   # 1 rdzeń dla systemu na węźle karty + 1 rdzeń główny VPP
-((avail_w >= 1)) || die "Węzeł NUMA $NUMA ma za mało rdzeni fizycznych (${#PHYS[@]})"
+# Rdzenie systemowe na węźle karty (kernel, przerwania, BIRD, SNMP, Routinator). Przy 2+ węzłach NUMA wystarczy
+# jeden — cały drugi procesor i tak zostaje dla systemu. Przy jednym węźle (serwer jednoprocesorowy) jeden rdzeń
+# to za mało: przeliczanie pełnej tablicy BGP zajmuje go w 100% i grozi zerwaniem sesji (hold timer). Wtedy
+# zostawiamy co najmniej 2 rdzenie, a przy większych procesorach 1/8 rdzeni fizycznych.
+if ((NUMA_NODES > 1)); then HK_RES=1; else HK_RES=$(( (${#PHYS[@]} + 7) / 8 )); ((HK_RES < 2)) && HK_RES=2; fi
+avail_w=$(( ${#PHYS[@]} - HK_RES - 1 ))   # rdzenie systemowe na węźle karty + 1 rdzeń główny VPP
+((avail_w >= 1)) || die "Węzeł NUMA $NUMA ma za mało rdzeni fizycznych (${#PHYS[@]}; system potrzebuje $HK_RES, VPP co najmniej 2)"
+((NUMA_NODES > 1)) || audit AUTO "Rdzenie systemowe" "jeden węzeł NUMA, ${#PHYS[@]} rdzeni" "$HK_RES dla systemu (BIRD, SNMP, kernel), reszta dla VPP"
 if [[ $VPP_WORKERS == auto ]]; then
   VPP_WORKERS=$(( NIC_CAP < avail_w ? NIC_CAP : avail_w ))
   audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w" "$VPP_WORKERS (powyżej $NIC_CAP karta i tak nie nadąży)"
@@ -10486,8 +10529,8 @@ else
   ((VPP_WORKERS <= avail_w)) || die "VPP_WORKERS=$VPP_WORKERS, a na węźle $NUMA jest tylko $avail_w wolnych rdzeni"
   audit OK "Workery VPP" "$VPP_WORKERS (ustawione ręcznie)" ""
 fi
-MAIN_CORE=${PHYS[1]}
-WORKERS=("${PHYS[@]:2:VPP_WORKERS}")
+MAIN_CORE=${PHYS[HK_RES]}
+WORKERS=("${PHYS[@]:HK_RES+1:VPP_WORKERS}")
 WORKERS_CSV=$(join_by , "${WORKERS[@]}")
 ISOL=("$MAIN_CORE" "${WORKERS[@]}")
 NOHZ=("${WORKERS[@]}")              # bez tiku zegara: tylko workery (pętla odpytywania karty); main-core śpi i budzi się
@@ -10524,9 +10567,30 @@ elif ((BUFFERS > BUF_MAX)); then
   warn "bufory $BUFFERS nie mieszczą się w hugepages węzła ($BUF_MAX) — ograniczam do $BUF_MAX (więcej RAM albo HUGEPAGES_2M)"
   BUFFERS=$BUF_MAX
 fi
+# Pierścienie RX/TX muszą się mieścić w buforach z zapasem (2×: pakiety w drodze, punt, kolejki TX). Przy małej
+# ilości RAM pierścień 32768 na 12+ kolejkach zjadłby całą pulę — VPP nie wystartuje albo stale gubi (rx-no-buf).
+# Wtedy zmniejszamy num-rx-desc o połowę, aż się zmieści (najmniej 1024); efektywną wartość zapamiętuje router.env.
+rings_need() { echo $(( ${#NIC_PCI[@]} * VPP_WORKERS * (VPP_RX_DESC + VPP_TX_DESC) * 2 + (VPP_WORKERS + 1) * 2048 )); }
+rx_want=$VPP_RX_DESC
+while (( BUFFERS > 0 && $(rings_need) > BUFFERS && VPP_RX_DESC > 1024 )); do VPP_RX_DESC=$(( VPP_RX_DESC / 2 )); done
+if ((VPP_RX_DESC < rx_want)); then
+  audit AUTO "Pierścień RX" "bufory $BUFFERS nie pokrywają $rx_want deskryptorów na kolejkę" \
+    "num-rx-desc $VPP_RX_DESC (mniejsza tolerancja na bursty pojedynczego przepływu; więcej RAM = większy pierścień)"
+fi
 audit AUTO "Pamięć VPP" "RAM $((MEM_MB / 1024)) GB" "hugepages $HUGEPAGES_2M × 2 MB, sterta $MAIN_HEAP, bufory $BUFFERS (tryb $VPP_BUFFERS, maksimum $BUF_MAX)"
 ((NODE_MEM_MB >= 16384)) || { audit WARN "Pamięć węzła karty" "$((NODE_MEM_MB / 1024)) GB" "mało na pełne tablice BGP"; rec 2 "sprzęt" "Dołóż RAM na procesorze karty (≥ 16 GB)" "VPP + pełne tablice BGP"; }
 EXTRA_CMDLINE+=("panic=$PANIC_REBOOT_SEC" "oops=panic")
+read -ra _kj <<<"$KERNEL_JITTER_PARAMS"; EXTRA_CMDLINE+=("${_kj[@]}")
+ncpu=$(grep -c '^processor' /proc/cpuinfo)
+if (( $(grep -c ' constant_tsc' /proc/cpuinfo) == ncpu && $(grep -c ' nonstop_tsc' /proc/cpuinfo) == ncpu )); then
+  EXTRA_CMDLINE+=(tsc=reliable)
+  audit AUTO "Zegar TSC" "stabilny na wszystkich $ncpu CPU" "tsc=reliable (bez watchdoga zegara na rdzeniach VPP)"
+else
+  audit INFO "Zegar TSC" "nie na wszystkich CPU constant_tsc/nonstop_tsc" "bez tsc=reliable — kernel pilnuje zegara sam"
+fi
+iommu_t=$(dmesg 2>/dev/null | sed -n 's/.*iommu: Default domain type: \([A-Za-z]*\).*/\1/p' | tail -n1)
+audit AUTO "IOMMU" "${iommu_t:-?}" "iommu=pt — DMA karty bez tłumaczenia adresów (działa po restarcie)"
+audit AUTO "Jitter kernela" "RCU, tiki zegara" "rcupdate.rcu_normal_after_boot=1 skew_tick=1 (bez IPI RCU na rdzeniach VPP)"
 audit AUTO "Kernel panic" "restart po panic" "panic=$PANIC_REBOOT_SEC oops=panic w linii kernela + sysctl kernel.panic"
 
 # ------------------------------------------------------------- raport audytu i zalecenia
@@ -10662,6 +10726,7 @@ INST_MAIN_HEAP=$MAIN_HEAP
 INST_EXTRA_CMDLINE="${EXTRA_CMDLINE[*]}"
 INST_ROUTER_ID=$ROUTER_ID
 INST_LOOP0_ADDR="${LOOP0_ADDR:--}"
+INST_RX_DESC_CAP=$( ((VPP_RX_DESC < rx_want)) && echo "$VPP_RX_DESC" )
 INST_NETFLOW_ENABLE=$NETFLOW_ENABLE
 SNMP_COMMUNITY=$SNMP_COMMUNITY
 EOF
@@ -10847,6 +10912,15 @@ EOF
 # install-router.sh: VPP sam przypina main-core $MAIN_CORE i workery $WORKERS_CSV; proces startuje na rdzeniach systemowych
 [Service]
 CPUAffinity=${HK_CSV//,/ } ${ISOL_CSV//,/ }
+EOF
+  # BIRD przed snmpd/monitoringiem na rdzeniach systemowych: przy przeliczaniu pełnej tablicy BGP keepalive'y
+  # muszą wyjść na czas (hold timer). Routinator ma już Nice=15; BIRD dostaje wyższy priorytet i wagę CPU.
+  local bu; bu=$(bird_unit)
+  put_file "/etc/systemd/system/$bu.service.d/15-priority.conf" "BIRD: pierwszeństwo na rdzeniach systemowych (keepalive BGP)" <<'EOF'
+[Service]
+Nice=-5
+CPUWeight=1000
+IOWeight=1000
 EOF
   systemctl daemon-reload
   local cfg
@@ -14497,7 +14571,7 @@ Zasada działania:
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
 - **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
-- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
 
 ---
 
