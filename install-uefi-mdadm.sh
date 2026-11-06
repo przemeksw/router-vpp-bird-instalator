@@ -88,6 +88,11 @@ fstype=$(lsblk -no FSTYPE "$ESP_DST")
 [[ $fstype == vfat ]] || die "$ESP_DST nie ma systemu plików FAT (jest: ${fstype:-brak}). Sformatuj: mkfs.vfat -F32 $ESP_DST"
 findmnt -rno TARGET "$ESP_DST" >/dev/null && die "$ESP_DST jest już zamontowana ($(findmnt -rno TARGET "$ESP_DST")) — odmontuj ją"
 PART_NO=$(cat "/sys/class/block/${ESP_DST##*/}/partition")
+# Nazwy /dev/sdX potrafią zamienić się miejscami między restartami (kolejność wykrywania dysków) — dlatego wpis
+# UEFI rozpoznajemy po identyfikatorze partycji GPT (PARTUUID, ten sam, który efibootmgr pokazuje w HD(...)),
+# a nie po nazwie dysku; w etykiecie jest początek PARTUUID zamiast "sda"/"sdb".
+DST_PUUID=$(lsblk -no PARTUUID "$ESP_DST" | tr 'A-F' 'a-f')
+SRC_PUUID=$(lsblk -no PARTUUID "$ESP_SRC" | tr 'A-F' 'a-f')
 
 # --- kopia ESP (wspólna dla instalacji i hooka apt)
 sync_esp() {
@@ -124,7 +129,7 @@ grep -qE 'resync|recovery' /proc/mdstat && warn "trwa synchronizacja RAID — to
 LOADER='\EFI\debian\shimx64.efi'
 [[ -f /boot/efi/EFI/debian/shimx64.efi ]] || LOADER='\EFI\debian\grubx64.efi'
 [[ -f /boot/efi/EFI/debian/${LOADER##*\\} ]] || die "brak /boot/efi/EFI/debian/${LOADER##*\\} — nietypowa instalacja, przerwano"
-LABEL="debian-${DISK##*/}"
+LABEL="debian-esp-${DST_PUUID:0:8}"
 
 cat <<EOF
 
@@ -151,8 +156,8 @@ ok "ESP skopiowana"
 command -v efibootmgr >/dev/null || run apt-get install -y efibootmgr
 if ((DRY)) && ! command -v efibootmgr >/dev/null; then
   say "[dry-run] efibootmgr nie jest zainstalowany — wpis UEFI zostałby dodany po instalacji"
-elif efibootmgr -v | grep -q "\* ${LABEL}[[:space:]]"; then
-  ok "wpis UEFI \"$LABEL\" już istnieje — bez zmian"
+elif [[ -n $DST_PUUID ]] && efibootmgr -v | tr 'A-F' 'a-f' | grep -q "gpt,${DST_PUUID},"; then
+  ok "wpis UEFI startujący z partycji EFI $ESP_DST (PARTUUID $DST_PUUID) już istnieje — bez zmian"
 else
   order=$(efibootmgr | sed -n 's/^BootOrder: //p')
   run efibootmgr -q -c -d "$DISK" -p "$PART_NO" -L "$LABEL" -l "$LOADER"
@@ -170,12 +175,14 @@ fi
 if ((HOOK_ON)); then
   run install -m 755 "$(readlink -f "$0")" "$SELF_DST"
   if ((DRY)); then
-    say "[dry-run] $HOOK: po każdym apt/dpkg: $SELF_DST --sync-only --quiet --disk $DISK"
+    say "[dry-run] $HOOK: po każdym apt/dpkg: $SELF_DST --sync-only --quiet (drugi dysk wykrywany za każdym razem)"
   else
     cat >"$HOOK" <<EOF
-// install-uefi-mdadm.sh: po każdej instalacji pakietów odśwież kopię partycji EFI na $DISK
-// (aktualizacja GRUB-a lub shim trafia na oba dyski). Usunięcie tego pliku wyłącza kopię.
-DPkg::Post-Invoke { "if [ -x $SELF_DST ]; then $SELF_DST --sync-only --quiet --disk $DISK || true; fi"; };
+// install-uefi-mdadm.sh: po każdej instalacji pakietów odśwież kopię partycji EFI na drugim dysku RAID
+// (aktualizacja GRUB-a lub shim trafia na oba dyski). Drugi dysk wykrywany za każdym razem z mdadm — bez
+// stałej nazwy /dev/sdX, która po restarcie może wskazywać dysk, z którego system wystartował.
+// Usunięcie tego pliku wyłącza kopię.
+DPkg::Post-Invoke { "if [ -x $SELF_DST ]; then $SELF_DST --sync-only --quiet || true; fi"; };
 EOF
     ok "automatyczna kopia ESP po apt: $HOOK"
   fi
@@ -183,9 +190,11 @@ fi
 
 printf '\n'
 ((DRY)) || efibootmgr -v | grep -i debian | sed 's/^/    /'
+dups=$( { efibootmgr -v 2>/dev/null || true; } | tr 'A-F' 'a-f' | { grep -oE 'gpt,[0-9a-f-]{36},' || true; } | sort | uniq -d | wc -l)
+((dups > 0)) && warn "kilka wpisów UEFI startuje z tej samej partycji EFI (zwykle po zamianie nazw sda/sdb) — działają, ale można zostawić po jednym: efibootmgr -v, potem efibootmgr -b XXXX -B dla zbędnych"
 cat <<EOF
 
 Gotowe. Sprawdzenie startu z drugiego dysku (w oknie serwisowym): w iDRAC / F11 (Boot Manager) wybierz
-"$LABEL" — albo odłącz pierwszy dysk i uruchom serwer. RAID zostanie zdegradowany ([U_]) do czasu
+"$LABEL" (partycja EFI $ESP_DST) — albo odłącz pierwszy dysk i uruchom serwer. RAID zostanie zdegradowany ([U_]) do czasu
 ponownego podłączenia dysku; odbudowa: mdadm --manage /dev/mdX --add /dev/sdX2 (odpowiednia partycja).
 EOF
