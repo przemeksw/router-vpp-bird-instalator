@@ -250,6 +250,7 @@ class TestMainLoop(unittest.TestCase):
             st = json.load(f)
         self.assertEqual(st["worker_busy"], [0.0, 50.0])             # worker 2: 2 M z 4 M pętli (mediana luzu)
         self.assertEqual(st["worker_busy_max"], 50.0)
+        self.assertEqual(st["alarms"], [])                         # bez zdarzeń: pusta lista aktywnych alarmów
 
 
 if __name__ == "__main__":

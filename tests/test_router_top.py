@@ -98,6 +98,45 @@ class TestIfacesScreen(unittest.TestCase):
         self.assertNotIn("skupienie", quiet)
         self.assertIn("Kolejki RX", top.header(5, False))
 
+    def test_alarms_screen(self):
+        st = self.root + "/state.json"
+        now = time.time()
+        with open(st, "w") as f:
+            json.dump({"time": now, "alarms": [{"fac": "VPP", "sev": 2, "mnem": "RX_MISS", "since": int(now) - 90,
+                                                 "text": "utrata pakietów na wejściu: hu0 342 pkt/s"}]}, f)
+        log = self.root + "/alarmy.log"
+        t = lambda sec: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - sec))  # noqa: E731
+        with open(log, "w") as f:
+            f.write("%s %%IFACE-4-DRIFT: VPP różni się od ifaces.conf\n" % t(3600))
+            f.write("%s %%IFACE-5-DRIFT_END: VPP znów zgodny\n" % t(3000))
+            f.write("%s %%IFACE-3-OPTICS: hu0 [ALARM] RX tor 2 -inf dBm\n" % t(600))
+            f.write("%s %%FW-5-BLOCK: blokada 1.2.3.4\n" % t(300))
+            f.write("%s %%RPKI-3-DOWN: walidator nie odpowiada\n" % t(200))
+            f.write("%s %%RPKI-5-UP: walidator wrócił\n" % t(100))
+            f.write("%s %%VPP-2-RX_MISS: stare, z logu\n" % t(90000))   # starsze niż doba: poza historią
+            f.write("śmieci bez formatu\n")
+        with mock.patch.object(top, "MON_STATE", st), mock.patch.object(top, "ALARM_LOG", log):
+            lines = top.screen_alarms(top.AlarmView().sample(), {}, 1.0)
+        text = "\n".join(x for x, _s in lines)
+        act = text.split("OSTATNIE ZDARZENIA")[0]
+        self.assertIn("VPP-RX_MISS", act)                       # z router-monitora (na żywo)
+        self.assertIn("1m 30s", act)
+        self.assertIn("IFACE-OPTICS", act)                      # z logu: otwarte, bez OPTICS_END
+        self.assertNotIn("IFACE-DRIFT", act)                    # zamknięte DRIFT_END
+        self.assertNotIn("RPKI-DOWN", act)                      # zamknięte UP
+        self.assertNotIn("FW-BLOCK", act)                       # jednorazowe — tylko w historii
+        hist = text.split("OSTATNIE ZDARZENIA")[1]
+        self.assertIn("%FW-5-BLOCK", hist)
+        self.assertNotIn("stare, z logu", hist)
+        self.assertLess(hist.index("RPKI-5-UP"), hist.index("FW-5-BLOCK"))   # najnowsze na górze
+        styles = {x.split()[2]: s for x, s in lines if "VPP-RX_MISS" in x or "IFACE-OPTICS" in x}
+        self.assertEqual(styles, {"VPP-RX_MISS": "miss", "IFACE-OPTICS": "deny"})
+        # router-monitor nie działa: ostrzeżenie zamiast cichego "brak alarmów"
+        with mock.patch.object(top, "MON_STATE", self.root + "/brak.json"), mock.patch.object(top, "ALARM_LOG", log):
+            text = "\n".join(x for x, _s in top.screen_alarms(top.AlarmView().sample(), {}, 1.0))
+        self.assertIn("router-monitor nie działa", text)
+        self.assertIn("Alarmy", top.header(6, False))
+
     def test_vpp_load_per_worker(self):
         with open(self.root + "/etc/router/router.env", "w") as f:
             f.write('INST_WORKERS=5,6,7\n')

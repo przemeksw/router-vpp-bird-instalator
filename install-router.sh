@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.42"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.43"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2461,12 +2461,14 @@ class Alarm:
         self.since = self.last = 0.0
         self.peak = 0.0
         self.peak_txt = ""
+        self.text = ""
         self.cur_sev, self.cur_mnem = sev, mnem
 
     def update(self, now, active, value, text, sev=None, mnem=None):
         sev = self.sev if sev is None else sev
         mnem = self.mnem if mnem is None else mnem
         if active:
+            self.text = text
             if not self.active:
                 self.active, self.since, self.last = True, now, now
                 self.peak, self.peak_txt = value, text
@@ -3113,6 +3115,12 @@ def main():
             win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
 
         # ---------------------------------------------------------- stan bieżący
+        # aktywne alarmy (router-top, karta 6): stan na tę sekundę, nie z logu — bez "wiszących" alarmów po restarcie
+        state["alarms"] = [{"fac": a.fac, "sev": a.cur_sev, "mnem": a.cur_mnem, "since": int(a.since), "text": a.text}
+                           for a in (a_down, a_miss, a_disc, a_wk, a_smi, a_load, a_punt, a_hk) if a.active]
+        state["alarms"] += [{"fac": "MD", "sev": 1, "mnem": "DEGRADED", "since": 0,
+                             "text": "%s zdegradowana [%s] %s" % (n, v["state"], v["progress"])}
+                            for n, v in md_known.items() if v.get("degraded")]
         try:
             os.makedirs(os.path.dirname(CFG["STATEFILE"]), exist_ok=True)
             tmp = CFG["STATEFILE"] + ".tmp"
@@ -7514,7 +7522,8 @@ prog_router_top() {
   karty:     1 VPP (obciążenie workerów, ruch łącznie)   2 interfejsy (porty i VLAN-y: Gb/s, pkt/s)
              3 firewall (liczniki ACL)   4 guard (naruszenia na żywo)
              5 kolejki RX (rozkład ruchu po kolejkach RSS = workerach, przepełnienia pierścienia rx_out_of_buffer)
-  klawisze:  1-5 karta   ↑ ↓ PgUp PgDn Home End przewijanie (także j k)   p pauza   q wyjście
+             6 alarmy (aktywne teraz + ostatnie zdarzenia z alarmy.log)
+  klawisze:  1-6 karta   ↑ ↓ PgUp PgDn Home End przewijanie (także j k)   p pauza   q wyjście
   router-top --once N     jeden odczyt ekranu N jako zwykły tekst (skrypty, diagnostyka)
 
 Tylko odczyt — niczego nie zmienia w VPP. Liczniki interfejsów i ACL są dokładne; lista zdarzeń guard to
@@ -8050,9 +8059,114 @@ def screen_guard(cur, prev, dt):
 
 
 # --------------------------------------------------------------------------- pętla
+# --------------------------------------------------------------------------- karta 6: alarmy
+# Aktywne alarmy z dwóch źródeł:
+#  * router-monitor (VPP, rdzenie, SMI, RAID) — stan na bieżącą sekundę z /run/router-monitor/state.json;
+#  * pozostałe narzędzia (router-ifaces, router-fw, router-guard, RPKI, mdadm) — z alarmy.log: zdarzenie, po którym
+#    nie było jeszcze zakończenia (pary w LOG_PAIRS). Zdarzenia jednorazowe (BLOCK, APPLIED…) są tylko w historii.
+ALARM_LOG = ROOT + "/var/log/router/alarmy.log"
+MON_STATE = os.environ.get("ROUTER_TOP_MON_STATE", ROOT + "/run/router-monitor/state.json")
+LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) %([A-Z]+)-(\d)-([A-Z_]+): (.*)$")
+LOG_PAIRS = [("IFACE", {"DRIFT"}, {"DRIFT_END"}), ("IFACE", {"OPTICS"}, {"OPTICS_END"}),
+             ("FW", {"DRIFT"}, {"DRIFT_END"}), ("GUARD", {"DRIFT"}, {"DRIFT_END"}),
+             ("RPKI", {"DOWN"}, {"UP"}), ("MD", {"DEGRADED", "DEGRADEDARRAY", "FAIL"}, {"RECOVERED"})]
+SEV_NAME = {1: "ALARM", 2: "KRYTYCZNY", 3: "BŁĄD", 4: "OSTRZEŻENIE", 5: "info"}
+
+
+def read_log_tail(path, nbytes=2 * 1024 * 1024):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = data.splitlines()
+    return lines[1:] if size > nbytes else lines
+
+
+def parse_alarm_log(lines):
+    """[(czas, fac, sev, mnem, tekst)] z linii alarmy.log (inne linie pomijane)."""
+    out = []
+    for ln in lines:
+        m = LOG_LINE.match(ln)
+        if m:
+            out.append((m.group(1), m.group(2), int(m.group(3)), m.group(4), m.group(5)))
+    return out
+
+
+def log_active(events):
+    """Aktywne zdarzenia stanowe z logu: ostatnie otwarcie bez późniejszego zamknięcia (LOG_PAIRS)."""
+    act = {}
+    for t, fac, sev, mnem, text in events:
+        for i, (pf, opens, closes) in enumerate(LOG_PAIRS):
+            if fac != pf:
+                continue
+            if mnem in opens:
+                act[i] = {"time": t, "fac": fac, "sev": sev, "mnem": mnem, "text": text}
+            elif mnem in closes:
+                act.pop(i, None)
+    return sorted(act.values(), key=lambda a: a["time"])
+
+
+class AlarmView:
+    def sample(self):
+        try:
+            with open(MON_STATE) as f:
+                mon = json.load(f)
+        except (OSError, ValueError):
+            mon = None
+        events = parse_alarm_log(read_log_tail(ALARM_LOG))
+        return {"mon": mon, "events": events, "now": time.time()}
+
+
+def _dur(sec):
+    sec = int(max(0, sec))
+    return "%dd %dh" % (sec // 86400, sec % 86400 // 3600) if sec >= 86400 else \
+        "%dh %dm" % (sec // 3600, sec % 3600 // 60) if sec >= 3600 else "%dm %ds" % (sec // 60, sec % 60)
+
+
+def screen_alarms(cur, prev, dt):
+    style = lambda sev: "miss" if sev <= 2 else "deny" if sev == 3 else "warn" if sev == 4 else "dim"  # noqa: E731
+    lines = [("  AKTYWNE ALARMY", "head"), ("  %-19s %-24s %-12s %-9s %s" % ("od", "alarm", "poziom", "trwa", "opis"), "head")]
+    mon, now = cur.get("mon"), cur.get("now", time.time())
+    active = []
+    mon_ok = bool(mon) and now - mon.get("time", 0) < 15
+    if mon_ok:
+        for a in mon.get("alarms", []):
+            since = a.get("since") or 0
+            active.append((time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since)) if since else "-",
+                           "%s-%s" % (a["fac"], a["mnem"]), a["sev"], _dur(now - since) if since else "-", a.get("text", "")))
+    for a in log_active(cur.get("events", [])):
+        try:
+            since = time.mktime(time.strptime(a["time"], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            since = now
+        active.append((a["time"], "%s-%s" % (a["fac"], a["mnem"]), a["sev"], _dur(now - since), a["text"]))
+    if not mon_ok:
+        lines.append(("  router-monitor nie działa albo nie odświeża stanu (systemctl status router-monitor) — "
+                      "alarmy VPP/rdzeni niewidoczne", "miss"))
+    if not active:
+        lines.append(("  brak aktywnych alarmów", "hit"))
+    for t, name, sev, dur, text in sorted(active, key=lambda x: (x[2], x[0])):
+        lines.append(("  %-19s %-24s %-12s %-9s %s" % (t, name, SEV_NAME.get(sev, str(sev)), dur, text), style(sev)))
+    lines.append(("", ""))
+    lines.append(("  OSTATNIE ZDARZENIA (24 h, najnowsze na górze)", "head"))
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 86400))
+    recent = [e for e in cur.get("events", []) if e[0] >= cutoff][-200:]
+    if not recent:
+        lines.append(("  brak zdarzeń w ostatniej dobie", "dim"))
+    for t, fac, sev, mnem, text in reversed(recent):
+        lines.append(("  %s %%%s-%d-%s: %s" % (t, fac, sev, mnem, text), style(sev) if sev <= 4 else "dim"))
+    lines.append(("", ""))
+    lines.append(("  Pełny log: /var/log/router/alarmy.log (na żywo: tail -f)", "dim"))
+    return lines
+
+
 SCREENS = {1: ("VPP", IfStats, screen_vpp), 2: ("Interfejsy", IfStats, screen_ifaces),
            3: ("Firewall (ACL)", FwView, screen_fw), 4: ("Guard", GuardView, screen_guard),
-           5: ("Kolejki RX", QueueStats, screen_queues)}
+           5: ("Kolejki RX", QueueStats, screen_queues), 6: ("Alarmy", AlarmView, screen_alarms)}
 
 
 class App:
@@ -8392,6 +8506,8 @@ AREAS = [
          A("Pełna kontrola stanu", "usługi, VPP, interfejsy, BIRD, SNMP, RAID, ostatnie alarmy", ["install-router", "--check"]),
          A("Podgląd na żywo: VPP", "obciążenie workerów i ruch łącznie", ["router-top", "1"]),
          A("Podgląd na żywo: interfejsy", "porty i VLAN-y: Gb/s i pakiety/s", ["router-top", "2"]),
+         A("Podgląd na żywo: kolejki RX", "ruch per kolejka RSS (worker), przepełnienia pierścienia", ["router-top", "5"]),
+         A("Podgląd na żywo: alarmy", "aktywne alarmy teraz i zdarzenia z ostatniej doby", ["router-top", "6"]),
          A("Podgląd na żywo: firewall", "liczniki reguł ACL", ["router-top", "3"]),
          A("Podgląd na żywo: guard", "naruszenia na żywo", ["router-top", "4"]),
          A("Ostatnie alarmy", "50 ostatnich zdarzeń routera", ["tail", "-n", "50", "/var/log/router/alarmy.log"]),
@@ -9248,7 +9364,7 @@ Powłoka w netns dataplane (BIRD, SSH/SNMP na loop0): `router dataplane` albo `d
 ## 2. Codzienna kontrola (2 minuty)
 
 ```
-router-top                            # NA ŻYWO: 1 obciążenie VPP, 2 porty/VLAN-y, 3 firewall, 4 guard, 5 kolejki RX (q = wyjście)
+router-top                            # NA ŻYWO: 1 obciążenie VPP, 2 porty/VLAN-y, 3 firewall, 4 guard, 5 kolejki RX, 6 alarmy (q = wyjście)
 router-check                          # pełna kontrola: usługi, VPP, BGP, interfejsy, firewall, logi
 tail -n 30 /var/log/router/alarmy.log # co się działo
 birdc show protocols                  # sesje BGP: wszystkie "Established"?
@@ -13381,7 +13497,7 @@ st_monitor() {
   prog_router_monitor | put_file /opt/router/bin/router-monitor "router-monitor: obciążenie VPP, rx-miss, CPU, RAID w czasie rzeczywistym" 755
   prog_router_top | put_file /opt/router/bin/router-top "router-top: podgląd na żywo — interfejsy (Gb/s, pkt/s), liczniki ACL, guard" 755
   ln -sfn /opt/router/bin/router-top /usr/local/sbin/router-top
-  man_add file /usr/local/sbin/router-top "polecenie router-top (1 VPP, 2 interfejsy, 3 firewall, 4 guard, 5 kolejki RX)"
+  man_add file /usr/local/sbin/router-top "polecenie router-top (1 VPP, 2 interfejsy, 3 firewall, 4 guard, 5 kolejki RX, 6 alarmy)"
   put_file /etc/router/router-monitor.conf "progi router-monitor (zmiana: edytuj i systemctl restart router-monitor)" <<EOF
 # router-monitor — progi alarmów. Po zmianie: systemctl restart router-monitor
 INTERVAL=1
