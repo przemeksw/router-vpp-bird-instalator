@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.41"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.42"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -72,9 +72,9 @@ VPP_NIC_DEVARGS=""             # dodatkowe devargs DPDK; przy firmware >= 12.28 
 PORT_MTU=1500                  # MTU portów VPP i VLAN-ów: standard Ethernet (ustawiane przy starcie VPP, przed podniesieniem portu)
 ROUTER_ID=""                   # puste = adres loop0 (LOOP0_ADDR), a bez niego IPv4 interfejsu z trasą domyślną (eth2)
 LOOP0_ADDR="10.10.10.10/32"    # loopback loop0 w VPP: stały adres zarządzania (SSH, SNMP) i router-id; puste = bez loop0.
-                                # Przy pierwszej instalacji (terminal, bez --yes) skrypt PYTA o ten adres — wartość tutaj
-                                # to podpowiedź; wybrany adres trafia do router.env (INST_LOOP0_ADDR) i obowiązuje
-                                # przy kolejnych uruchomieniach (--check, --from N), dopóki nie zmienisz go tu ręcznie.
+                                # Instalacja w terminalu (bez --yes) zaczyna się od pytania o ten adres — wartość tutaj
+                                # (a przy ponownym uruchomieniu adres z router.env) to tylko podpowiedź. Wybrany adres
+                                # trafia do router.env (INST_LOOP0_ADDR); upgrade_script/--check/set_workers nie pytają.
 DATAPLANE_SSH=yes              # yes = drugi sshd w netns dataplane na adresie loop0 (sshd portu zarządzającego zostaje)
 MGMT_SNMP=yes                  # yes = snmpd także na porcie zarządzającym (host, RAID); liczniki portów VPP są na loop0
 SSH_PASSWORD_AUTH=yes          # logowanie hasłem na sshd w dataplane (loop0): yes = hasło lub klucz, no = tylko klucz
@@ -292,6 +292,34 @@ mkdir -p "$SRC_DIR" "$DEB_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR"
 chmod 700 "$DATA_DIR"
 exec > >(tee -a "$MAIN_LOG") 2>&1
 ((RESET)) && { rm -f "$STATE_DIR"/*.done; echo "Wyzerowano listę ukończonych etapów."; }
+
+# --- adres loop0: PIERWSZE pytanie przy każdym uruchomieniu instalacji w terminalu (bez --yes). Podpowiedź =
+# adres z poprzedniej instalacji (router.env), a przy pierwszej instalacji LOOP0_ADDR z ustawień skryptu.
+# "-" = bez loop0. Zmiana adresu na działającym routerze wymaga potwierdzenia (SSH/SNMP na starym adresie
+# znikną, router-id BGP się zmieni); st_loop0_access podmienia wtedy wiersz loop0 w ifaces.conf.
+LOOP0_PREV=$(sed -n 's/^INST_LOOP0_ADDR="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/router/router.env 2>/dev/null || true)
+if [[ $MODE == install && -t 0 && $ASSUME_YES == 0 ]]; then
+  printf '\n%s── Adres loopback loop0 (zarządzanie SSH/SNMP w dataplane, router-id BGP) ──%s\n' "$c_hdr" "$c_off"
+  printf '  IPv4 hosta (maska /32, dopisywana sama). Switch/BNG musi mieć do niego trasę przez ten router.\n'
+  printf '  Enter = podpowiedź w nawiasie; "-" = bez loop0 (SSH/SNMP w dataplane wyłączone, router-id z portu zarządzania).\n'
+  while :; do
+    read -rp "  Adres loop0 [${LOOP0_ADDR:--}]: " ans
+    ans=${ans:-${LOOP0_ADDR:--}}
+    if [[ $ans == - ]]; then ans=""; break; fi
+    [[ $ans == */* ]] || ans="$ans/32"
+    valid_ip4_32 "$ans" && break
+    printf '  Nieprawidłowy adres "%s" — podaj IPv4 hosta, np. 10.10.10.10 (maska tylko /32), albo "-".\n' "$ans"
+  done
+  if [[ -n $LOOP0_PREV && $LOOP0_PREV != "${ans:--}" ]]; then
+    printf '  %sZmiana loop0: %s → %s.%s SSH i SNMP na starym adresie przestaną działać, zmieni się router-id BGP\n' \
+      "$c_warn" "$LOOP0_PREV" "${ans:-bez loop0}" "$c_off"
+    printf '  (sesje BGP zestawią się na nowo), a switch/BNG musi mieć trasę do nowego adresu.\n'
+    read -rp "  Na pewno zmienić? [t/N] " c
+    [[ $c =~ ^[TtYy] ]] || { ans=$LOOP0_PREV; [[ $ans == - ]] && ans=""; echo "  Zostaje ${ans:-bez loop0}."; }
+  fi
+  LOOP0_ADDR=$ans
+  ok "loop0: ${LOOP0_ADDR:-bez loop0}"
+fi
 
 # ------------------------------------------------------------------ pomocnicze
 expand_cpulist() {   # "1,3,5-9" -> "1 3 5 6 7 8 9"
@@ -10741,19 +10769,6 @@ if ((INTERACTIVE)) && ! compgen -G "$STATE_DIR/*.done" >/dev/null; then
   read -rp "Kontynuować instalację z tymi ustawieniami? (zalecenia BIOS możesz wprowadzić później) [T/n] " ans
   [[ -z $ans || $ans =~ ^[TtYy] ]] || { echo "Przerwano. Po zmianach w BIOS uruchom skrypt ponownie."; exit 0; }
 
-  # --- adres loop0: pytanie przy pierwszej instalacji (potem z router.env); "-" = instalacja bez loop0
-  printf '\n  %s── Adres loopback loop0 (zarządzanie SSH/SNMP w dataplane, router-id BGP) ──%s\n' "$c_hdr" "$c_off"
-  printf '  IPv4 hosta (maska /32, dopisywana sama). Switch/BNG musi mieć do niego trasę przez ten router.\n'
-  printf '  Enter = podpowiedź; "-" = bez loop0 (SSH/SNMP w dataplane wyłączone, router-id z portu zarządzania).\n'
-  while :; do
-    read -rp "  Adres loop0 [${LOOP0_ADDR:--}]: " ans
-    ans=${ans:-${LOOP0_ADDR:--}}
-    if [[ $ans == - ]]; then LOOP0_ADDR=""; break; fi
-    [[ $ans == */* ]] || ans="$ans/32"
-    if valid_ip4_32 "$ans"; then LOOP0_ADDR=$ans; break; fi
-    printf '  Nieprawidłowy adres "%s" — podaj IPv4 hosta, np. 10.10.10.10 (maska tylko /32), albo "-".\n' "$ans"
-  done
-  ok "loop0: ${LOOP0_ADDR:-bez loop0}"
 fi
 
 # --- powiadomienia e-mail: zewnętrzny serwer SMTP (pytanie, jeśli nie ustawiono w skrypcie)
@@ -14047,7 +14062,18 @@ st_loop0_access() {
   if [[ -z $LOOP0_ADDR ]]; then
     say "LOOP0_ADDR puste — pomijam loop0 oraz SSH/SNMP w dataplane"
   else
-    # --- loop0 w ifaces.conf (istniejącego pliku nie nadpisujemy; dopisujemy tylko brakujący wiersz loop0)
+    # --- loop0 w ifaces.conf (istniejącego pliku nie nadpisujemy; dopisujemy brakujący wiersz loop0, a gdy przy
+    #     uruchomieniu wybrano inny adres — podmieniamy tylko pole adresu IPv4 w wierszu loop0)
+    cur_l0=$(awk '$1 == "loop0" && $2 == "-" {print $3; exit}' /etc/router/ifaces.conf 2>/dev/null)
+    if [[ -n $cur_l0 && $cur_l0 != "$LOOP0_ADDR" ]]; then
+      cp -a /etc/router/ifaces.conf "/etc/router/ifaces.conf.bak-$(date +%Y%m%d-%H%M%S)"
+      awk -v o="$cur_l0" -v a="$LOOP0_ADDR" '$1 == "loop0" && $2 == "-" && !d {i = index($0, o); $0 = substr($0, 1, i - 1) a substr($0, i + length(o)); d = 1} {print}' \
+        /etc/router/ifaces.conf >/etc/router/ifaces.conf.new && mv /etc/router/ifaces.conf.new /etc/router/ifaces.conf
+      say "loop0 w /etc/router/ifaces.conf: $cur_l0 → $LOOP0_ADDR (kopia: ifaces.conf.bak-*)"
+      if vppctl show version >/dev/null 2>&1; then
+        /opt/router/bin/router-ifaces apply -y || warn "router-ifaces apply nie powiódł się — popraw ifaces.conf i uruchom ręcznie"
+      fi
+    fi
     if [[ -f /etc/router/ifaces.conf ]] && ! grep -Eq '^loop0[[:space:]]' /etc/router/ifaces.conf; then
       printf '%-12s %-5s %-18s %-24s %s\n' loop0 - "$LOOP0_ADDR" - "Loopback: zarządzanie (SSH, SNMP), router-id" >>/etc/router/ifaces.conf
       say "dopisano loop0 $LOOP0_ADDR do /etc/router/ifaces.conf"
@@ -15335,7 +15361,7 @@ Bez terminala (skrypty, szybki podgląd): `router-top --once 1` (albo 2, 3, 4) �
 
 ## 10c. Dostęp zarządzający przez loop0 (SSH i SNMP)
 
-Instalator tworzy w VPP loopback **`loop0`** z adresem `LOOP0_ADDR` — przy pierwszej instalacji pyta o niego (podpowiedź `10.10.10.10/32`; `-` = bez loop0), wybór zapisuje w `router.env` (`INST_LOOP0_ADDR`) — jako stały adres zarządzania i router-id BIRD. Adres jest w `/etc/router/ifaces.conf`, a `lcp-sync` kopiuje go do namespace `dataplane`.
+Instalator tworzy w VPP loopback **`loop0`** z adresem `LOOP0_ADDR` — każda instalacja w terminalu zaczyna się od pytania o niego (podpowiedź: adres z poprzedniej instalacji albo `10.10.10.10/32`; `-` = bez loop0; zmiana na działającym routerze wymaga potwierdzenia i podmienia adres w `ifaces.conf`), wybór zapisuje w `router.env` (`INST_LOOP0_ADDR`) — jako stały adres zarządzania i router-id BIRD. Adres jest w `/etc/router/ifaces.conf`, a `lcp-sync` kopiuje go do namespace `dataplane`.
 
 | Usługa | Gdzie słucha | Co daje |
 |---|---|---|

@@ -11,7 +11,12 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.41"                     '^SCRIPT_VERSION="1\.5\.41"' 1
+chk "wersja skryptu 1.5.42"                     '^SCRIPT_VERSION="1\.5\.42"' 1
+chk "loop0: pytanie przy każdej instalacji w terminalu" 'if \[\[ \$MODE == install && -t 0 && \$ASSUME_YES == 0 \]\]; then' 1
+chk "loop0: zmiana adresu wymaga potwierdzenia"   'read -rp "  Na pewno zmienić\? \[t/N\] " c' 1
+chk "loop0: podmiana adresu w ifaces.conf"       'cur_l0=\$\(awk' 1
+l0q=$(grep -n 'read -rp "  Adres loop0' install-router.sh | cut -d: -f1); aud=$(grep -n '^# AUDYT SPRZĘTU' install-router.sh | cut -d: -f1)
+if [[ -n $l0q && -n $aud ]] && ((l0q < aud)); then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  pytanie o loop0 nie jest przed audytem (linia $l0q, audyt $aud)"; fi
 chk "luz workerów uczony tylko przy realnym ruchu (monitor i top)" '^IDLE_MIN_RX_PPS = 1000\.0' 2
 chk "stary plik luzu (bez wersji) odrzucany" '^IDLE_FMT = 2' 2
 chk "router-monitor: pomiar luzu nie nadpisywany przez zmienną rdzeni systemowych" '^    idle_loops, idle_saved_t, last_rx_pps = IdleLoops|        for c, \(tot, idle\) in hk_now' 2
@@ -38,7 +43,7 @@ chk "luz uczony, nie wpisany na sztywno (router-monitor i router-top)" '^IDLE_VE
 chk "router-snmp: rvWorkerBusyPct i rvVppWorkerBusyMax" '\(4, "rvWorkerBusyPct", "gauge"|\(24, "rvVppWorkerBusyMax", "gauge"' 2
 chk "instalacja pyta o adres loop0"            'read -rp "  Adres loop0 \[\$\{LOOP0_ADDR:--\}\]: " ans' 1
 chk "loop0 z router.env przy kolejnych uruchomieniach" 'INST_LOOP0_ADDR="\$\{LOOP0_ADDR:--\}"|^INST_LOOP0_ADDR=' 1
-chk "loop0: odczyt INST_LOOP0_ADDR z router.env" "sed -n 's/\^INST_LOOP0_ADDR=" 1
+chk "loop0: odczyt INST_LOOP0_ADDR z router.env" "sed -n 's/\^INST_LOOP0_ADDR=" 2
 v32() { eval "$(sed -n '/^valid_ip4_32() {/,/^}/p' install-router.sh)"; valid_ip4_32 "$1"; }
 for a in 10.10.10.10/32 185.1.2.3/32 1.0.0.1/32; do
   if v32 "$a"; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  valid_ip4_32 odrzuca poprawny $a"; fi
