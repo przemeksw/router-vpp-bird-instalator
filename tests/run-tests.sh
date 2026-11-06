@@ -258,8 +258,10 @@ mkdir -p "$W/root/etc/router"; echo 'OPTICS_CHECK_EVERY=1' >"$W/root/etc/router/
 sleep 1.1; $RI check --log >/dev/null 2>&1
 t "wkładki w normie: bez OPTICS w logu"      1 grep -q 'OPTICS' "$ALOG"
 sed -i.bak 's#0.7000 mW (-1.55 dBm)#0.0000 mW (-inf dBm)#' "$W/ddm-hu0"       # tor 2 bez światła (oba porty mają ten plik)
+echo 'OPTICS_CHECK_EVERY=3600' >"$W/root/etc/router/router-monitor.conf"     # odstęp niezależny od szybkości testu
 $RI check --log >/dev/null 2>&1
 t "w odstępie krótszym niż OPTICS_CHECK_EVERY nie czyta" 1 grep -q 'IFACE-3-OPTICS' "$ALOG"
+echo 'OPTICS_CHECK_EVERY=1' >"$W/root/etc/router/router-monitor.conf"
 sleep 1.1; $RI check --log >/dev/null 2>&1
 t "tor bez światła → %IFACE-3-OPTICS"        0 grep -q 'IFACE-3-OPTICS' "$ALOG"
 t "OPTICS: port, tor i wartość w opisie"     0 grep -q 'hu0 \[ALARM\] RX tor 2 -inf dBm \[ALARM' "$ALOG"
