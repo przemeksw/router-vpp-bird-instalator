@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.39"                     '^SCRIPT_VERSION="1\.5\.39"' 1
+chk "wersja skryptu 1.5.40"                     '^SCRIPT_VERSION="1\.5\.40"' 1
 chk "router-monitor: pomiar luzu nie nadpisywany przez zmienną rdzeni systemowych" '^    idle_loops, idle_saved_t = IdleLoops|        for c, \(tot, idle\) in hk_now' 2
 chk "router-monitor: nikt nie woła metod na 'idle'" '\bidle\.(learn|busy|save)\(' 0
 chk "lspci: LnkSta z tabulatorem (wcześniej nic nie łapało)" "LnkSta:\\[\\[:space:\\]\\]\\*Speed" 3
@@ -59,7 +59,8 @@ chk "router-monitor: alarm SMI"               'Alarm\("SYS", 3, "SMI", "SMI_END"
 chk "router-monitor.conf: SMI_PER_S"          '^SMI_PER_S=5$' 1
 chk "router-notify: SMI i ISOL_FIX w VPP_DROPS" '\^SYS-\(SMI\|ISOL_FIX\)' 1
 chk "--check: częstość SMI z 5 s pomiaru"     'SMI na rdzeniu workera \(cpu \$c\)' 3
-chk "pierścień RX = maksimum ConnectX-4 (burst jednego przepływu)" '^VPP_RX_DESC=32768 ' 1
+chk "pierścień RX 16384 (32768 zatrzymywał odbiór na mlx5)" '^VPP_RX_DESC=16384 ' 1
+chk "pierścień RX obcinany do sprawdzonej granicy" 'if \(\(VPP_RX_DESC > VPP_RX_DESC_MAX\)\); then' 1
 chk "set_workers: sam startup.conf → tylko restart VPP" 'zmienił się tylko startup.conf' 1
 chk "router-monitor: WK_GRACE po starcie VPP (kod i konfiguracja)" '"WK_GRACE": 120,|^WK_GRACE=120$|t0 - vpp_seen_t < CFG\["WK_GRACE"\]' 3
 chk "router-monitor: CPU procesów bez wątków na izolowanych rdzeniach" 'procs = read_proc_cpu\(isolated\)' 1

@@ -54,19 +54,18 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.39"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.40"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
 VPP_WORKERS=auto               # auto = dobór do rdzeni, modelu karty i wydajności procesora; albo liczba, np. 12
 VPP_SIZING_PKT=800             # B — typowy średni pakiet przy doborze workerów (ruch internetowy: 700–1000 B;
                                # mniejsza wartość = więcej workerów na wolnym procesorze)
-VPP_RX_DESC=32768              # deskryptory RX na kolejkę = maksimum ConnectX-4 (show hardware-interfaces: "desc … max 32768").
-                                # Jeden duży przepływ TCP (ten sam 5-tuple → zawsze ta sama kolejka RSS → jeden worker) od nadawcy
-                                # z kartą 100G wysyła okno 20–30 MB z prędkością łącza (~10 Mpps przy 1200 B), a worker zdejmuje
-                                # ~1–2 Mpps: pierścień 16384 przepełniał się w ~1,7 ms i karta gubiła kilkaset pakietów
-                                # (rx_out_of_buffer = rx-miss) bez żadnego sygnału po stronie CPU. 32768 podwaja tolerowany
-                                # burst (~40 MB); koszt: +16384 buforów na kolejkę (12 kolejek × 2 porty ≈ 393 tys. z puli).
+VPP_RX_DESC=16384              # deskryptory RX na kolejkę. NIE więcej niż 16384 (VPP_RX_DESC_MAX): karta ConnectX-4 zgłasza
+                                # "desc … max 32768", ale z VPP 26.06 przy 32768 kolejki RX przyjmują pierwszy pakiet i potem
+                                # się nie uzupełniają — port nadaje, nie odbiera (rx packets 1, rx-miss rośnie). Sprawdzone na
+                                # lodz2-vpp 2026-11-06; powrót do 16384 przywrócił ruch od razu. Instalator obcina większe wartości.
+VPP_RX_DESC_MAX=16384          # górna granica sprawdzona na żywym ruchu (podnosić tylko po teście w oknie serwisowym)
 VPP_TX_DESC=4096               # deskryptory TX na kolejkę (errno -95 przy wyższych wartościach to był stary firmware 12.20, nie liczba deskryptorów —
                                 # od firmware >= 12.21.1000 (audyt st_firmware/do_audit wymusza aktualizację) nieaktualne)
 VPP_NIC_DEVARGS=""             # dodatkowe devargs DPDK; przy firmware >= 12.28 niepotrzebne (potwierdzone na R630: bez devargs porty wstają)
@@ -188,6 +187,14 @@ MANIFEST=$DATA_DIR/MANIFEST.txt
 MAN_DB=$STATE_DIR/manifest.tsv
 ENV_FILE=$DATA_DIR/router-install.env
 TOTAL_STAGES=27
+
+# pierścień RX powyżej sprawdzonej granicy psuje odbiór na mlx5 (opis przy VPP_RX_DESC) — obcinamy zawsze,
+# także gdy ktoś wpisze więcej w ustawieniach albo przyniesie stary skrypt z 32768
+if ((VPP_RX_DESC > VPP_RX_DESC_MAX)); then
+  printf 'UWAGA: VPP_RX_DESC=%s > %s — ograniczam do %s (większy pierścień zatrzymuje odbiór na mlx5)\n' \
+    "$VPP_RX_DESC" "$VPP_RX_DESC_MAX" "$VPP_RX_DESC_MAX" >&2
+  VPP_RX_DESC=$VPP_RX_DESC_MAX
+fi
 
 # adres loop0 wybrany przy instalacji (pytanie) obowiązuje przy kolejnych uruchomieniach; ręczna zmiana LOOP0_ADDR
 # w skrypcie (inna niż podpowiedź domyślna) nadal wygrywa. "-" w router.env = instalacja bez loop0.
@@ -10642,7 +10649,7 @@ elif ((BUFFERS > BUF_MAX)); then
   BUFFERS=$BUF_MAX
 fi
 # Pierścienie RX/TX muszą się mieścić w buforach z zapasem (2×: pakiety w drodze, punt, kolejki TX). Przy małej
-# ilości RAM pierścień 32768 na 12+ kolejkach zjadłby całą pulę — VPP nie wystartuje albo stale gubi (rx-no-buf).
+# ilości RAM pierścień 16384 na 12+ kolejkach zjadłby całą pulę — VPP nie wystartuje albo stale gubi (rx-no-buf).
 # Wtedy zmniejszamy num-rx-desc o połowę, aż się zmieści (najmniej 1024); efektywną wartość zapamiętuje router.env.
 rings_need() { echo $(( ${#NIC_PCI[@]} * VPP_WORKERS * (VPP_RX_DESC + VPP_TX_DESC) * 2 + (VPP_WORKERS + 1) * 2048 )); }
 rx_want=$VPP_RX_DESC
@@ -14808,7 +14815,7 @@ Format jak w syslogu Cisco: `%OBSZAR-POZIOM-ZDARZENIE: opis`. Poziom: 1 = alarm 
 | `%VPP-4-LOAD_HIGH` | wektor workera ≥ `VEC_WARN` | obserwować; przy częstych wystąpieniach rozważyć więcej workerów |
 | `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (NetFlow/FastNetMon), ewentualnie blackhole |
 | `%VPP-5-LOAD_NORMAL` | koniec przeciążenia, z czasem trwania i szczytem | — |
-| `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: przy dużym ruchu — zidentyfikować cel ataku, RTBH/Flowspec u upstreamu. Pojedyncze sekundy z kilkuset pakietami przy małym ruchu, bez `LOAD_HIGH` i bez `WK_PREEMPT` = burst jednego przepływu na jednej kolejce RSS (pierścień `VPP_RX_DESC`; 32768 to maksimum ConnectX-4) |
+| `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: przy dużym ruchu — zidentyfikować cel ataku, RTBH/Flowspec u upstreamu. Pojedyncze sekundy z kilkuset pakietami przy małym ruchu, bez `LOAD_HIGH` i bez `WK_PREEMPT` = burst jednego przepływu na jednej kolejce RSS (pierścień `VPP_RX_DESC`, 16384 — więcej nie: przy 32768 mlx5 z VPP 26.06 przestaje odbierać) |
 | `%VPP-3-NIC_DISCARD` | karta odrzuca pakiety sprzętowo (`*discard*`) | bufor PHY/priorytetu karty, PCIe; przy stałym występowaniu — ConnectX-5 |
 | `%VPP-3-WK_PREEMPT` | worker VPP wywłaszczony z izolowanego rdzenia (w opisie: który worker, cpu, co na nim siedzi) | `router-kthreads -n` i `router-kthreads`; jeśli to proces użytkownika — `ps -eLo psr,comm` i jego `CPUAffinity` |
 | `%SYS-3-SMI` | przerwania BIOS-u (SMI) na rdzeniach workerów — rdzeń stoi poza kontrolą kernela, bez śladu w `/proc/interrupts` | BIOS: System Profile = Performance, Memory Patrol/Demand Scrub = Disabled, USB legacy = Off; iDRAC/BMC bez cyklicznych odpytań |
