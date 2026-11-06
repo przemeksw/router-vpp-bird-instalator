@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.44"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.45"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -7845,21 +7845,39 @@ class QueueStats:
     def sample(self):
         if HW_TEXT:
             with open(HW_TEXT) as f:
-                return parse_hw_queues(f.read())
+                return self.with_busy(parse_hw_queues(f.read()))
         r = subprocess.run([VPPCTL, "show", "hardware-interfaces"], capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip() or "vppctl: błąd")
-        return parse_hw_queues(r.stdout)
+        return self.with_busy(parse_hw_queues(r.stdout))
+
+    @staticmethod
+    def with_busy(res):
+        """Dołącza zajętość workerów z router-monitora (świeży stan) — pasek na karcie 5."""
+        try:
+            with open(MON_STATE) as f:
+                mon = json.load(f)
+            if time.time() - mon.get("time", 0) < 15:
+                res["__busy__"] = mon.get("worker_busy") or []
+        except (OSError, ValueError, AttributeError):
+            pass
+        return res
 
 
 def screen_queues(cur, prev, dt):
-    lines = [("  KOLEJKI RX (kolejka = worker; przepływ trafia zawsze do tej samej kolejki)", "head"),
-             ("  %-8s %-7s %10s %13s %7s  %-18s %s" % ("port", "kolejka", "pkt/s", "b/s", "udział", "rozkład", "rdzeń"), "head")]
-    if not cur:
+    """Kolejki RX: ile ruchu dostaje każda kolejka i jak bardzo zajęty jest worker, który ją obsługuje.
+    Pasek = zajętość workera (0–100% jego możliwości, z router-monitora), NIE zapełnienie bufora i nie porównanie
+    z najbardziej obciążoną kolejką — przy małym ruchu paski mają być prawie puste."""
+    lines = [("  KOLEJKI RX — jak karta rozdziela ruch portu między workery VPP", "head"),
+             ("  %-6s %-7s %10s %13s %7s  %-18s %-26s" % ("port", "kolejka", "pkt/s", "b/s", "udział", "obsługuje",
+                                                          "zajętość workera (0–100%)"), "head")]
+    ports = [p for p in cur if not p.startswith("__")]
+    if not ports:
         lines.append(("  Brak danych o kolejkach (show hardware-interfaces).", "dim"))
         return lines
     cores = [c for c in read_kv(ENV_FILE, "INST_WORKERS").split(",") if c]
-    for port in sorted(cur, key=natkey):
+    busy = cur.get("__busy__") or []
+    for port in sorted(ports, key=natkey):
         d, o = cur[port], prev.get(port, cur[port])
         rates = {}
         for n, (p, b) in sorted(d["q"].items()):
@@ -7868,23 +7886,37 @@ def screen_queues(cur, prev, dt):
         tot = sum(r[0] for r in rates.values())
         oob = max(0, d["oob"] - o["oob"]) / dt
         disc = max(0, d["disc"] - o["disc"]) / dt
-        lines.append(("  %-8s %-7s %10s %13s %7s  %s" % (
-            port, "razem", fmt_pps(tot), fmt_bps(8 * sum(r[1] for r in rates.values())), "",
-            "rx_out_of_buffer %s/s — pierścień pełny" % fmt_pps(oob) if oob else "bez przepełnień pierścienia"),
-            "miss" if oob else "bold"))
-        peak = max((r[0] for r in rates.values()), default=0.0)
+        lines.append(("  %-6s %-7s %10s %13s" % (port, "razem", fmt_pps(tot), fmt_bps(8 * sum(r[1] for r in rates.values()))),
+                      "bold"))
         for n, (pps, bps) in sorted(rates.items()):
             share = pps / tot if tot else 0.0
-            skew = tot > 0 and len(rates) > 1 and share > 2.0 / len(rates)
-            lines.append(("  %-8s %-7s %10s %13s %6.1f%%  %s %s%s" % (
-                "", "q%d" % n, fmt_pps(pps), fmt_bps(8 * bps), 100 * share, bar(pps / peak if peak else 0.0, 16),
-                cores[n] if n < len(cores) else "?", "  ← skupienie ruchu" if skew else ""), "warn" if skew else ""))
+            b = busy[n] if n < len(busy) else None
+            who = "worker %d (cpu %s)" % (n + 1, cores[n] if n < len(cores) else "?")
+            more = tot > 0 and len(rates) > 1 and share > 2.0 / len(rates)
+            note, st = "", ""
+            if b is not None and b >= 70:
+                note, st = "  ← worker mocno zajęty", "miss" if b >= 90 else "warn"
+            elif more:
+                note, st = "  (więcej ruchu niż średnio — normalne, duże połączenie)", "dim"
+            lines.append(("  %-6s %-7s %10s %13s %6.1f%%  %-18s %s %4s%s" % (
+                "", "q%d" % n, fmt_pps(pps), fmt_bps(8 * bps), 100 * share, who, bar((b or 0) / 100.0, 20),
+                "?" if b is None else "%.0f%%" % b, note), st))
+        if oob:
+            lines.append(("  %-6s GUBIONE PAKIETY: %s/s — pierścień kolejki RX pełny (worker nie nadążył albo nagły burst)"
+                          % ("", fmt_pps(oob)), "miss"))
+        else:
+            lines.append(("  %-6s stan: OK — w tej sekundzie żaden pakiet nie został zgubiony" % "", "hit"))
         if disc:
-            lines.append(("  %-8s odrzucenia PHY karty: %s/s" % ("", fmt_pps(disc)), "miss"))
+            lines.append(("  %-6s odrzucenia sprzętowe karty: %s/s" % ("", fmt_pps(disc)), "miss"))
         lines.append(("", ""))
-    lines.append(("  udział > 2× średniej = jeden/kilka przepływów obciąża jeden worker (RSS nie rozkłada jednego 5-tuple).", "dim"))
-    lines.append(("  rx_out_of_buffer = pierścień RX pełny: burst jednego przepływu albo worker nie nadąża (num-rx-desc w startup.conf).",
+    if not busy:
+        lines.append(("  zajętość „?”: router-monitor jeszcze nie zmierzył wydajności workerów (potrzebny ruch na portach)", "dim"))
+    lines.append(("  Zajętość workera: ile czasu rdzeń spędza na obsłudze pakietów (cały jego ruch, z obu portów).", "dim"))
+    lines.append(("    0% = bezczynny, 100% = pracuje bez przerwy. Problem dopiero, gdy trwale > 70% albo pojawi się GUBIONE PAKIETY.",
                   "dim"))
+    lines.append(("  Udział: część ruchu portu w tej kolejce (przy %d kolejkach średnio ~%.0f%%). Nierówny rozkład jest normalny —"
+                  % (len(cores) or 1, 100.0 / (len(cores) or 1)), "dim"))
+    lines.append(("    jedno połączenie zawsze idzie przez jedną kolejkę, żeby pakiety nie zmieniały kolejności.", "dim"))
     return lines
 
 

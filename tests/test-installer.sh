@@ -11,7 +11,8 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.44"                     '^SCRIPT_VERSION="1\.5\.44"' 1
+chk "wersja skryptu 1.5.45"                     '^SCRIPT_VERSION="1\.5\.45"' 1
+chk "router-top karta 5: pasek = zajętość workera, nie porównanie kolejek" 'zajętość workera \(0–100%\)' 1
 chk "router-top: karta 6 alarmy"               '6: \("Alarmy", AlarmView, screen_alarms\)' 1
 chk "router-monitor: aktywne alarmy w state.json" 'state\["alarms"\] = \[' 1
 chk "menu: skróty do kart 5 i 6 router-top"    '\["router-top", "(5|6)"\]' 2

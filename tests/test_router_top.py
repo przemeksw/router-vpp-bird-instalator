@@ -87,15 +87,26 @@ class TestIfacesScreen(unittest.TestCase):
         with open(self.root + "/router.env", "w") as f:
             f.write('INST_WORKERS="5,7,9"\n')
         top.ENV_FILE = self.root + "/router.env"
-        text = "\n".join(t for t, _s in top.screen_queues(cur, prev, 1.0))
-        self.assertIn("rx_out_of_buffer 342/s", text)           # 649 - 307 w tej sekundzie
-        self.assertIn("q2", text)
-        self.assertIn("skupienie ruchu", text)                   # 20k z 20k = 100% na jednej kolejce
-        self.assertIn("100.0%", text)
-        self.assertIn(" 9", text)                                # rdzeń workera kolejki q2
-        quiet = "\n".join(t for t, _s in top.screen_queues(prev, prev, 1.0))
-        self.assertIn("bez przepełnień", quiet)
-        self.assertNotIn("skupienie", quiet)
+        cur["__busy__"] = [1.0, 2.0, 75.0]                      # zajętość workerów z router-monitora
+        lines = top.screen_queues(cur, prev, 1.0)
+        text = "\n".join(t for t, _s in lines)
+        self.assertIn("GUBIONE PAKIETY: 342/s", text)           # 649 - 307 w tej sekundzie
+        self.assertIn("worker 3 (cpu 9)", text)                  # kolejka q2 → worker 3 na rdzeniu 9
+        self.assertIn("100.0%", text)                            # udział q2 w ruchu portu
+        q0 = [t for t, _s in lines if " q0 " in t][0]
+        self.assertIn("  1%", q0)                                # pasek = zajętość workera, nie porównanie kolejek
+        self.assertNotIn("█", q0)                                # 1% zajętości → pusty pasek
+        q2 = [(t, st) for t, st in lines if " q2 " in t][0]
+        self.assertIn("worker mocno zajęty", q2[0])              # 75% → ostrzeżenie
+        self.assertEqual(q2[1], "warn")
+        self.assertNotIn("__busy__", text)
+        quiet_cur = dict(prev, __busy__=[1.0, 1.0, 1.0])
+        quiet = "\n".join(t for t, _s in top.screen_queues(quiet_cur, prev, 1.0))
+        self.assertIn("stan: OK", quiet)
+        self.assertNotIn("GUBIONE PAKIETY:", quiet)
+        self.assertNotIn("mocno zajęty", quiet)
+        unknown = "\n".join(t for t, _s in top.screen_queues(prev, prev, 1.0))
+        self.assertIn("router-monitor jeszcze nie zmierzył", unknown)
         self.assertIn("Kolejki RX", top.header(5, False))
 
     def test_alarms_screen(self):
