@@ -3,6 +3,7 @@
 """Testy filtra alarmy.log w router-monitor: w pliku tylko ostrzeżenia i groźniejsze (plus zakończenia alarmów)."""
 import importlib.machinery
 import importlib.util
+import json
 import logging
 import os
 import unittest
@@ -151,6 +152,99 @@ class TestWorkerPreempt(unittest.TestCase):
             self.assertEqual(mon.read_smi([5]), {})                       # brak modułu msr / AMD: pusto, bez wyjątku
         finally:
             mon.DEV = saved
+
+
+class _Col:
+    """Kolumna licznika VPP: rx[:, i].sum_packets() / .sum_octets() / .sum()."""
+    def __init__(self, v):
+        self.v = v
+
+    def sum_packets(self):
+        return self.v
+
+    def sum_octets(self):
+        return self.v * 1000
+
+    def sum(self):
+        return self.v
+
+
+class _Counter:
+    def __init__(self, vals):
+        self.vals = vals
+
+    def __getitem__(self, key):
+        return _Col(self.vals[key[1]])
+
+
+class _FakeStats:
+    """Segment statystyk VPP z rosnącymi licznikami — każde wywołanie to kolejna sekunda."""
+    t = 0
+
+    def __init__(self, socketname=None, timeout=None):
+        pass
+
+    def connect(self):
+        pass
+
+    def ls(self, _patterns):
+        return []
+
+    def __getitem__(self, key):
+        _FakeStats.t += 1
+        n = _FakeStats.t
+        return {
+            "/sys/heartbeat": n,
+            "/if/names": ["local0", "hu0", "hu1"],
+            "/sys/vector_rate_per_worker": [[0.0, 1.0, 3.0]],
+            "/sys/loops_per_worker": [[100000.0, 4000000.0, 2000000.0]],
+            "/if/rx": _Counter([0, n * 1000, n * 500]), "/if/tx": _Counter([0, n * 1000, n * 500]),
+            "/if/rx-miss": _Counter([0, 0, 0]), "/if/rx-no-buf": _Counter([0, 0, 0]),
+            "/if/punt": _Counter([0, 0, 0]),
+        }[key]
+
+
+class TestMainLoop(unittest.TestCase):
+    """Kilka obiegów prawdziwej pętli main() na sztucznym VPP: żadnego %VPP-2-DOWN z błędu w kodzie monitora
+    (1.5.35: zmienna 'idle' nadpisana liczbą → "'int' object has no attribute 'learn'" co sekundę)."""
+
+    def test_loop_runs_without_internal_errors(self):
+        import sys
+        import tempfile
+        import types
+        from unittest import mock
+        tmp = tempfile.mkdtemp()
+        papi = types.ModuleType("vpp_papi")
+        stats_mod = types.ModuleType("vpp_papi.vpp_stats")
+        stats_mod.VPPStats = _FakeStats
+        papi.vpp_stats = stats_mod
+        saved = {k: mon.CFG[k] for k in ("LOGFILE", "STATEFILE", "ENVFILE", "XSTATS_EVERY", "MD_EVERY", "SMI_PER_S")}
+        mon.CFG.update(LOGFILE=tmp + "/alarmy.log", STATEFILE=tmp + "/state.json", ENVFILE=tmp + "/router.env",
+                       XSTATS_EVERY=0, MD_EVERY=10 ** 9, SMI_PER_S=0)
+        emitted = []
+        loops = {"n": 0}
+
+        def fake_sleep(_s):
+            loops["n"] += 1
+            if loops["n"] >= 4:
+                raise KeyboardInterrupt
+
+        try:
+            with mock.patch.dict(sys.modules, {"vpp_papi": papi, "vpp_papi.vpp_stats": stats_mod}), \
+                    mock.patch.object(mon, "IDLE_FILE", tmp + "/idle.json"), \
+                    mock.patch.object(mon, "PROC", tmp), mock.patch.object(mon, "SPOOL", tmp + "/spool"), \
+                    mock.patch.object(mon, "read_proc_stat", lambda: {}), \
+                    mock.patch.object(mon, "emit", lambda fac, sev, mnem, msg, mail=True: emitted.append((mnem, msg))), \
+                    mock.patch.object(mon.time, "sleep", fake_sleep), mock.patch.object(sys, "argv", ["router-monitor"]):
+                with self.assertRaises(KeyboardInterrupt):
+                    mon.main()
+        finally:
+            mon.CFG.update(saved)
+        self.assertEqual([e for e in emitted if e[0] in ("DOWN", "UP")], [])
+        with open(tmp + "/state.json") as f:
+            st = json.load(f)
+        self.assertEqual(st["worker_busy"], [0.0, 50.0])             # worker 2: 2 M z 4 M pętli (mediana luzu)
+        self.assertEqual(st["worker_busy_max"], 50.0)
 
 
 if __name__ == "__main__":

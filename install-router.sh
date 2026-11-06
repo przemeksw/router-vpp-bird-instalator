@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.38"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.39"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2808,7 +2808,7 @@ def main():
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
     smi_prev, wk_last_t, smi_last_t, smi_hist = {}, 0.0, 0.0, []
-    idle, idle_saved_t = IdleLoops(IDLE_FILE), 0.0
+    idle_loops, idle_saved_t = IdleLoops(IDLE_FILE), 0.0   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -2874,14 +2874,14 @@ def main():
                     sum(1 for _, v in workers if v >= CFG["VEC_WARN"]), len(workers))
                 state["vector_max"], state["vector_worker"] = wv, wi
                 state["vector_per_worker"] = [v for _, v in workers]
-                idle.learn(vrow, lrow)
-                busy = [idle.busy(i, lrow[i] if i < len(lrow) else 0) for i, _ in workers]
+                idle_loops.learn(vrow, lrow)
+                busy = [idle_loops.busy(i, lrow[i] if i < len(lrow) else 0) for i, _ in workers]
                 state["worker_busy"] = busy
                 known = [b for b in busy if b is not None]
                 if known:
                     state["worker_busy_max"] = max(known)
                 if t0 - idle_saved_t >= 60:
-                    idle.save()
+                    idle_loops.save()
                     idle_saved_t = t0
                 crit = wv >= CFG["VEC_CRIT"]
                 a_load.update(t0, wv >= CFG["VEC_WARN"], wv, txt,
