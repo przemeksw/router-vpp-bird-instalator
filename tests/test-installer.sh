@@ -11,7 +11,11 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.36"                     '^SCRIPT_VERSION="1\.5\.36"' 1
+chk "wersja skryptu 1.5.37"                     '^SCRIPT_VERSION="1\.5\.37"' 1
+chk "dobór workerów wg wydajności rdzenia"     'NEED_W=\$\(\( \(need_pps \+ PPS_W - 1\) / PPS_W \)\)' 1
+chk "workery: co najmniej NIC_CAP, najwyżej 2× i wolne rdzenie" 'want > NIC_CAP \* 2' 1
+chk "pojemność routera w raporcie i router.env" 'audit INFO "Pojemność \(szacunek\)"|^INST_CAPACITY=' 2
+chk "prędkość portu nominalna, gdy porty ma VPP" 'NIC_LINE=[0-9]+' 8
 chk "kernel: parametry przeciw zakłóceniom"      '^KERNEL_JITTER_PARAMS="rcupdate\.rcu_normal_after_boot=1 iommu=pt skew_tick=1"$' 1
 chk "kernel: tsc=reliable tylko przy stabilnym TSC" 'EXTRA_CMDLINE\+=\(tsc=reliable\)' 1
 chk "upgrade/--check/set_workers sprawdzają parametry kernela" 'kernel_params_ok' 6
@@ -394,6 +398,21 @@ if [[ -n $hf ]]; then
 else
   fail=$((fail+1)); echo "BŁĄD  brak funkcji hugepages_for"
 fi
+# dobór workerów wg wydajności rdzenia: <opis> <MHz maks.> <wolne rdzenie> <NIC_CAP> <porty Mb/s> <PCIe Gb/s> <oczekiwane workery>
+sizing=$(sed -n '/^CYC_FWD=1600/,/^MAIN_CORE=/p' install-router.sh | sed '$d')
+tw() {
+  local got
+  got=$( ( audit() { :; }; rec() { :; }; eval "$(sed -n '/^fmt_mpps() {/p' install-router.sh)"
+           PHYS=(0); VPP_WORKERS=auto VPP_SIZING_PKT=800 NIC_MODEL=test ROUTER_TEST_CPU_KHZ=$2 avail_w=$3 NIC_CAP=$4 \
+           PORTS_MBPS=$5 PCIE_GBPS=$6; eval "$sizing"; echo "$VPP_WORKERS" ) 2>&1 )
+  if [[ $got == "$7" ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  dobór workerów $1: oczekiwano $7, jest '$got'"; fi
+}
+tw "R630 (3,6 GHz, CX-4, PCIe Gen3)"        3600000 18 12 200000 100 12
+tw "wolny 2,0 GHz: więcej niż NIC_CAP"       2000000 18 12 200000 100 18
+tw "wolny, mało rdzeni: tyle, ile wolnych"   2000000 10 12 200000 100 10
+tw "bardzo wolny: najwyżej 2× NIC_CAP"       1200000 40 8  200000 100 16
+tw "szybki 4,5 GHz: NIC_CAP (zapas na DDoS)" 4500000 30 12 100000 100 12
+tw "CX-4 Lx 2×25G: mało ruchu, NIC_CAP"      2400000 20 8  50000  0   8
 chk "domyślnie VPP_BUFFERS=auto (od zapotrzebowania)" '^VPP_BUFFERS=auto ' 1
 printf '\nWynik: %d OK, %d błędów\n' "$pass" "$fail"
 ((fail == 0))

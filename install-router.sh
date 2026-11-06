@@ -54,11 +54,13 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.36"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.37"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
-VPP_WORKERS=auto               # auto = dobór do rdzeni i modelu karty; albo liczba, np. 12
+VPP_WORKERS=auto               # auto = dobór do rdzeni, modelu karty i wydajności procesora; albo liczba, np. 12
+VPP_SIZING_PKT=800             # B — typowy średni pakiet przy doborze workerów (ruch internetowy: 700–1000 B;
+                               # mniejsza wartość = więcej workerów na wolnym procesorze)
 VPP_RX_DESC=32768              # deskryptory RX na kolejkę = maksimum ConnectX-4 (show hardware-interfaces: "desc … max 32768").
                                 # Jeden duży przepływ TCP (ten sam 5-tuple → zawsze ta sama kolejka RSS → jeden worker) od nadawcy
                                 # z kartą 100G wysyła okno 20–30 MB z prędkością łącza (~10 Mpps przy 1200 B), a worker zdejmuje
@@ -208,6 +210,8 @@ kernel_params_ok() {   # kernel_params_ok PLIK_GRUB — czy GRUB ma już wszystk
   local p
   for p in $KERNEL_JITTER_PARAMS; do grep -q -- "$p" "$1" 2>/dev/null || return 1; done
 }
+
+fmt_mpps() { awk -v p="$1" 'BEGIN {printf "%.1f", p / 1000000}'; }   # pakiety/s → "1.8"
 
 valid_ip4_32() {   # a.b.c.d/32 — adres loop0: IPv4 hosta z maską /32, nie 0.0.0.0, nie 127/8, nie multicast
   local ip=${1%/32} o
@@ -10114,7 +10118,8 @@ workers_plan() {
   printf '  po zmianie:                %d workerów na rdzeniach %s (rdzeń główny VPP: %s)\n' "$VPP_WORKERS" "$WORKERS_CSV" "$MAIN_CORE"
   printf '  izolowane rdzenie:         %s\n' "$ISOL_CSV"
   printf '  maksimum na węźle %s:      %d (rdzenie fizyczne bez %d systemowych i głównego VPP)\n' "$NUMA" "$avail_w" "$HK_RES"
-  printf '  zalecane dla %s:   %d\n' "$NIC_MODEL" "$NIC_CAP"
+  printf '  zalecane dla %s:   %d (wydajność rdzenia: potrzeba %d na łącze przy %d B)\n' "$NIC_MODEL" "$NIC_CAP" "${NEED_W:-0}" "$VPP_SIZING_PKT"
+  printf '  pojemność (szacunek):      %s\n' "${CAPACITY:-?}"
   printf '  porty VPP (%d): %s — bufory i kolejki RX liczone dla każdego; inny port: install-router set_workers N --choose-nic\n' \
     "${#NIC_PCI[@]}" "${NIC_PCI[*]}"
   printf '  bufory VPP: %d (tryb %s, maksimum %d), sterta %s, hugepages %d × 2 MB\n' "$BUFFERS" "$VPP_BUFFERS" "$BUF_MAX" "$MAIN_HEAP" "$HUGEPAGES_2M"
@@ -10417,13 +10422,14 @@ fi
 sect "Karta sieciowa"
 NIC_DEV=$(cat "/sys/bus/pci/devices/${NIC_PCI[0]}/device")
 case $NIC_DEV in
-  0x1013) NIC_MODEL="ConnectX-4";        NIC_CAP=12 ;;
-  0x1015) NIC_MODEL="ConnectX-4 Lx";     NIC_CAP=8 ;;
-  0x1017) NIC_MODEL="ConnectX-5";        NIC_CAP=16 ;;
-  0x1019) NIC_MODEL="ConnectX-5 Ex";     NIC_CAP=18 ;;
-  0x101b|0x101d|0x101f) NIC_MODEL="ConnectX-6"; NIC_CAP=20 ;;
-  0x1021) NIC_MODEL="ConnectX-7";        NIC_CAP=24 ;;
-  *)      NIC_MODEL="Mellanox $NIC_DEV"; NIC_CAP=12 ;;
+  0x1013) NIC_MODEL="ConnectX-4";        NIC_CAP=12; NIC_LINE=100000 ;;
+  0x1015) NIC_MODEL="ConnectX-4 Lx";     NIC_CAP=8;  NIC_LINE=50000 ;;
+  0x1017) NIC_MODEL="ConnectX-5";        NIC_CAP=16; NIC_LINE=100000 ;;
+  0x1019) NIC_MODEL="ConnectX-5 Ex";     NIC_CAP=18; NIC_LINE=100000 ;;
+  0x101b|0x101d) NIC_MODEL="ConnectX-6"; NIC_CAP=20; NIC_LINE=200000 ;;
+  0x101f) NIC_MODEL="ConnectX-6 Lx";     NIC_CAP=12; NIC_LINE=50000 ;;
+  0x1021) NIC_MODEL="ConnectX-7";        NIC_CAP=24; NIC_LINE=400000 ;;
+  *)      NIC_MODEL="Mellanox $NIC_DEV"; NIC_CAP=12; NIC_LINE=100000 ;;
 esac
 NIC_PN=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | sed -n 's/.*\[PN\] Part number: *//p' | head -n1)
 NIC_PSID=$(mstflint -d "${NIC_PCI[0]}" q 2>/dev/null | sed -n 's/^PSID: *//p' | head -n1)
@@ -10442,13 +10448,21 @@ for p in "${NIC_PCI[@]}"; do
     audit OK "PCIe $p" "${sta_s:-?}/s ${sta_w:-?}" ""
   fi
 done
-# Dwa porty na jednej karcie dzielą jedno złącze PCIe: Gen3 x16 ≈ 100 Gb/s, Gen4 x16 ≈ 200 Gb/s na kierunek.
+# Przepustowość portów i złącza (do doboru workerów i oszacowania pojemności). Prędkość portu z kernela, a gdy
+# porty ma już VPP (netdev znika) — nominalna dla modelu karty. Złącze: Gen3 x16 ≈ 100 Gb/s na kierunek.
+sp=0
+for p in "${NIC_PCI[@]}"; do
+  d=$(netdev_of "$p"); s1=$(cat "/sys/class/net/$d/speed" 2>/dev/null || echo 0)
+  [[ $s1 =~ ^[0-9]+$ ]] && ((s1 > 0)) || s1=$NIC_LINE
+  sp=$((sp + s1))
+done
+PORTS_MBPS=$sp
+gt=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta: Speed [0-9.]*GT/s' | grep -o '[0-9.]*' | head -n1)
+w=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta:.*Width x[0-9]*' | grep -o '[0-9]*$' | head -n1)
+case ${gt:-0} in 2.5) per=2 ;; 5) per=4 ;; 8) per=8 ;; 16) per=16 ;; 32) per=32 ;; *) per=0 ;; esac
+bus=$(( per * ${w:-0} * 98 / 100 * 80 / 100 ))   # Gb/s użytkowe na kierunek: kodowanie 128b/130b i ~20% narzutu TLP/DMA
+PCIE_GBPS=$bus
 if ((${#NIC_PCI[@]} > 1)); then
-  sp=0; for p in "${NIC_PCI[@]}"; do d=$(netdev_of "$p"); s1=$(cat "/sys/class/net/$d/speed" 2>/dev/null || echo 0); ((s1 > 0)) && sp=$((sp + s1)); done
-  gt=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta: Speed [0-9.]*GT/s' | grep -o '[0-9.]*' | head -n1)
-  w=$(lspci -s "${NIC_PCI[0]}" -vv 2>/dev/null | grep -o 'LnkSta:.*Width x[0-9]*' | grep -o '[0-9]*$' | head -n1)
-  case ${gt:-0} in 2.5) per=2 ;; 5) per=4 ;; 8) per=8 ;; 16) per=16 ;; 32) per=32 ;; *) per=0 ;; esac
-  bus=$(( per * ${w:-0} * 98 / 100 ))           # Gb/s użytkowe na kierunek (kodowanie 128b/130b), bez narzutu TLP
   if ((bus > 0 && sp / 1000 > bus)); then
     audit INFO "Przepustowość PCIe" "porty razem $((sp / 1000)) Gb/s, złącze ~${bus} Gb/s na kierunek (${gt} GT/s x${w})" \
       "przy pełnym obciążeniu obu portów limitem jest złącze, nie CPU — na 2×100G pełną prędkość daje PCIe Gen4 (ConnectX-6) albo dwie karty"
@@ -10522,13 +10536,50 @@ if ((NUMA_NODES > 1)); then HK_RES=1; else HK_RES=$(( (${#PHYS[@]} + 7) / 8 )); 
 avail_w=$(( ${#PHYS[@]} - HK_RES - 1 ))   # rdzenie systemowe na węźle karty + 1 rdzeń główny VPP
 ((avail_w >= 1)) || die "Węzeł NUMA $NUMA ma za mało rdzeni fizycznych (${#PHYS[@]}; system potrzebuje $HK_RES, VPP co najmniej 2)"
 ((NUMA_NODES > 1)) || audit AUTO "Rdzenie systemowe" "jeden węzeł NUMA, ${#PHYS[@]} rdzeni" "$HK_RES dla systemu (BIRD, SNMP, kernel), reszta dla VPP"
+# Wydajność rdzenia: ile pakietów/s zdejmie jeden worker. Koszt pakietu w cyklach zmierzony na lodz2-vpp
+# (show runtime, E5-2698 v4, ACL + guard): ~1600 cykli bez NetFlow, ~4400 z NetFlow na interfejsie. Nowsze
+# mikroarchitektury potrzebują mniej cykli, więc dla nich oszacowanie jest ostrożne. Taktowanie: maksymalne
+# z cpufreq × 0,8 (turbo przy wszystkich rdzeniach obciążonych), bez cpufreq — "cpu MHz" albo nazwa modelu.
+CYC_FWD=1600; CYC_NF=4400
+cpu_khz=${ROUTER_TEST_CPU_KHZ:-$(cat "/sys/devices/system/cpu/cpu${PHYS[0]}/cpufreq/cpuinfo_max_freq" 2>/dev/null || true)}
+[[ $cpu_khz =~ ^[0-9]+$ ]] || cpu_khz=$(awk -F: '/^cpu MHz/ {v = $2 + 0; if (v > m) m = v} END {printf "%d", m * 1000}' /proc/cpuinfo)
+if ! ((cpu_khz > 0)); then
+  cpu_khz=$(grep -m1 -oE '@ *[0-9.]+GHz' /proc/cpuinfo | grep -oE '[0-9.]+' | awk '{printf "%d", $1 * 1000000 / 0.8}')
+fi
+((cpu_khz > 0)) || cpu_khz=2500000
+EFF_MHZ=$(( cpu_khz * 80 / 100 / 1000 ))
+PPS_W=$(( EFF_MHZ * 1000000 / CYC_FWD ))        # pakiety/s na workera bez NetFlow
+PPS_W_NF=$(( EFF_MHZ * 1000000 / CYC_NF ))      # z NetFlow
+line_gbps=$(( PORTS_MBPS / 1000 )); ((PCIE_GBPS > 0 && PCIE_GBPS < line_gbps)) && line_gbps=$PCIE_GBPS
+# ile workerów, żeby obsłużyć porty z prędkością łącza przy typowym pakiecie (+25% zapasu na bursty)
+need_pps=$(( line_gbps * 1000000000 / (8 * (VPP_SIZING_PKT + 20)) * 125 / 100 ))
+NEED_W=$(( (need_pps + PPS_W - 1) / PPS_W ))
+audit INFO "Wydajność rdzenia" "$((cpu_khz / 1000)) MHz maks., do obliczeń $EFF_MHZ MHz" \
+  "worker: ~$(fmt_mpps "$PPS_W") Mpps bez NetFlow, ~$(fmt_mpps "$PPS_W_NF") Mpps z NetFlow; na ${line_gbps} Gb/s przy ${VPP_SIZING_PKT} B potrzeba $NEED_W"
 if [[ $VPP_WORKERS == auto ]]; then
-  VPP_WORKERS=$(( NIC_CAP < avail_w ? NIC_CAP : avail_w ))
-  audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w" "$VPP_WORKERS (powyżej $NIC_CAP karta i tak nie nadąży)"
+  # Co najmniej tyle, ile karta sensownie rozkłada (NIC_CAP — zapas na ataki małymi pakietami); więcej tylko,
+  # gdy procesor jest za wolny, żeby z NIC_CAP workerami obsłużyć łącze (najwyżej 2× NIC_CAP) — i zawsze
+  # w granicach wolnych rdzeni węzła karty.
+  want=$(( NEED_W > NIC_CAP ? NEED_W : NIC_CAP ))
+  ((want > NIC_CAP * 2)) && want=$((NIC_CAP * 2))
+  VPP_WORKERS=$(( want < avail_w ? want : avail_w ))
+  if ((NEED_W > NIC_CAP)); then
+    audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w, procesor ${EFF_MHZ} MHz" \
+      "$VPP_WORKERS (więcej niż $NIC_CAP dla karty, bo rdzeń za wolny na łącze z $NIC_CAP workerami)"
+  else
+    audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w" "$VPP_WORKERS (powyżej $NIC_CAP karta i tak nie nadąży)"
+  fi
+  ((NEED_W > avail_w)) && rec 2 "sprzęt" "Szybszy procesor albo więcej rdzeni na węźle karty" \
+    "do obsługi ${line_gbps} Gb/s przy ${VPP_SIZING_PKT} B potrzeba ~$NEED_W workerów, a jest $avail_w wolnych rdzeni"
 else
   ((VPP_WORKERS <= avail_w)) || die "VPP_WORKERS=$VPP_WORKERS, a na węźle $NUMA jest tylko $avail_w wolnych rdzeni"
   audit OK "Workery VPP" "$VPP_WORKERS (ustawione ręcznie)" ""
 fi
+# Oszacowanie pojemności routera (raport audytu): CPU vs łącze/PCIe
+cap_pps=$(( VPP_WORKERS * PPS_W )); cap_nf=$(( VPP_WORKERS * PPS_W_NF ))
+cap_gb() { local g=$(( $1 * 8 * ($2 + 20) / 1000000000 )); ((g > line_gbps)) && g=$line_gbps; echo "$g"; }
+CAPACITY="bez NetFlow ~$(fmt_mpps "$cap_pps") Mpps (64 B: $(cap_gb "$cap_pps" 64) Gb/s, 400 B: $(cap_gb "$cap_pps" 400) Gb/s, ${VPP_SIZING_PKT} B: $(cap_gb "$cap_pps" "$VPP_SIZING_PKT") Gb/s); z NetFlow wszędzie ~$(fmt_mpps "$cap_nf") Mpps (${VPP_SIZING_PKT} B: $(cap_gb "$cap_nf" "$VPP_SIZING_PKT") Gb/s); łącze/PCIe ${line_gbps} Gb/s"
+audit INFO "Pojemność (szacunek)" "$VPP_WORKERS workerów × $EFF_MHZ MHz" "$CAPACITY"
 MAIN_CORE=${PHYS[HK_RES]}
 WORKERS=("${PHYS[@]:HK_RES+1:VPP_WORKERS}")
 WORKERS_CSV=$(join_by , "${WORKERS[@]}")
@@ -10727,6 +10778,7 @@ INST_EXTRA_CMDLINE="${EXTRA_CMDLINE[*]}"
 INST_ROUTER_ID=$ROUTER_ID
 INST_LOOP0_ADDR="${LOOP0_ADDR:--}"
 INST_RX_DESC_CAP=$( ((VPP_RX_DESC < rx_want)) && echo "$VPP_RX_DESC" )
+INST_CAPACITY="$CAPACITY"
 INST_NETFLOW_ENABLE=$NETFLOW_ENABLE
 SNMP_COMMUNITY=$SNMP_COMMUNITY
 EOF
@@ -14571,7 +14623,7 @@ Zasada działania:
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
 - **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
-- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Liczbę workerów instalator liczy z wydajności procesora: maksymalne taktowanie × 0,8 i koszt pakietu (~1600 cykli bez NetFlow, ~4400 z NetFlow) dają pakiety/s na workera; workerów jest co najmniej tyle, ile karta sensownie rozkłada (zapas na ataki małymi pakietami), a więcej, gdy rdzeń jest za wolny na obsłużenie łącza przy typowym pakiecie `VPP_SIZING_PKT` (800 B) — najwyżej 2× i nigdy więcej niż wolnych rdzeni. Szacowaną pojemność routera (Mpps i Gb/s z NetFlow i bez) pokazuje raport audytu i `install-router set_workers --dry-run`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
 
 ---
 
