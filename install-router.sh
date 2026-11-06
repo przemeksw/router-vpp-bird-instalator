@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.34"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.35"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2661,6 +2661,64 @@ def tasks_on_cpu(cpu, skip_pid=None, n=4):
     return ", ".join(sorted(seen)[:n])
 
 
+# ------------------------------------------------------------------ zajętość workerów w %
+# Wektor rośnie dopiero przy ~80% zajętości (paczki robią się duże, gdy brakuje pustych obiegów), więc do pytania
+# "ile zapasu" lepsza jest liczba pętli: pusty obieg pętli workera kosztuje stały czas, zależny od CPU, taktowania
+# i liczby kolejek, które worker sprawdza. Zajętość ≈ 1 − pętle/s ÷ pętle/s na luzie. "Na luzie" nie jest wpisane
+# na sztywno: każdy worker uczy się go sam (najwyższa wartość pętli/s zmierzona przy wektorze < IDLE_VEC, czyli
+# gdy prawie wszystkie obiegi są puste), więc działa na każdym serwerze. Wynik zapisywany w IDLE_FILE (czyta go
+# też router-top); unieważniany, gdy zmieni się liczba wątków VPP. Worker bez pomiaru dostaje medianę pozostałych
+# (te same rdzenie, ta sama konfiguracja), a bez żadnego pomiaru zajętość jest nieznana (None), nie zgadywana.
+IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", "/var/lib/router/vpp-idle-loops.json")
+IDLE_VEC = 1.1
+
+
+class IdleLoops:
+    def __init__(self, path):
+        self.path, self.idle, self.dirty = path, [], False
+        try:
+            with open(path) as f:
+                self.idle = [float(x) for x in json.load(f).get("idle", [])]
+        except (OSError, ValueError, TypeError, AttributeError):
+            self.idle = []
+
+    def learn(self, vrow, lrow):
+        n = len(lrow)
+        if len(self.idle) != n:                      # inna liczba wątków VPP (set_workers) — uczymy się od nowa
+            self.idle, self.dirty = [0.0] * n, True
+        for i in range(n):
+            v = vrow[i] if i < len(vrow) else 99.0
+            lp = float(lrow[i] or 0)
+            if v < IDLE_VEC and lp > self.idle[i]:
+                self.idle[i], self.dirty = lp, True
+
+    def base(self, i):
+        if i < len(self.idle) and self.idle[i] > 0:
+            return self.idle[i]
+        known = sorted(x for x in self.idle[1:] if x > 0)
+        return known[len(known) // 2] if known else 0.0
+
+    def busy(self, i, loops):
+        """Zajętość workera w % (0–100) albo None, gdy pętle na luzie jeszcze nieznane."""
+        b = self.base(i)
+        if b <= 0:
+            return None
+        return round(100.0 * max(0.0, min(1.0, 1.0 - float(loops or 0) / b)), 1)
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"idle": self.idle, "time": int(time.time())}, f)
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except OSError:
+            pass
+
+
 # ------------------------------------------------------------------ SMI (przerwania BIOS-u)
 # SMI zatrzymuje rdzeń na setki µs–ms poza kontrolą kernela: bez wywłaszczenia (WK_PREEMPT tego nie widzi),
 # bez wpisu w /proc/interrupts. Źródła: patrol/demand scrub pamięci, emulacja USB, zarządzanie energią, iDRAC/BMC.
@@ -2730,6 +2788,7 @@ def main():
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
     smi_prev, wk_last_t, smi_last_t = {}, 0.0, 0.0
+    idle, idle_saved_t = IdleLoops(IDLE_FILE), 0.0
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -2795,6 +2854,15 @@ def main():
                     sum(1 for _, v in workers if v >= CFG["VEC_WARN"]), len(workers))
                 state["vector_max"], state["vector_worker"] = wv, wi
                 state["vector_per_worker"] = [v for _, v in workers]
+                idle.learn(vrow, lrow)
+                busy = [idle.busy(i, lrow[i] if i < len(lrow) else 0) for i, _ in workers]
+                state["worker_busy"] = busy
+                known = [b for b in busy if b is not None]
+                if known:
+                    state["worker_busy_max"] = max(known)
+                if t0 - idle_saved_t >= 60:
+                    idle.save()
+                    idle_saved_t = t0
                 crit = wv >= CFG["VEC_CRIT"]
                 a_load.update(t0, wv >= CFG["VEC_WARN"], wv, txt,
                               sev=2 if crit else 4, mnem="LOAD_CRITICAL" if crit else "LOAD_HIGH")
@@ -6390,6 +6458,7 @@ SCALARS = [
         (21, "rvIfacesDrift", "int", "", "1 = interfejsy VPP roznia sie od ifaces.conf"),
         (22, "rvVppWkPreempt", "gauge", "", "Wywlaszczenia workerow VPP na sekunde (cos poza VPP na izolowanym rdzeniu)"),
         (23, "rvVppSmi", "gauge", "", "Przerwania BIOS (SMI) na rdzeniach workerow VPP na sekunde"),
+        (24, "rvVppWorkerBusyMax", "gauge", "%", "Zajetosc najbardziej obciazonego workera VPP w %"),
     ]),
     (8, "rvFirewall", "Firewall tranzytu (router-fw)", [
         (1, "rvFwEnabled", "int", "", "1 = firewall aktywny na stale (router-fw enable)"),
@@ -6429,6 +6498,7 @@ TABLES = [
         (1, "rvWorkerIndex", "int", "", "Numer workera"),
         (2, "rvWorkerName", "string", "", "Worker i rdzen CPU"),
         (3, "rvWorkerVector", "gauge", "", "Sredni rozmiar wektora (1 = luz, 256 = nasycenie)"),
+        (4, "rvWorkerBusyPct", "gauge", "%", "Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana"),
     ]),
     (4, "rvPortTable", "rvPortEntry", "Porty fizyczne VPP: straty i bledy", [
         (1, "rvPortIndex", "int", "", "Indeks"),
@@ -6950,10 +7020,15 @@ class Collector:
                     s[name] = int(round(mon[key]))
             cores = [c for c in env_value(ENVF, "INST_WORKERS").split(",") if c]
             vec = mon.get("vector_per_worker", [])
+            busy = mon.get("worker_busy", [])
             s["rvVppWorkers"] = len(vec)
+            if mon.get("worker_busy_max") is not None:
+                s["rvVppWorkerBusyMax"] = int(round(mon["worker_busy_max"]))
             for i, v in enumerate(vec, 1):
+                b = busy[i - 1] if i - 1 < len(busy) else None
                 t.setdefault("rvWorkerTable", {})[str(i)] = {
                     "rvWorkerIndex": i, "rvWorkerVector": int(round(v)),
+                    "rvWorkerBusyPct": -1 if b is None else int(round(b)),
                     "rvWorkerName": "worker %d cpu %s" % (i, cores[i - 1] if i <= len(cores) else "?")}
         if "hk_cpu_max" in mon and time.time() - mon.get("time", 0) < 15:
             s["rvVppHkCpuMax"] = int(round(mon["hk_cpu_max"]))
@@ -7513,25 +7588,76 @@ def bar(frac, width=24):
     return "█" * n + "░" * (width - n)
 
 
+# Zajętość workera w %: 1 − pętle/s ÷ pętle/s na luzie (pusty obieg kosztuje stały czas na danym CPU). Wartość
+# "na luzie" uczy się router-monitor (IDLE_FILE, przy wektorze < IDLE_VEC) — router-top ją czyta i douczą się sam,
+# więc działa na każdym serwerze bez ustawiania czegokolwiek. Bez pomiaru zajętość jest nieznana ("?").
+IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", ROOT + "/var/lib/router/vpp-idle-loops.json")
+IDLE_VEC = 1.1
+IDLE_LOCAL = []                                                       # pomiary router-top (indeks = wątek VPP)
+BUSY_WARN, BUSY_CRIT = 70.0, 90.0
+
+
+def idle_loops(n):
+    """Pętle/s na luzie dla wątków 0..n-1: maksimum z IDLE_FILE i własnych pomiarów; brak → mediana innych workerów."""
+    try:
+        with open(IDLE_FILE) as f:
+            saved = [float(x) for x in json.load(f).get("idle", [])]
+    except (OSError, ValueError, TypeError, AttributeError):
+        saved = []
+    if len(saved) != n:
+        saved = []
+    out = [max(saved[i] if saved else 0.0, IDLE_LOCAL[i] if i < len(IDLE_LOCAL) else 0.0) for i in range(n)]
+    known = sorted(x for x in out[1:] if x > 0)
+    med = known[len(known) // 2] if known else 0.0
+    return [x if x > 0 else med for x in out]
+
+
+def learn_idle(workers):
+    global IDLE_LOCAL
+    if len(IDLE_LOCAL) != len(workers):
+        IDLE_LOCAL = [0.0] * len(workers)
+    for i, (vecr, loops) in enumerate(workers):
+        if vecr < IDLE_VEC and loops > IDLE_LOCAL[i]:
+            IDLE_LOCAL[i] = float(loops)
+
+
+def busy_pct(loops, base):
+    return None if base <= 0 else 100.0 * max(0.0, min(1.0, 1.0 - float(loops) / base))
+
+
 def screen_load(workers):
-    """Obciążenie VPP (odpowiednik QFP): średni rozmiar wektora każdego workera — 1 = luz, 256 = nasycenie."""
+    """Obciążenie VPP (odpowiednik QFP): zajętość workera w % (z pętli) i średni rozmiar wektora (1 = luz, 256 = nasycenie)."""
     if not workers:
         return []
     warn = float(read_kv(MONITOR_CONF, "VEC_WARN", "64") or 64)
     crit = float(read_kv(MONITOR_CONF, "VEC_CRIT", "160") or 160)
     cores = [c for c in read_kv(ENV_FILE, "INST_WORKERS").split(",") if c]
+    learn_idle(workers)
+    base = idle_loops(len(workers))
     rows = [(i, w) for i, w in enumerate(workers) if i > 0] or [(0, workers[0])]   # 0 = wątek główny
-    lines = [("  OBCIĄŻENIE VPP (wektor: 1 = luz, %d = alarm, %d = krytyczne, 256 = nasycenie)" % (warn, crit), "head")]
+    lines = [("  OBCIĄŻENIE VPP (zajętość: z pętli/s względem luzu; wektor: 1 = luz, %d = alarm, %d = krytyczne, 256 = nasycenie)"
+              % (warn, crit), "head"),
+             ("  %-22s %-24s %8s %8s  %-10s %16s" % ("wątek VPP", "zajętość", "%", "wektor", "stan", "pętle/s"), "head")]
+    busys = []
     for i, (vecr, loops) in rows:
-        state, style = ("NASYCENIE", "miss") if vecr >= crit else ("WYSOKIE", "warn") if vecr >= warn else \
-            ("praca", "hit") if vecr >= 4 else ("luz", "dim")
+        b = busy_pct(loops, base[i] if i < len(base) else 0.0)
+        if vecr >= crit:                       # przy nasyceniu pętle prawie stają — liczymy jak 100%
+            b = 100.0 if b is None else max(b, 100.0 * min(1.0, vecr / 256.0), 95.0)
+        busys.append(b)
+        state, style = ("NASYCENIE", "miss") if vecr >= crit or (b or 0) >= BUSY_CRIT else \
+            ("WYSOKIE", "warn") if vecr >= warn or (b or 0) >= BUSY_WARN else \
+            ("praca", "hit") if vecr >= 4 or (b or 0) >= 20 else ("luz", "dim")
         core = cores[i - 1] if 0 < i <= len(cores) else "?"
         name = "worker %d (rdzeń %s)" % (i, core) if i else "wątek główny"
-        lines.append(("  %-22s %s %6.1f  %-10s %10s pętli/s" % (name, bar(vecr / 256.0), vecr, state, fmt_pps(loops)),
-                      style))
+        lines.append(("  %-22s %s %7s%% %8.1f  %-10s %10s pętli/s" % (
+            name, bar((b or 0) / 100.0), "?" if b is None else "%.0f" % b, vecr, state, fmt_pps(loops)), style))
     peak = max(w[0] for _i, w in rows)
-    lines.append(("  najwyżej: %.1f   średnio: %.1f   (rośnie z ruchem; trwale > %d = workery nie nadążają, patrz zgub./s)"
-                  % (peak, sum(w[0] for _i, w in rows) / len(rows), warn), "dim"))
+    known = [b for b in busys if b is not None]
+    lines.append(("  zajętość: najwyżej %s, średnio %s   wektor: najwyżej %.1f, średnio %.1f" % (
+        "%.0f%%" % max(known) if known else "?", "%.0f%%" % (sum(known) / len(known)) if known else "?",
+        peak, sum(w[0] for _i, w in rows) / len(rows)), "dim"))
+    lines.append(("  zajętość rośnie z ruchem od pierwszych pakietów; wektor dopiero przy ~80%% (trwale > %d = workery nie nadążają)%s"
+                  % (warn, "; ? = router-monitor jeszcze nie zmierzył pętli na luzie" if None in busys else ""), "dim"))
     lines.append(("", ""))
     return lines
 

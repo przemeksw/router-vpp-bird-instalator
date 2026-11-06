@@ -310,6 +310,14 @@ modules:
                     group: 'VPP'
                     low_limit: 20
                 -
+                    oid: 'rvVppWorkerBusyMax'
+                    value: 'rvVppWorkerBusyMax'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.24.{{ $index }}'
+                    descr: 'VPP: zajętość najbardziej obciążonego workera'
+                    index: 'rvVppWorkerBusyMax.{{ $index }}'
+                    group: 'VPP'
+                    high_limit: 90
+                -
                     oid: 'rvVppHkCpuMax'
                     value: 'rvVppHkCpuMax'
                     num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.2.7.{{ $index }}'
@@ -349,6 +357,14 @@ modules:
                     index: 'rvDiskWearPct.{{ $index }}'
                     group: 'Dyski'
                     high_limit: 80
+                -
+                    oid: 'rvWorkerTable'
+                    value: 'rvWorkerBusyPct'
+                    num_oid: '.1.3.6.1.4.1.8072.9999.9999.630.3.1.4.{{ $index }}'
+                    descr: 'Zajętość {{ $rvWorkerName }}'
+                    index: 'rvWorkerBusyPct.{{ $index }}'
+                    group: 'VPP'
+                    high_limit: 90
                 -
                     oid: 'rvRaidTable'
                     value: 'rvRaidSyncPct'

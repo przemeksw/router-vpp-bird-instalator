@@ -11,7 +11,11 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.34"                     '^SCRIPT_VERSION="1\.5\.34"' 1
+chk "wersja skryptu 1.5.35"                     '^SCRIPT_VERSION="1\.5\.35"' 1
+chk "router-monitor: zajętość workerów z pętli (IdleLoops)" '^class IdleLoops:' 1
+chk "router-top: kolumna zajętości i pasek %"  '^def busy_pct\(loops, base\):' 1
+chk "luz uczony, nie wpisany na sztywno (router-monitor i router-top)" '^IDLE_VEC = 1\.1$' 2
+chk "router-snmp: rvWorkerBusyPct i rvVppWorkerBusyMax" '\(4, "rvWorkerBusyPct", "gauge"|\(24, "rvVppWorkerBusyMax", "gauge"' 2
 chk "instalacja pyta o adres loop0"            'read -rp "  Adres loop0 \[\$\{LOOP0_ADDR:--\}\]: " ans' 1
 chk "loop0 z router.env przy kolejnych uruchomieniach" 'INST_LOOP0_ADDR="\$\{LOOP0_ADDR:--\}"|^INST_LOOP0_ADDR=' 1
 chk "loop0: odczyt INST_LOOP0_ADDR z router.env" "sed -n 's/\^INST_LOOP0_ADDR=" 1

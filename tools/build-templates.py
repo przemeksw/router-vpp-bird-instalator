@@ -55,6 +55,7 @@ TITLE = {
     "rvVppPuntPps": "VPP: ruch do control plane (punt)", "rvVppRxMissPps": "VPP: straty na wejściu (rx-miss)",
     "rvVppNicDiscardPps": "VPP: odrzucenia sprzętowe karty", "rvVppHkCpuMax": "System: najbardziej zajęty rdzeń systemowy",
     "rvVppWkPreempt": "VPP: wywłaszczenia workerów (coś poza VPP na izolowanym rdzeniu)",
+    "rvVppWorkerBusyMax": "VPP: zajętość najbardziej obciążonego workera, %",
     "rvVppSmi": "System: przerwania BIOS (SMI) na rdzeniach workerów VPP",
     "rvVppBufAvail": "VPP: bufory wolne",
     "rvVppBufUsed": "VPP: bufory zajęte", "rvVppBufCached": "VPP: bufory w pamięci wątków",
@@ -78,7 +79,7 @@ TITLE = {
     "rvGuardDrift": "Guard: rozjazd VPP ze stanem",
     "rvRpkiEnforce": "RPKI: odrzucanie INVALID", "rvRpkiInvalid": "RPKI: trasy INVALID w BIRD",
     "rvRpkiValidatorUp": "RPKI: Routinator działa", "rvRpkiCheckAge": "RPKI: wiek kontroli router-rpki",
-    "rvWorkerVector": "wektor", "rvPortRxMiss": "rx-miss", "rvPortRxNoBuf": "rx-no-buf", "rvPortRxErrors": "rx-error",
+    "rvWorkerVector": "wektor", "rvWorkerBusyPct": "zajętość %", "rvPortRxMiss": "rx-miss", "rvPortRxNoBuf": "rx-no-buf", "rvPortRxErrors": "rx-error",
     "rvPortTxErrors": "tx-error", "rvPortDrops": "drops", "rvPortPunt": "punt", "rvPortHwDiscards": "odrzucenia sprzętowe",
     "rvErrorCount": "licznik",
     "rvBgpPeerState": "stan", "rvBgpPeerEnabled": "włączona", "rvBgpPeerUptime": "czas zestawienia",
@@ -124,6 +125,7 @@ MACROS = [
     ("{$RV.DISCARD.MAX}", "1", "Odrzucenia sprzętowe karty (pakiety/s) przez 5 minut"),
     ("{$RV.PUNT.MAX}", "20000", "Ruch do control plane (pakiety/s) przez 5 minut"),
     ("{$RV.HKCPU.MAX}", "90", "Zajętość rdzenia systemowego (%) przez 5 minut"),
+    ("{$RV.WORKER.BUSY.MAX}", "90", "Zajętość workera VPP (%) przez 5 minut"),
     ("{$RV.BUF.FREE.MIN}", "20", "Najmniej wolnych buforów VPP (%)"),
     ("{$RV.FIB.DIFF.MAX}", "2", "Największa różnica FIB VPP i BIRD (%) przez 15 minut"),
     ("{$RV.GUARD.TABLE.MAX}", "90", "Zapełnienie tablicy guard (%)"),
@@ -168,6 +170,8 @@ SCALAR_TRIGGERS = [
      ["rvVppPuntPps"]),
     ("min({rvVppHkCpuMax},5m)>{$RV.HKCPU.MAX}", "WARNING", "System: przeciążony rdzeń systemowy (BIRD/SNMP)",
      ["rvVppHkCpuMax"]),
+    ("min({rvVppWorkerBusyMax},5m)>{$RV.WORKER.BUSY.MAX}", "AVERAGE",
+     "VPP: worker zajęty ponad {$RV.WORKER.BUSY.MAX}% od 5 minut ({ITEM.LASTVALUE1}%) — mało zapasu", ["rvVppWorkerBusyMax"]),
     ("last({rvVppWkPreempt})>0", "HIGH", "VPP: worker wywłaszczony z izolowanego rdzenia (router-kthreads -n)",
      ["rvVppWkPreempt"]),
     ("last({rvVppSmi})>0", "HIGH", "System: przerwania BIOS (SMI) na rdzeniach workerów VPP", ["rvVppSmi"]),
@@ -192,8 +196,8 @@ SCALAR_TRIGGERS = [
 # reguły odkrywania: tabela, makra LLD (makro → kolumna), pozycje (kolumny), wyzwalacze, wykres
 DISCOVERY = [
     {"key": "rv.worker.discovery", "name": "Workery VPP", "table": "rvWorkerTable",
-     "macros": {"{#RV.NAME}": "rvWorkerName"}, "label": "Worker {#RV.NAME}", "items": ["rvWorkerVector"],
-     "graph": ("Workery VPP: wektor {#RV.NAME}", ["rvWorkerVector"])},
+     "macros": {"{#RV.NAME}": "rvWorkerName"}, "label": "Worker {#RV.NAME}", "items": ["rvWorkerVector", "rvWorkerBusyPct"],
+     "graph": ("Workery VPP: zajętość i wektor {#RV.NAME}", ["rvWorkerBusyPct", "rvWorkerVector"])},
     {"key": "rv.port.discovery", "name": "Porty VPP", "table": "rvPortTable",
      "macros": {"{#RV.NAME}": "rvPortName"}, "label": "Port {#RV.NAME}",
      "items": ["rvPortRxMiss", "rvPortRxNoBuf", "rvPortRxErrors", "rvPortTxErrors", "rvPortDrops", "rvPortPunt",
@@ -250,7 +254,7 @@ DISCOVERY = [
 
 SCALAR_GRAPHS = [
     ("VPP: straty i odrzucenia", ["rvVppRxMissPps", "rvVppNicDiscardPps", "rvVppDrops", "rvVppErrors"]),
-    ("VPP: obciążenie", ["rvVppVectorMax", "rvVppHkCpuMax"]),
+    ("VPP: obciążenie", ["rvVppWorkerBusyMax", "rvVppVectorMax", "rvVppHkCpuMax"]),
     ("VPP: izolacja workerów (wywłaszczenia, SMI)", ["rvVppWkPreempt", "rvVppSmi"]),
     ("VPP: ruch do control plane", ["rvVppPuntPps"]),
     ("VPP: bufory", ["rvVppBufAvail", "rvVppBufUsed", "rvVppBufCached"]),
@@ -418,11 +422,13 @@ LNMS_COUNT_TABLE = [("rvBgpPeerImported", "Prefiksy od {{ $rvBgpPeerName }} {{ $
                     ("rvDiskPending", "{{ $rvDiskName }}: sektory oczekujące", "Dyski"),
                     ("rvDiskRealloc", "{{ $rvDiskName }}: sektory realokowane", "Dyski")]
 LNMS_PERCENT = [("rvVppBufFreePct", "VPP: wolne bufory", "VPP", "low", 20),
+                ("rvVppWorkerBusyMax", "VPP: zajętość najbardziej obciążonego workera", "VPP", "high", 90),
                 ("rvVppHkCpuMax", "Rdzeń systemowy: zajętość", "Router", "high", 90),
                 ("rvFibDiffPct", "FIB VPP vs BIRD: różnica", "Trasy", "high", 2),
                 ("rvGuardTable4Pct", "Guard: tablica IPv4", "Router", "high", 90),
                 ("rvGuardTable6Pct", "Guard: tablica IPv6", "Router", "high", 90)]
 LNMS_PERCENT_TABLE = [("rvDiskWearPct", "{{ $rvDiskName }}: zużycie SSD", "Dyski", "high", 80),
+                      ("rvWorkerBusyPct", "Zajętość {{ $rvWorkerName }}", "VPP", "high", 90),
                       ("rvRaidSyncPct", "RAID {{ $rvRaidName }}: synchronizacja", "RAID", "low", 100)]
 LNMS_TEMP_TABLE = [("rvDiskTemp", "Dysk {{ $rvDiskName }}", "Dyski", 60),
                    ("rvTempValue", "CPU {{ $rvTempName }}", "CPU", 85)]
@@ -544,7 +550,7 @@ def mib():
 
 
 # --------------------------------------------------------------------------- Cacti
-CACTI = [("rvWorkerTable", "router_vpp_workers", "Router VPP - workery (wektor)"),
+CACTI = [("rvWorkerTable", "router_vpp_workers", "Router VPP - workery (zajetosc %, wektor)"),
          ("rvPortTable", "router_vpp_ports", "Router VPP - porty: straty i bledy"),
          ("rvErrorTable", "router_vpp_errors", "Router VPP - liczniki show errors"),
          ("rvBgpPeerTable", "router_vpp_bgp_peers", "Router VPP - sesje BGP"),
@@ -630,6 +636,8 @@ def dsname(name):
 # opcje: cdef = CDEF dla wszystkich linii, upper = górna granica osi (bez sztywnego limitu)
 CG_SCALAR = [
     ("vector", "VPP - najwiekszy wektor workera", "wektor", [("rvVppVectorMax", "Wektor (1 luz, 256 nasycenie)", LINE)], {}),
+    ("busy", "VPP - zajetosc najbardziej obciazonego workera", "%", [("rvVppWorkerBusyMax", "Zajetosc workera", AREA)],
+     {"upper": 100}),
     ("hkcpu", "System - najbardziej zajety rdzen", "%", [("rvVppHkCpuMax", "Rdzen systemowy", AREA)], {"upper": 100}),
     ("loss", "VPP - straty pakietow", "pakiety/s", [("rvVppRxMissPps", "rx-miss + rx-no-buf", LINE),
                                                      ("rvVppNicDiscardPps", "Odrzucenia karty", LINE),
@@ -670,6 +678,8 @@ CG_SCALAR = [
 # Wykresy z zapytań SNMP (tablice): (klucz, tablica, tytuł po nazwie hosta, opis osi, [(kolumna, etykieta, linia)], opcje)
 CG_TABLE = [
     ("worker", "rvWorkerTable", "VPP |query_rvWorkerName| - wektor", "wektor", [("rvWorkerVector", "Wektor", LINE)], {}),
+    ("workerbusy", "rvWorkerTable", "VPP |query_rvWorkerName| - zajetosc", "%", [("rvWorkerBusyPct", "Zajetosc", AREA)],
+     {"upper": 100}),
     ("port", "rvPortTable", "Port |query_rvPortName| - straty i bledy", "pakiety/s",
      [("rvPortRxMiss", "rx-miss", LINE), ("rvPortRxNoBuf", "rx-no-buf", LINE), ("rvPortHwDiscards", "Odrzucenia karty", LINE),
       ("rvPortRxErrors", "rx-error", LINE), ("rvPortTxErrors", "tx-error", LINE), ("rvPortDrops", "drops", LINE),

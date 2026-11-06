@@ -376,7 +376,8 @@ class Fake:
         r = self.root
         write(r + "/run/router-monitor/state.json", json.dumps({
             "time": time.time(), "vector_max": 71.6, "vector_per_worker": [71.6, 3.2], "punt_pps": 120.4,
-            "rx_miss_pps": 0.0, "nic_discard_pps": 2.0, "hk_cpu_max": 35.5, "wk_preempt": 3, "smi": 0}))
+            "rx_miss_pps": 0.0, "nic_discard_pps": 2.0, "hk_cpu_max": 35.5, "wk_preempt": 3, "smi": 0,
+            "worker_busy": [62.4, None], "worker_busy_max": 62.4}))
         write(r + "/etc/router/router.env", 'INST_WORKERS="5,7"\n')
         write(r + "/etc/router/version", "SCRIPT_VERSION=1.5.0\nINSTALLED=2026-10-12\n")
         write(r + "/var/lib/router/ifaces.state.json", json.dumps({"drift": "hu0.999"}))
@@ -425,6 +426,9 @@ class TestCollector(unittest.TestCase):
         self.assertEqual((s["rvVppBufAvail"], s["rvVppBufCached"], s["rvVppBufUsed"], s["rvVppBufFreePct"]),
                          (170000, 10000, 20000, 90))
         self.assertEqual((s["rvVppWkPreempt"], s["rvVppSmi"]), (3, 0))
+        self.assertEqual(s["rvVppWorkerBusyMax"], 62)
+        wt = d["t"]["rvWorkerTable"]
+        self.assertEqual((wt["1"]["rvWorkerBusyPct"], wt["2"]["rvWorkerBusyPct"]), (62, -1))
         self.assertEqual((s["rvVppDrops"], s["rvVppRxMiss"], s["rvVppPunt"], s["rvVppErrors"]), (19, 45, 5, 15))
         self.assertEqual((s["rvFib4Routes"], s["rvBird4Routes"], s["rvFib6Routes"], s["rvBird6Routes"]),
                          (949051, 949000, 200000, 190000))

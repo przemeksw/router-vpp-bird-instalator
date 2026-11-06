@@ -232,6 +232,14 @@ rvVppSmi OBJECT-TYPE
     DESCRIPTION "Przerwania BIOS (SMI) na rdzeniach workerow VPP na sekunde"
     ::= { rvVpp 23 }
 
+rvVppWorkerBusyMax OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Zajetosc najbardziej obciazonego workera VPP w %"
+    ::= { rvVpp 24 }
+
 rvFirewall OBJECT IDENTIFIER ::= { routerVppMIB 8 }
 
 rvFwEnabled OBJECT-TYPE
@@ -442,7 +450,8 @@ rvWorkerEntry OBJECT-TYPE
 RvWorkerEntry ::= SEQUENCE {
     rvWorkerIndex                Integer32,
     rvWorkerName                 DisplayString,
-    rvWorkerVector               Gauge32
+    rvWorkerVector               Gauge32,
+    rvWorkerBusyPct              Gauge32
 }
 
 rvWorkerIndex OBJECT-TYPE
@@ -465,6 +474,14 @@ rvWorkerVector OBJECT-TYPE
     STATUS      current
     DESCRIPTION "Sredni rozmiar wektora (1 = luz, 256 = nasycenie)"
     ::= { rvWorkerEntry 3 }
+
+rvWorkerBusyPct OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "%"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana"
+    ::= { rvWorkerEntry 4 }
 
 rvPortTable OBJECT-TYPE
     SYNTAX      SEQUENCE OF RvPortEntry

@@ -407,6 +407,19 @@ zabbix_export:
               tag: 'component'
               value: 'vpp'
         -
+          uuid: 'ff1550963eb442a3aae9efa401252d7e'
+          name: 'VPP: zajętość najbardziej obciążonego workera, %'
+          type: 'SNMP_AGENT'
+          snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.2.24.0'
+          key: 'rvVppWorkerBusyMax'
+          history: '7d'
+          units: '%'
+          description: 'Zajetosc najbardziej obciazonego workera VPP w % (1.3.6.1.4.1.8072.9999.9999.630.2.24)'
+          tags:
+            -
+              tag: 'component'
+              value: 'vpp'
+        -
           uuid: '2de0a3c95d9443f58a6988b768d6d1e8'
           name: 'Firewall: aktywny'
           type: 'SNMP_AGENT'
@@ -834,14 +847,33 @@ zabbix_export:
                 -
                   tag: 'component'
                   value: 'vpp'
+            -
+              uuid: '7964f9d88dd84852915826e4ed0412ea'
+              name: 'Worker {#RV.NAME}: zajętość %'
+              type: 'SNMP_AGENT'
+              snmp_oid: '1.3.6.1.4.1.8072.9999.9999.630.3.1.4.{#SNMPINDEX}'
+              key: 'rvWorkerBusyPct[{#SNMPINDEX}]'
+              history: '7d'
+              units: '%'
+              description: 'Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana (1.3.6.1.4.1.8072.9999.9999.630.3.1.4)'
+              tags:
+                -
+                  tag: 'component'
+                  value: 'vpp'
           graph_prototypes:
             -
               uuid: '9d398dab2d1244ba9a8f6e8a6a961f19'
-              name: 'Workery VPP: wektor {#RV.NAME}'
+              name: 'Workery VPP: zajętość i wektor {#RV.NAME}'
               graph_items:
                 -
                   sortorder: '0'
                   color: '1A7C11'
+                  item:
+                    host: 'Router VPP BIRD by SNMP'
+                    key: 'rvWorkerBusyPct[{#SNMPINDEX}]'
+                -
+                  sortorder: '1'
+                  color: 'F63100'
                   item:
                     host: 'Router VPP BIRD by SNMP'
                     key: 'rvWorkerVector[{#SNMPINDEX}]'
@@ -1594,6 +1626,10 @@ zabbix_export:
           value: '90'
           description: 'Zajętość rdzenia systemowego (%) przez 5 minut'
         -
+          macro: '{$RV.WORKER.BUSY.MAX}'
+          value: '90'
+          description: 'Zajętość workera VPP (%) przez 5 minut'
+        -
           macro: '{$RV.BUF.FREE.MIN}'
           value: '20'
           description: 'Najmniej wolnych buforów VPP (%)'
@@ -1763,6 +1799,11 @@ zabbix_export:
       name: 'System: przeciążony rdzeń systemowy (BIRD/SNMP)'
       priority: 'WARNING'
     -
+      uuid: '3a2c2907b398476499794616fd2481c0'
+      expression: 'min(/Router VPP BIRD by SNMP/rvVppWorkerBusyMax,5m)>{$RV.WORKER.BUSY.MAX}'
+      name: 'VPP: worker zajęty ponad {$RV.WORKER.BUSY.MAX}% od 5 minut ({ITEM.LASTVALUE1}%) — mało zapasu'
+      priority: 'AVERAGE'
+    -
       uuid: 'b8b017b8d9874666b84b2d3e90af3e83'
       expression: 'last(/Router VPP BIRD by SNMP/rvVppWkPreempt)>0'
       name: 'VPP: worker wywłaszczony z izolowanego rdzenia (router-kthreads -n)'
@@ -1855,10 +1896,16 @@ zabbix_export:
           color: '1A7C11'
           item:
             host: 'Router VPP BIRD by SNMP'
-            key: 'rvVppVectorMax'
+            key: 'rvVppWorkerBusyMax'
         -
           sortorder: '1'
           color: 'F63100'
+          item:
+            host: 'Router VPP BIRD by SNMP'
+            key: 'rvVppVectorMax'
+        -
+          sortorder: '2'
+          color: '2774A4'
           item:
             host: 'Router VPP BIRD by SNMP'
             key: 'rvVppHkCpuMax'

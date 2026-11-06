@@ -2,7 +2,7 @@
 	<hash_020103843c4ebc061ce655b5dcd88541d96a96>
 		<name>Router VPP BIRD</name>
 		<class>linux</class>
-		<graph_templates>hash_0001034ad1656588575c339db35a9bba08d223|hash_00010341f727efaa3df62c60a34bf58b1a8406|hash_00010347299b8393c76a0a65431939ffdf9705|hash_000103f35f330f0f75a68f2bb0b20a6d9ff6d4|hash_000103d07e2afd69622e3eb8cc909fd50d0ae1|hash_000103ef73156fadaf35aadaf083439e803cf7|hash_0001035545498279b5179d937772ce5f3d47e3|hash_0001031fd43de889bb21c1d465df6c06be9293|hash_0001036294b8f23a5179243552d832fe94df39|hash_000103bbf6c3053cb83c6c17103e9ccf71f62d|hash_0001036e03ec0ec9624eb460fccd4501c598c1|hash_000103b19e035b797a056fad561416fbe5e02c|hash_00010374b35a17e32a4c18cc90fdf6aa2e8968|hash_000103db9a7466d018e707ed48dc617d19fee9|hash_000103abae0338c8da7d8f4a282b528fe98096|hash_000103bfb5b0884da9d6dd3214ddf3b12bf808|hash_000103f27704965b778bfc91e7bc48cd9e200d|hash_0001034124879f2e22bc514764ff8bef030011|hash_0001039665e79ac6bfbd6d77d0cdc9098573ea|hash_000103ab37cbed8610deeffbb20dc1fe57b330|hash_0001035107ec0206562e77d965ce6b852ef9d4|hash_000103be275639d5680e94c72c0ebb4e19056d|hash_000103eee71ec20dc7b44635ab185bbf924dc4</graph_templates>
+		<graph_templates>hash_0001034ad1656588575c339db35a9bba08d223|hash_000103a5bc3ab3e9362dfa905b77baa2e7f261|hash_00010341f727efaa3df62c60a34bf58b1a8406|hash_00010347299b8393c76a0a65431939ffdf9705|hash_000103f35f330f0f75a68f2bb0b20a6d9ff6d4|hash_000103d07e2afd69622e3eb8cc909fd50d0ae1|hash_000103ef73156fadaf35aadaf083439e803cf7|hash_0001035545498279b5179d937772ce5f3d47e3|hash_0001031fd43de889bb21c1d465df6c06be9293|hash_0001036294b8f23a5179243552d832fe94df39|hash_000103bbf6c3053cb83c6c17103e9ccf71f62d|hash_0001036e03ec0ec9624eb460fccd4501c598c1|hash_000103b19e035b797a056fad561416fbe5e02c|hash_00010374b35a17e32a4c18cc90fdf6aa2e8968|hash_000103db9a7466d018e707ed48dc617d19fee9|hash_000103abae0338c8da7d8f4a282b528fe98096|hash_000103bfb5b0884da9d6dd3214ddf3b12bf808|hash_000103f27704965b778bfc91e7bc48cd9e200d|hash_0001034124879f2e22bc514764ff8bef030011|hash_0001039665e79ac6bfbd6d77d0cdc9098573ea|hash_000103ab37cbed8610deeffbb20dc1fe57b330|hash_0001035107ec0206562e77d965ce6b852ef9d4|hash_000103be275639d5680e94c72c0ebb4e19056d|hash_000103eee71ec20dc7b44635ab185bbf924dc4</graph_templates>
 		<data_queries>hash_04010338f4704fac40e1ad9cb2187ab2974b37|hash_040103dbf6da99685fa86390e3242f88372392|hash_040103d89e0ac47c43af6e8274933e9d5897d6|hash_04010351a3a2e81923200d98002e841fef377c|hash_040103beec6fa8f3a03985f39332003e96f2c6|hash_04010359184f16e009f6594177335587ed7130|hash_040103c343d0bcaa19efbe6ffdfe06c18267dd|hash_0401038b45332730e6c1562db9a290ae268df6|hash_040103f6d49b9e330bd56fe995f2d351b0fb39|hash_040103d75e406fdeca4fcef45b8be3a9a63cbc|hash_0401039343eab1f4d88b0e61ffc9d020f35414</data_queries>
 	</hash_020103843c4ebc061ce655b5dcd88541d96a96>
 
@@ -159,6 +159,160 @@
 			</hash_0901039342e8d006ec1a149a21b758221fc0be>
 		</inputs>
 	</hash_0001034ad1656588575c339db35a9bba08d223>
+
+	<hash_000103a5bc3ab3e9362dfa905b77baa2e7f261>
+		<name>Router VPP - VPP - zajetosc najbardziej obciazonego workera</name>
+		<multiple></multiple>
+		<test_source></test_source>
+		<graph>
+			<t_title></t_title>
+			<title>|host_description| - VPP - zajetosc najbardziej obciazonego workera</title>
+			<t_vertical_label></t_vertical_label>
+			<vertical_label>%</vertical_label>
+			<t_image_format_id></t_image_format_id>
+			<image_format_id>3</image_format_id>
+			<t_height></t_height>
+			<height>200</height>
+			<t_width></t_width>
+			<width>700</width>
+			<t_base_value></t_base_value>
+			<base_value>1000</base_value>
+			<t_slope_mode></t_slope_mode>
+			<slope_mode>on</slope_mode>
+			<t_auto_scale></t_auto_scale>
+			<auto_scale>on</auto_scale>
+			<t_auto_scale_opts></t_auto_scale_opts>
+			<auto_scale_opts>2</auto_scale_opts>
+			<t_auto_scale_log></t_auto_scale_log>
+			<auto_scale_log></auto_scale_log>
+			<t_scale_log_units></t_scale_log_units>
+			<scale_log_units></scale_log_units>
+			<t_auto_scale_rigid></t_auto_scale_rigid>
+			<auto_scale_rigid></auto_scale_rigid>
+			<t_upper_limit></t_upper_limit>
+			<upper_limit>100</upper_limit>
+			<t_lower_limit></t_lower_limit>
+			<lower_limit>0</lower_limit>
+			<t_unit_value></t_unit_value>
+			<unit_value></unit_value>
+			<t_unit_exponent_value></t_unit_exponent_value>
+			<unit_exponent_value></unit_exponent_value>
+			<t_unit_length></t_unit_length>
+			<unit_length></unit_length>
+			<t_no_gridfit></t_no_gridfit>
+			<no_gridfit></no_gridfit>
+			<t_alt_y_grid></t_alt_y_grid>
+			<alt_y_grid></alt_y_grid>
+			<t_right_axis></t_right_axis>
+			<right_axis></right_axis>
+			<t_right_axis_label></t_right_axis_label>
+			<right_axis_label></right_axis_label>
+			<t_right_axis_format></t_right_axis_format>
+			<right_axis_format>0</right_axis_format>
+			<t_right_axis_formatter></t_right_axis_formatter>
+			<right_axis_formatter>0</right_axis_formatter>
+			<t_left_axis_formatter></t_left_axis_formatter>
+			<left_axis_formatter>0</left_axis_formatter>
+			<t_auto_padding></t_auto_padding>
+			<auto_padding>on</auto_padding>
+			<t_dynamic_labels></t_dynamic_labels>
+			<dynamic_labels></dynamic_labels>
+			<t_force_rules_legend></t_force_rules_legend>
+			<force_rules_legend></force_rules_legend>
+			<t_tab_width></t_tab_width>
+			<tab_width>40</tab_width>
+			<t_legend_position></t_legend_position>
+			<legend_position>0</legend_position>
+			<t_legend_direction></t_legend_direction>
+			<legend_direction>0</legend_direction>
+		</graph>
+		<items>
+			<hash_1001031456e7fd682dab859b7532e79bac60c1>
+				<graph_type_id>7</graph_type_id>
+				<task_item_id>hash_080103b600d12548fd2aaf7adc0912653f5a59</task_item_id>
+				<color_id>1A7C11</color_id>
+				<alpha>7F</alpha>
+				<consolidation_function_id>1</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Zajetosc workera  </text_format>
+				<hard_return></hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>1</sequence>
+			</hash_1001031456e7fd682dab859b7532e79bac60c1>
+			<hash_1001039975efd974ac4563f51e3265dd966f97>
+				<graph_type_id>9</graph_type_id>
+				<task_item_id>hash_080103b600d12548fd2aaf7adc0912653f5a59</task_item_id>
+				<color_id>0</color_id>
+				<alpha>FF</alpha>
+				<consolidation_function_id>4</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Teraz:</text_format>
+				<hard_return></hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>2</sequence>
+			</hash_1001039975efd974ac4563f51e3265dd966f97>
+			<hash_10010393db56dd03b44e418986dc13bc933d84>
+				<graph_type_id>9</graph_type_id>
+				<task_item_id>hash_080103b600d12548fd2aaf7adc0912653f5a59</task_item_id>
+				<color_id>0</color_id>
+				<alpha>FF</alpha>
+				<consolidation_function_id>1</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Srednio:</text_format>
+				<hard_return></hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>3</sequence>
+			</hash_10010393db56dd03b44e418986dc13bc933d84>
+			<hash_100103e5de3ac88c618e8ba1cc1aa695ab6e30>
+				<graph_type_id>9</graph_type_id>
+				<task_item_id>hash_080103b600d12548fd2aaf7adc0912653f5a59</task_item_id>
+				<color_id>0</color_id>
+				<alpha>FF</alpha>
+				<consolidation_function_id>3</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Max:</text_format>
+				<hard_return>on</hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>4</sequence>
+			</hash_100103e5de3ac88c618e8ba1cc1aa695ab6e30>
+		</items>
+		<inputs>
+			<hash_090103545c87ea279f9935e6ecc3db8dd6763f>
+				<name>Zrodlo danych [VppWorkerBusyMax]</name>
+				<description>Zajetosc workera</description>
+				<column_name>task_item_id</column_name>
+				<items>hash_0001031456e7fd682dab859b7532e79bac60c1|hash_0001039975efd974ac4563f51e3265dd966f97|hash_00010393db56dd03b44e418986dc13bc933d84|hash_000103e5de3ac88c618e8ba1cc1aa695ab6e30</items>
+			</hash_090103545c87ea279f9935e6ecc3db8dd6763f>
+		</inputs>
+	</hash_000103a5bc3ab3e9362dfa905b77baa2e7f261>
 
 	<hash_00010341f727efaa3df62c60a34bf58b1a8406>
 		<name>Router VPP - System - najbardziej zajety rdzen</name>
@@ -4808,6 +4962,160 @@
 		</inputs>
 	</hash_0001031641f5b45eda7d35cb65a241a6c53dd1>
 
+	<hash_00010364f088189e28796c0f7c2531cc0de012>
+		<name>Router VPP - VPP - zajetosc</name>
+		<multiple></multiple>
+		<test_source></test_source>
+		<graph>
+			<t_title></t_title>
+			<title>|host_description| - VPP |query_rvWorkerName| - zajetosc</title>
+			<t_vertical_label></t_vertical_label>
+			<vertical_label>%</vertical_label>
+			<t_image_format_id></t_image_format_id>
+			<image_format_id>3</image_format_id>
+			<t_height></t_height>
+			<height>200</height>
+			<t_width></t_width>
+			<width>700</width>
+			<t_base_value></t_base_value>
+			<base_value>1000</base_value>
+			<t_slope_mode></t_slope_mode>
+			<slope_mode>on</slope_mode>
+			<t_auto_scale></t_auto_scale>
+			<auto_scale>on</auto_scale>
+			<t_auto_scale_opts></t_auto_scale_opts>
+			<auto_scale_opts>2</auto_scale_opts>
+			<t_auto_scale_log></t_auto_scale_log>
+			<auto_scale_log></auto_scale_log>
+			<t_scale_log_units></t_scale_log_units>
+			<scale_log_units></scale_log_units>
+			<t_auto_scale_rigid></t_auto_scale_rigid>
+			<auto_scale_rigid></auto_scale_rigid>
+			<t_upper_limit></t_upper_limit>
+			<upper_limit>100</upper_limit>
+			<t_lower_limit></t_lower_limit>
+			<lower_limit>0</lower_limit>
+			<t_unit_value></t_unit_value>
+			<unit_value></unit_value>
+			<t_unit_exponent_value></t_unit_exponent_value>
+			<unit_exponent_value></unit_exponent_value>
+			<t_unit_length></t_unit_length>
+			<unit_length></unit_length>
+			<t_no_gridfit></t_no_gridfit>
+			<no_gridfit></no_gridfit>
+			<t_alt_y_grid></t_alt_y_grid>
+			<alt_y_grid></alt_y_grid>
+			<t_right_axis></t_right_axis>
+			<right_axis></right_axis>
+			<t_right_axis_label></t_right_axis_label>
+			<right_axis_label></right_axis_label>
+			<t_right_axis_format></t_right_axis_format>
+			<right_axis_format>0</right_axis_format>
+			<t_right_axis_formatter></t_right_axis_formatter>
+			<right_axis_formatter>0</right_axis_formatter>
+			<t_left_axis_formatter></t_left_axis_formatter>
+			<left_axis_formatter>0</left_axis_formatter>
+			<t_auto_padding></t_auto_padding>
+			<auto_padding>on</auto_padding>
+			<t_dynamic_labels></t_dynamic_labels>
+			<dynamic_labels></dynamic_labels>
+			<t_force_rules_legend></t_force_rules_legend>
+			<force_rules_legend></force_rules_legend>
+			<t_tab_width></t_tab_width>
+			<tab_width>40</tab_width>
+			<t_legend_position></t_legend_position>
+			<legend_position>0</legend_position>
+			<t_legend_direction></t_legend_direction>
+			<legend_direction>0</legend_direction>
+		</graph>
+		<items>
+			<hash_100103e4cbc39b5e6f63510038bfa011d79dab>
+				<graph_type_id>7</graph_type_id>
+				<task_item_id>hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e</task_item_id>
+				<color_id>1A7C11</color_id>
+				<alpha>7F</alpha>
+				<consolidation_function_id>1</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Zajetosc  </text_format>
+				<hard_return></hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>1</sequence>
+			</hash_100103e4cbc39b5e6f63510038bfa011d79dab>
+			<hash_100103aa17a5a942d40fbc3d2e76fd3c2b1c09>
+				<graph_type_id>9</graph_type_id>
+				<task_item_id>hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e</task_item_id>
+				<color_id>0</color_id>
+				<alpha>FF</alpha>
+				<consolidation_function_id>4</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Teraz:</text_format>
+				<hard_return></hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>2</sequence>
+			</hash_100103aa17a5a942d40fbc3d2e76fd3c2b1c09>
+			<hash_10010334640c2b1b5dd99ee35915ddce8090d9>
+				<graph_type_id>9</graph_type_id>
+				<task_item_id>hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e</task_item_id>
+				<color_id>0</color_id>
+				<alpha>FF</alpha>
+				<consolidation_function_id>1</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Srednio:</text_format>
+				<hard_return></hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>3</sequence>
+			</hash_10010334640c2b1b5dd99ee35915ddce8090d9>
+			<hash_100103860fef46f6dfc71a59ccd2741e6c4d18>
+				<graph_type_id>9</graph_type_id>
+				<task_item_id>hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e</task_item_id>
+				<color_id>0</color_id>
+				<alpha>FF</alpha>
+				<consolidation_function_id>3</consolidation_function_id>
+				<cdef_id>0</cdef_id>
+				<vdef_id>0</vdef_id>
+				<shift></shift>
+				<value></value>
+				<gprint_id>hash_060103e9c43831e54eca8069317a2ce8c6f751</gprint_id>
+				<textalign></textalign>
+				<text_format>Max:</text_format>
+				<hard_return>on</hard_return>
+				<line_width>0.00</line_width>
+				<dashes></dashes>
+				<dash_offset>0</dash_offset>
+				<sequence>4</sequence>
+			</hash_100103860fef46f6dfc71a59ccd2741e6c4d18>
+		</items>
+		<inputs>
+			<hash_090103b7b4ec34f07ef3acdd5035da5f3410d8>
+				<name>Zrodlo danych [WorkerBusyPct]</name>
+				<description>Zajetosc</description>
+				<column_name>task_item_id</column_name>
+				<items>hash_000103e4cbc39b5e6f63510038bfa011d79dab|hash_000103aa17a5a942d40fbc3d2e76fd3c2b1c09|hash_00010334640c2b1b5dd99ee35915ddce8090d9|hash_000103860fef46f6dfc71a59ccd2741e6c4d18</items>
+			</hash_090103b7b4ec34f07ef3acdd5035da5f3410d8>
+		</inputs>
+	</hash_00010364f088189e28796c0f7c2531cc0de012>
+
 	<hash_000103e4198d07e5d48f708f8d914bec8cdd23>
 		<name>Router VPP - Port - straty i bledy</name>
 		<multiple></multiple>
@@ -7709,6 +8017,75 @@
 		</data>
 	</hash_0101035b660e45765c292765dd9012a712cb43>
 
+	<hash_010103f8aa96c1fad9f87652edfe2937cf7f2e>
+		<name>Router VPP - Zajetosc najbardziej obciazonego workera VPP w % (rvVppWorkerBusyMax)</name>
+		<ds>
+			<t_name></t_name>
+			<name>|host_description| - Zajetosc najbardziej obciazonego workera VPP w % (rvVppWorkerBusyMax)</name>
+			<data_source_path></data_source_path>
+			<data_input_id>hash_0301033eb92bb845b9660a7445cf9740726522</data_input_id>
+			<t_data_source_profile_id></t_data_source_profile_id>
+			<data_source_profile_id>0</data_source_profile_id>
+			<t_rrd_step></t_rrd_step>
+			<rrd_step>60</rrd_step>
+			<t_active></t_active>
+			<active>on</active>
+		</ds>
+		<items>
+			<hash_080103b600d12548fd2aaf7adc0912653f5a59>
+				<t_data_source_name></t_data_source_name>
+				<data_source_name>VppWorkerBusyMax</data_source_name>
+				<t_rrd_minimum></t_rrd_minimum>
+				<rrd_minimum>0</rrd_minimum>
+				<t_rrd_maximum></t_rrd_maximum>
+				<rrd_maximum>U</rrd_maximum>
+				<t_data_source_type_id></t_data_source_type_id>
+				<data_source_type_id>1</data_source_type_id>
+				<t_rrd_heartbeat></t_rrd_heartbeat>
+				<rrd_heartbeat>600</rrd_heartbeat>
+				<t_data_input_field_id></t_data_input_field_id>
+				<data_input_field_id>0</data_input_field_id>
+			</hash_080103b600d12548fd2aaf7adc0912653f5a59>
+		</items>
+		<data>
+			<item_000>
+				<data_input_field_id>hash_07010392f5906c8dc0f964b41f4253df582c38</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_000>
+			<item_001>
+				<data_input_field_id>hash_07010332285d5bf16e56c478f5e83f32cda9ef</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_001>
+			<item_002>
+				<data_input_field_id>hash_070103ad14ac90641aed388139f6ba86a2e48b</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_002>
+			<item_003>
+				<data_input_field_id>hash_0701039c55a74bd571b4f00a96fd4b793278c6</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_003>
+			<item_004>
+				<data_input_field_id>hash_070103012ccb1d3687d3edb29c002ea66e72da</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_004>
+			<item_005>
+				<data_input_field_id>hash_0701034276a5ec6e3fe33995129041b1909762</data_input_field_id>
+				<t_value></t_value>
+				<value>.1.3.6.1.4.1.8072.9999.9999.630.2.24.0</value>
+			</item_005>
+			<item_006>
+				<data_input_field_id>hash_070103fc64b99742ec417cc424dbf8c7692d36</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_006>
+		</data>
+	</hash_010103f8aa96c1fad9f87652edfe2937cf7f2e>
+
 	<hash_010103f7b988d73671338ecf4a2a439c7acdaa>
 		<name>Router VPP - Najbardziej zajety rdzen systemowy (rvVppHkCpuMax)</name>
 		<ds>
@@ -10504,6 +10881,110 @@
 		</data>
 	</hash_01010378ce06e450299258dfbabb0d11b87206>
 
+	<hash_0101030f7608e6e2931c5900c6400248bf5d8e>
+		<name>Router VPP - VPP - zajetosc (rvWorkerTable)</name>
+		<ds>
+			<t_name></t_name>
+			<name>|host_description| - VPP - zajetosc (rvWorkerTable)</name>
+			<data_source_path></data_source_path>
+			<data_input_id>hash_030103bf566c869ac6443b0c75d1c32b5a350e</data_input_id>
+			<t_data_source_profile_id></t_data_source_profile_id>
+			<data_source_profile_id>0</data_source_profile_id>
+			<t_rrd_step></t_rrd_step>
+			<rrd_step>60</rrd_step>
+			<t_active></t_active>
+			<active>on</active>
+		</ds>
+		<items>
+			<hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e>
+				<t_data_source_name></t_data_source_name>
+				<data_source_name>WorkerBusyPct</data_source_name>
+				<t_rrd_minimum></t_rrd_minimum>
+				<rrd_minimum>0</rrd_minimum>
+				<t_rrd_maximum></t_rrd_maximum>
+				<rrd_maximum>U</rrd_maximum>
+				<t_data_source_type_id></t_data_source_type_id>
+				<data_source_type_id>1</data_source_type_id>
+				<t_rrd_heartbeat></t_rrd_heartbeat>
+				<rrd_heartbeat>600</rrd_heartbeat>
+				<t_data_input_field_id></t_data_input_field_id>
+				<data_input_field_id>0</data_input_field_id>
+			</hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e>
+		</items>
+		<data>
+			<item_000>
+				<data_input_field_id>hash_07010392f5906c8dc0f964b41f4253df582c38</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_000>
+			<item_001>
+				<data_input_field_id>hash_07010332285d5bf16e56c478f5e83f32cda9ef</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_001>
+			<item_002>
+				<data_input_field_id>hash_070103617cdc8a230615e59f06f361ef6e7728</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_002>
+			<item_003>
+				<data_input_field_id>hash_070103acb449d1451e8a2a655c2c99d31142c7</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_003>
+			<item_004>
+				<data_input_field_id>hash_070103f4facc5e2ca7ebee621f09bc6d9fc792</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_004>
+			<item_005>
+				<data_input_field_id>hash_0701031cc1493a6781af2c478fa4de971531cf</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_005>
+			<item_006>
+				<data_input_field_id>hash_070103b5c23f246559df38662c255f4aa21d6b</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_006>
+			<item_007>
+				<data_input_field_id>hash_0701036027a919c7c7731fbe095b6f53ab127b</data_input_field_id>
+				<t_value>on</t_value>
+				<value></value>
+			</item_007>
+			<item_008>
+				<data_input_field_id>hash_070103cbbe5c1ddfb264a6e5d509ce1c78c95f</data_input_field_id>
+				<t_value>on</t_value>
+				<value></value>
+			</item_008>
+			<item_009>
+				<data_input_field_id>hash_070103e6deda7be0f391399c5130e7c4a48b28</data_input_field_id>
+				<t_value>on</t_value>
+				<value></value>
+			</item_009>
+			<item_010>
+				<data_input_field_id>hash_070103c1f36ee60c3dc98945556d57f26e475b</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_010>
+			<item_011>
+				<data_input_field_id>hash_0701032cf7129ad3ff819a7a7ac189bee48ce8</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_011>
+			<item_012>
+				<data_input_field_id>hash_0701036b13ac0a0194e171d241d4b06f913158</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_012>
+			<item_013>
+				<data_input_field_id>hash_0701033a33d4fc65b8329ab2ac46a36da26b72</data_input_field_id>
+				<t_value></t_value>
+				<value></value>
+			</item_013>
+		</data>
+	</hash_0101030f7608e6e2931c5900c6400248bf5d8e>
+
 	<hash_0101037fc7a806fd4de464d1694fab0c6ab115>
 		<name>Router VPP - Port - straty i bledy (rvPortTable)</name>
 		<ds>
@@ -11921,7 +12402,7 @@
 	</hash_0101038ff7d46738bf724f47a2e402be655ee8>
 
 	<hash_04010338f4704fac40e1ad9cb2187ab2974b37>
-		<name>Router VPP - workery (wektor)</name>
+		<name>Router VPP - workery (zajetosc %, wektor)</name>
 		<description>Obciazenie workerow VPP</description>
 		<xml_path>&lt;path_cacti&gt;/resource/snmp_queries/router_vpp_workers.xml</xml_path>
 		<data_input_id>hash_030103bf566c869ac6443b0c75d1c32b5a350e</data_input_id>
@@ -11952,6 +12433,32 @@
 					</hash_1301036c5176137bdfca533a0fb6d81b81325e>
 				</sv_data_source>
 			</hash_110103c6fca096eeea0296ad24133e615309e9>
+			<hash_11010313597e51bbb527102c80564d38d0cc8e>
+				<graph_template_id>hash_00010364f088189e28796c0f7c2531cc0de012</graph_template_id>
+				<name>VPP - zajetosc</name>
+				<rrd>
+					<item_000>
+						<snmp_field_name>rvWorkerBusyPct</snmp_field_name>
+						<data_template_id>hash_0101030f7608e6e2931c5900c6400248bf5d8e</data_template_id>
+						<data_template_rrd_id>hash_08010385913574bb0e70e2b2e1f6cdcb3a0d4e</data_template_rrd_id>
+					</item_000>
+				</rrd>
+				<sv_graph>
+					<hash_1201035c62ba16d4e1134b93007db747821909>
+						<field_name>title</field_name>
+						<sequence>1</sequence>
+						<text>|host_description| - VPP |query_rvWorkerName| - zajetosc</text>
+					</hash_1201035c62ba16d4e1134b93007db747821909>
+				</sv_graph>
+				<sv_data_source>
+					<hash_130103d80e88d2e6ef5c3d6434f3685a84738a>
+						<field_name>name</field_name>
+						<data_template_id>hash_0101030f7608e6e2931c5900c6400248bf5d8e</data_template_id>
+						<sequence>1</sequence>
+						<text>|host_description| - VPP |query_rvWorkerName| - zajetosc</text>
+					</hash_130103d80e88d2e6ef5c3d6434f3685a84738a>
+				</sv_data_source>
+			</hash_11010313597e51bbb527102c80564d38d0cc8e>
 		</graphs>
 	</hash_04010338f4704fac40e1ad9cb2187ab2974b37>
 

@@ -103,6 +103,8 @@ class TestIfacesScreen(unittest.TestCase):
             f.write('INST_WORKERS=5,6,7\n')
         top.ENV_FILE = self.root + "/etc/router/router.env"
         top.MONITOR_CONF = self.root + "/nie-ma"
+        top.IDLE_FILE = self.root + "/nie-ma-idle.json"
+        top.IDLE_LOCAL = []
         cur = {"hu0": (0, 0, 0, 0, 0), "__workers__": [[0.0, 0], [2.0, 9000000], [80.0, 40000], [200.0, 5000]]}
         lines = top.screen_vpp(cur, cur, 1.0)
         text = "\n".join(t for t, _s in lines)
@@ -113,9 +115,33 @@ class TestIfacesScreen(unittest.TestCase):
         styles = {t.split("(")[0].strip(): st for t, st in lines if t.startswith("  worker ")}
         self.assertEqual(styles, {"worker 1": "dim", "worker 2": "warn", "worker 3": "miss"})
         self.assertIn("NASYCENIE", text)
-        self.assertIn("najwyżej: 200.0", text)
+        self.assertIn("wektor: najwyżej 200.0", text)
+        w1 = [t for t, _s in lines if t.startswith("  worker 1 ")][0]
+        self.assertIn("?%", w1)                               # bez pomiaru luzu zajętość nieznana, nie zgadywana
+        self.assertIn("router-monitor jeszcze nie zmierzył", text)
         self.assertIn("RUCH ŁĄCZNIE", text)
         self.assertNotIn("OBCIĄŻENIE", "\n".join(t for t, _s in top.screen_ifaces(cur, cur, 1.0)))
+
+    def test_worker_busy_percent_from_loops(self):
+        top.ENV_FILE = self.root + "/nie-ma"
+        top.MONITOR_CONF = self.root + "/nie-ma"
+        top.IDLE_LOCAL = []
+        top.IDLE_FILE = self.root + "/idle.json"
+        with open(top.IDLE_FILE, "w") as f:                    # router-monitor zmierzył luz: 4 M pętli/s
+            json.dump({"idle": [100000, 4000000, 4000000, 0]}, f)
+        cur = {"__workers__": [[1.0, 90000], [1.0, 2000000], [1.0, 400000], [2.0, 3000000]]}
+        lines = top.screen_load(cur["__workers__"])
+        rows = {t.split("(")[0].strip(): (t, st) for t, st in lines if t.startswith("  worker ")}
+        self.assertIn(" 50%", rows["worker 1"][0])            # 2 M z 4 M pętli = połowa czasu na pakietach
+        self.assertIn(" 90%", rows["worker 2"][0])            # wektor wciąż 1.0, a worker prawie pełny
+        self.assertEqual(rows["worker 2"][1], "miss")         # stan liczy też zajętość, nie tylko wektor
+        self.assertIn(" 25%", rows["worker 3"][0])            # bez własnego pomiaru: mediana innych workerów
+        self.assertIn("█" * 12, rows["worker 1"][0])          # pasek = zajętość (50% z 24 znaków)
+        self.assertIn("zajętość: najwyżej 90%", "\n".join(t for t, _s in lines))
+        # zmiana liczby workerów (set_workers): stary plik nie pasuje — uczymy się od nowa z próbki na luzie
+        top.IDLE_LOCAL = []
+        lines = top.screen_load([[1.0, 50000], [1.0, 3500000]])
+        self.assertIn("  0%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])
 
     def test_scrolling_keeps_table_header(self):
         lines = [("naglowek", "head")] + [("wiersz %d" % i, "") for i in range(100)]
