@@ -144,6 +144,37 @@ class TestWorkerPreempt(unittest.TestCase):
         il2.learn([0.0, 1.0], [100, 3900000], 50000)            # inna liczba wątków: od nowa
         self.assertEqual(il2.idle, [100.0, 3900000.0])
 
+    def test_idle_loops_relearned_after_vpp_config_change(self):
+        """Luz uczony przy innej konfiguracji VPP jest nieważny: lodz2-vpp 6.11 po zmianie odbioru ze skalarnego
+        na wektorowy (ethernet default-mtu) pusty obieg kosztował inaczej i wszystkie workery pokazywały ~34% przy
+        wektorze 1.0. Maksimum tylko rośnie, więc samo się nie poprawi — trzeba uczyć się od nowa."""
+        conf = os.path.join(self.tmp, "startup.conf")
+        with open(conf, "w") as f:
+            f.write("# komentarz\ndpdk {\n  dev 0000:82:00.0 { name hu0 }\n}\n")
+        sig = mon.vpp_config_sig(conf)
+        with open(conf, "w") as f:                                # inne komentarze i puste linie: ten sam podpis
+            f.write("dpdk {\n\n  dev 0000:82:00.0 { name hu0 }   # port\n}\n")
+        self.assertEqual(mon.vpp_config_sig(conf), sig)
+        with open(conf, "a") as f:
+            f.write("ethernet {\n  default-mtu 1500\n}\n")
+        sig2 = mon.vpp_config_sig(conf)
+        self.assertNotEqual(sig2, sig)
+        path = os.path.join(self.tmp, "idle2", "vpp-idle-loops.json")
+        il = mon.IdleLoops(path, sig)
+        il.learn([0.0, 1.0], [100, 4400000], 50000)
+        il.save()
+        self.assertEqual(mon.IdleLoops(path, sig).base(1), 4400000)   # ta sama konfiguracja: luz zostaje
+        self.assertIsNone(mon.IdleLoops(path, sig2).busy(1, 2900000))  # inna: odrzucony, nie fałszywe 34%
+        il.reset_if(sig)
+        self.assertEqual(il.base(1), 4400000)
+        il.reset_if(sig2)                                          # VPP wstał z nową konfiguracją
+        self.assertIsNone(il.busy(1, 2900000))
+        il.learn([0.0, 1.0], [100, 2950000], 50000)
+        self.assertEqual(il.busy(1, 2950000), 0.0)
+        il.save()
+        with open(path) as f:
+            self.assertEqual(json.load(f)["sig"], sig2)
+
     def test_read_smi_from_msr(self):
         dev = os.path.join(self.tmp, "dev")
         for cpu, count in ((5, 17), (7, 0)):
@@ -210,19 +241,99 @@ class _FakeStats:
         }[key]
 
 
+class TestMissExplain(unittest.TestCase):
+    """Przyczyna RX_MISS. VPP przepisuje rx-miss z karty co ~10 s (dpdk-process), więc strata mogła być do
+    MISS_WINDOW s przed skokiem licznika — przyczyny szukamy w całym oknie, nie w ostatnich 3 s (lodz2-vpp 6.11:
+    "SMI" i "burst" przypisywane przypadkiem, strata 435 tys. pakietów opisana jak burst jednego przepływu)."""
+
+    def setUp(self):
+        self.saved = mon.CFG["MISS_WINDOW"]
+        mon.CFG["MISS_WINDOW"] = 13
+
+    def tearDown(self):
+        mon.CFG["MISS_WINDOW"] = self.saved
+
+    def test_ring_capacity_from_startup_conf(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+            f.write("dpdk {\n  dev 0000:82:00.0 { name hu0 num-rx-queues 12 num-rx-desc 16384 num-tx-desc 4096"
+                    " devargs rxq_pkt_pad_en=1,rxq_cqe_comp_en=0 }\n"
+                    "  dev 0000:82:00.1 { name hu1 num-rx-queues 12 num-rx-desc 8192 }\n"
+                    "  dev 0000:03:00.0 { name xe0 }\n}\n")
+        # bez "ethernet { default-mtu }" VPP buduje kolejki dla MTU 9000: (9000 + 18) / 2048 B → 5 → 8 buforów na
+        # pakiet (lodz2-vpp 6.11: rx burst mode Scalar), więc pierścień mieści 8× mniej pakietów niż deskryptorów
+        self.assertEqual(mon.ring_capacity(f.name), {"hu0": 24576, "hu1": 12288})
+        self.assertEqual(mon.ring_capacity(f.name + ".brak"), {})
+        with open(f.name, "a") as g:
+            g.write("buffers {\n  buffers-per-numa 262144\n  default data-size 2048\n}\nethernet {\n  default-mtu 1500\n}\n")
+        self.assertEqual(mon.ring_capacity(f.name), {"hu0": 196608, "hu1": 98304})
+
+    def test_ring_segments_per_packet(self):
+        self.assertEqual(mon.rx_segments(9000, 2048), 8)
+        self.assertEqual(mon.rx_segments(1500, 2048), 1)
+        self.assertEqual(mon.rx_segments(4000, 2048), 2)
+        self.assertEqual(mon.rx_segments(9000, 9216), 1)
+
+    def test_nothing_in_window_is_single_flow_burst(self):
+        why, ev = mon.explain_miss(100.0, {"hu0": 43}, [(95.0, 1.0, 0, 0)], {"hu0": 196608})
+        self.assertIn("burst jednego przepływu", why)
+        self.assertIn("bez SMI", why)
+        self.assertIn("w ostatnich 13 s", ev)
+
+    def test_smi_ten_seconds_before_counter_jump_is_found(self):
+        hist = [(90.0, 1.0, 0, 1)] + [(90.0 + i, 1.0, 0, 0) for i in range(1, 11)]
+        why, ev = mon.explain_miss(100.0, {"hu0": 300}, hist, {})
+        self.assertIn("SMI", why)
+        self.assertIn("SMI +1", ev)
+
+    def test_events_older_than_window_are_ignored(self):
+        why, _ev = mon.explain_miss(100.0, {"hu0": 300}, [(80.0, 200.0, 3, 2)], {})
+        self.assertIn("burst jednego przepływu", why)
+
+    def test_overload_then_preemption_take_precedence(self):
+        why, _ = mon.explain_miss(100.0, {"hu0": 9}, [(95.0, 180.0, 2, 1)], {})
+        self.assertIn("przeciążony (wektor 180)", why)
+        why, _ = mon.explain_miss(100.0, {"hu0": 9}, [(95.0, 3.0, 2, 1)], {})
+        self.assertIn("wywłaszczony", why)
+
+    def test_loss_bigger_than_all_rings_is_a_stall_not_a_burst(self):
+        why, _ = mon.explain_miss(100.0, {"hu0": 435200}, [(95.0, 1.0, 0, 0)], {"hu0": 196608})
+        self.assertNotIn("burst", why)
+        self.assertIn("wszystkie pierścienie RX", why)
+        why, _ = mon.explain_miss(100.0, {"hu0": 435200}, [(95.0, 1.0, 0, 1)], {"hu0": 196608})
+        self.assertIn("SMI", why)
+        self.assertIn("wszystkie pierścienie RX", why)
+
+    def test_smi_not_measured_is_not_claimed_absent(self):
+        why, ev = mon.explain_miss(100.0, {"hu0": 43}, [(95.0, 1.0, 0, None)], {})
+        self.assertNotIn("bez SMI", why)
+        self.assertIn("SMI ?", ev)
+
+
+class _MissStats(_FakeStats):
+    """Jak _FakeStats, ale rx-miss na hu0 skacze o 1000 raz (jak licznik karty odświeżany przez VPP co ~10 s)."""
+
+    def __getitem__(self, key):
+        if key == "/if/rx-miss":
+            _FakeStats.t += 1
+            return _Counter([0, 1000 if _FakeStats.t > 20 else 0, 0])
+        return super().__getitem__(key)
+
+
 class TestMainLoop(unittest.TestCase):
     """Kilka obiegów prawdziwej pętli main() na sztucznym VPP: żadnego %VPP-2-DOWN z błędu w kodzie monitora
     (1.5.35: zmienna 'idle' nadpisana liczbą → "'int' object has no attribute 'learn'" co sekundę)."""
 
-    def test_loop_runs_without_internal_errors(self):
+    def run_loop(self, stats_cls):
         import sys
         import tempfile
         import types
         from unittest import mock
+        _FakeStats.t = 0
         tmp = tempfile.mkdtemp()
         papi = types.ModuleType("vpp_papi")
         stats_mod = types.ModuleType("vpp_papi.vpp_stats")
-        stats_mod.VPPStats = _FakeStats
+        stats_mod.VPPStats = stats_cls
         papi.vpp_stats = stats_mod
         saved = {k: mon.CFG[k] for k in ("LOGFILE", "STATEFILE", "ENVFILE", "XSTATS_EVERY", "MD_EVERY", "SMI_PER_S")}
         mon.CFG.update(LOGFILE=tmp + "/alarmy.log", STATEFILE=tmp + "/state.json", ENVFILE=tmp + "/router.env",
@@ -239,6 +350,7 @@ class TestMainLoop(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"vpp_papi": papi, "vpp_papi.vpp_stats": stats_mod}), \
                     mock.patch.object(mon, "IDLE_FILE", tmp + "/idle.json"), \
                     mock.patch.object(mon, "PROC", tmp), mock.patch.object(mon, "SPOOL", tmp + "/spool"), \
+                    mock.patch.object(mon, "STARTUP", tmp + "/startup.conf"), \
                     mock.patch.object(mon, "read_proc_stat", lambda: {}), \
                     mock.patch.object(mon, "emit", lambda fac, sev, mnem, msg, mail=True: emitted.append((mnem, msg))), \
                     mock.patch.object(mon.time, "sleep", fake_sleep), mock.patch.object(sys, "argv", ["router-monitor"]):
@@ -246,6 +358,19 @@ class TestMainLoop(unittest.TestCase):
                     mon.main()
         finally:
             mon.CFG.update(saved)
+        return tmp, emitted
+
+    def test_rx_miss_reports_packets_and_window(self):
+        _tmp, emitted = self.run_loop(_MissStats)
+        miss = [m for n, m in emitted if n == "RX_MISS"]
+        self.assertEqual(len(miss), 1, emitted)
+        self.assertIn("hu0 1.0k pkt ", miss[0])          # pakiety od poprzedniego odczytu karty, nie pkt/s
+        self.assertNotIn("pkt/s", miss[0].split(";")[0])
+        self.assertIn("w ostatnich 13 s", miss[0])
+        self.assertIn("burst jednego przepływu", miss[0])
+
+    def test_loop_runs_without_internal_errors(self):
+        tmp, emitted = self.run_loop(_FakeStats)
         self.assertEqual([e for e in emitted if e[0] in ("DOWN", "UP")], [])
         with open(tmp + "/state.json") as f:
             st = json.load(f)

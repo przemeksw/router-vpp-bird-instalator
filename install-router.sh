@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.48"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.50"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -74,8 +74,12 @@ VPP_NIC_DEVARGS="rxq_pkt_pad_en=1,rxq_cqe_comp_en=0"   # parametry sterownika DP
                                 #                    na Xeonach → przepełnienie bufora karty przy burstach (rx_phy_discard)
                                 # rxq_cqe_comp_en=0  bez kompresji wpisów o odebranych pakietach (CQE) — jak w jądrze
                                 # Pomiar lodz2-vpp (ConnectX-4, E5-2698 v4, 2026-11-06), straty w buforze karty na milion
-                                # pakietów: bez opcji ~1,1; z dopełnianiem ~0,2; z oboma 0 (Linux na tej samej karcie: 0).
-PORT_MTU=1500                  # MTU portów VPP i VLAN-ów: standard Ethernet (ustawiane przy starcie VPP, przed podniesieniem portu)
+                                # pakietów: bez opcji ~1,1; z dopełnianiem ~0,2–0,3 (drugie ustawienie bez mierzalnego efektu).
+PORT_MTU=1500                  # MTU portów VPP i VLAN-ów: standard Ethernet (ustawiane przy starcie VPP, przed podniesieniem portu).
+                                # Trafia też do startup.conf jako "ethernet { default-mtu }": VPP buduje kolejki karty raz, przy
+                                # starcie, z tym MTU (domyślnie 9000) — późniejsze "set interface mtu" kolejek nie przebudowuje.
+                                # Przy 9000 i buforach 2048 B każdy pakiet dostawał 8 buforów: odbiór skalarny DPDK zamiast
+                                # wektorowego i pierścień 8× mniejszy (16384 deskryptorów = 2048 pakietów) — lodz2-vpp 2026-11-06.
 ROUTER_ID=""                   # puste = adres loop0 (LOOP0_ADDR), a bez niego IPv4 interfejsu z trasą domyślną (eth2)
 LOOP0_ADDR="10.10.10.10/32"    # loopback loop0 w VPP: stały adres zarządzania (SSH, SNMP) i router-id; puste = bez loop0.
                                 # Instalacja w terminalu (bez --yes) zaczyna się od pytania o ten adres — wartość tutaj
@@ -345,6 +349,8 @@ cpu_mask() {   # cpu_mask 0 1 40 -> "00000100,00000003" (maska hex w formacie sy
 }
 normalize_pci() { local p="${1,,}"; [[ $p =~ ^[0-9a-f]{4}: ]] || p="0000:$p"; echo "$p"; }
 netdev_of() { ls "${PCI_SYSFS:-/sys/bus/pci/devices}/$1/net" 2>/dev/null | head -n1 || true; }
+# MTU dla "ethernet { default-mtu }" w startup.conf: PORT_MTU, w granicach przyjmowanych przez VPP (64..9000)
+vpp_default_mtu() { local m=${PORT_MTU:-1500}; ((m > 9000)) && m=9000; ((m < 64)) && m=64; echo "$m"; }
 # bufory VPP od zapotrzebowania: każda kolejka RX/TX trzyma swoje bufory (deskryptory) + cache wątków; bierzemy 8× tyle
 # (zapas na zrywy, punt do Linuksa, składanie fragmentów), nie mniej niż 524288, zaokrąglone do 16384. Pamięć dobiera się potem do tego.
 calc_buffers() {   # calc_buffers PORTY WORKERY RX_DESC TX_DESC
@@ -2533,6 +2539,7 @@ prog_router_monitor() {
 # E-mail: zgłoszenia, eskalacje i zakończenia zdarzeń trafiają do kolejki router-notify
 #         (/var/spool/router-notify); przypomnienia "trwa Ns" nie. Co faktycznie idzie mailem,
 #         decyduje MAIL_SEND w /etc/router/notify.conf (router-notify categories).
+import hashlib
 import itertools
 import json
 import logging
@@ -2549,6 +2556,8 @@ CFG = {
     "VEC_WARN": 64.0,       # średni rozmiar wektora workera (1 = luz, 256 = nasycenie)
     "VEC_CRIT": 160.0,
     "RXMISS_PPS": 1.0,      # pkt/s zgubione przez kartę (rx-miss + rx-no-buf) => alarm
+    "MISS_WINDOW": 13,      # s, okno szukania przyczyny RX_MISS: VPP przepisuje rx-miss z karty co 10 s (dpdk-process
+                            # sprawdza co 3 s), więc strata mogła być do ~13 s przed skokiem licznika
     "NIC_DISCARD_PPS": 1.0, # pkt/s odrzucone sprzętowo (xstats *discard*; rx_out_of_buffer to ten sam licznik co rx-miss)
     "WK_PREEMPT": 5.0,      # wywłaszczenia workerów VPP w oknie WK_WINDOW s => alarm. Pojedyncze (wątek kernela
                             # tego rdzenia, µs) to nie problem; kcompactd na lodz2-vpp dawał ~30/min
@@ -2943,18 +2952,36 @@ IDLE_VEC = 1.1
 # bez linku, kolejki RX, które się nie uzupełniają — num-rx-desc 32768 na lodz2-vpp) pusty obieg jest tańszy niż
 # w normalnej pracy: wyuczony wtedy "luz" (~7,7 M zamiast ~4,3 M pętli/s) dawał stałe ~45% zajętości bez ruchu.
 IDLE_MIN_RX_PPS = 1000.0
-IDLE_FMT = 2                                       # wersja pliku; starsze (uczone bez warunku ruchu) są odrzucane
+IDLE_FMT = 3                                       # wersja pliku; 2: bez podpisu konfiguracji VPP, 1: bez warunku ruchu — odrzucane
+
+
+def vpp_config_sig(path=None):
+    """Podpis konfiguracji VPP (startup.conf bez komentarzy i pustych linii). Koszt pustego obiegu workera zależy od
+    niej (odbiór skalarny/wektorowy, kolejki, porty), więc luz uczony przy innej konfiguracji jest nieważny."""
+    try:
+        with open(path or STARTUP) as f:
+            lines = [line.split("#", 1)[0].strip() for line in f]
+    except OSError:
+        return ""
+    return hashlib.sha1("\n".join(x for x in lines if x).encode()).hexdigest()[:16]
 
 
 class IdleLoops:
-    def __init__(self, path):
-        self.path, self.idle, self.dirty = path, [], False
+    def __init__(self, path, sig=""):
+        self.path, self.idle, self.dirty, self.sig = path, [], False, sig
         try:
             with open(path) as f:
                 d = json.load(f)
-                self.idle = [float(x) for x in d.get("idle", [])] if d.get("v") == IDLE_FMT else []
+                ok = d.get("v") == IDLE_FMT and d.get("sig", "") == sig
+                self.idle = [float(x) for x in d.get("idle", [])] if ok else []
         except (OSError, ValueError, TypeError, AttributeError):
             self.idle = []
+
+    def reset_if(self, sig):
+        """VPP wstał z inną konfiguracją (np. odbiór wektorowy zamiast skalarnego): luz od nowa. Maksimum tylko rośnie,
+        więc stary, wyższy luz zawyżałby zajętość na stałe (lodz2-vpp 6.11: ~34% przy wektorze 1.0)."""
+        if sig != self.sig:
+            self.sig, self.idle, self.dirty = sig, [], True
 
     def learn(self, vrow, lrow, rx_pps):
         if rx_pps is None or rx_pps < IDLE_MIN_RX_PPS:
@@ -2988,7 +3015,7 @@ class IdleLoops:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"v": IDLE_FMT, "idle": self.idle, "time": int(time.time())}, f)
+                json.dump({"v": IDLE_FMT, "sig": self.sig, "idle": self.idle, "time": int(time.time())}, f)
             os.replace(tmp, self.path)
             self.dirty = False
         except OSError:
@@ -3018,6 +3045,74 @@ def read_smi(cpus):
         finally:
             os.close(fd)
     return out
+
+
+# ------------------------------------------------------------------ przyczyna RX_MISS
+# rx-miss (imissed DPDK = rx_out_of_buffer w mlx5) VPP przepisuje z karty do segmentu statystyk co 10 s
+# (DPDK_STATS_POLL_INTERVAL; każde "show hardware-interfaces" odświeża od razu). Licznik skacze więc raz na ~10 s
+# o wszystko, co zginęło od poprzedniego odczytu: podajemy pakiety, nie pkt/s, a przyczyny (przeciążenie,
+# wywłaszczenie, SMI) szukamy w całym oknie MISS_WINDOW s przed skokiem — nie w ostatnich sekundach.
+STARTUP = os.environ.get("ROUTER_MONITOR_STARTUP", "/etc/vpp/startup.conf")
+DEV_RE = re.compile(r"\bdev\s+\S+\s*\{([^}]*)\}")
+
+
+def rx_segments(mtu, data_size):
+    """Bufory na pakiet w kolejce RX DPDK mlx5: (MTU + 18) / rozmiar bufora, w górę do potęgi 2 (mlx5_rxq.c)."""
+    n = max(1, -(-(mtu + 18) // max(1, data_size)))
+    return 1 << (n - 1).bit_length()
+
+
+def ring_capacity(path=None):
+    """{port: ile pakietów mieszczą wszystkie pierścienie RX portu} z startup.conf VPP: kolejki × deskryptory /
+    bufory na pakiet. VPP buduje kolejki przy starcie z "ethernet { default-mtu }" (domyślnie 9000) — przy 9000
+    i buforach 2048 B pakiet zajmuje 8 deskryptorów (lodz2-vpp 6.11: 16384 deskryptorów = 2048 pakietów)."""
+    try:
+        with open(path or STARTUP) as f:
+            text = f.read()
+    except OSError:
+        return {}
+    text = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+    mtu = re.search(r"\bdefault-mtu\s+(\d+)", text)
+    size = re.search(r"\bdefault\s+data-size\s+(\d+)", text)
+    segs = rx_segments(int(mtu.group(1)) if mtu else 9000, int(size.group(1)) if size else 2048)
+    res = {}
+    for m in DEV_RE.finditer(text):
+        body = m.group(1)
+        name = re.search(r"\bname\s+(\S+)", body)
+        q = re.search(r"\bnum-rx-queues\s+(\d+)", body)
+        d = re.search(r"\bnum-rx-desc\s+(\d+)", body)
+        if name and q and d:
+            res[name.group(1)] = int(q.group(1)) * int(d.group(1)) // segs
+    return res
+
+
+def explain_miss(now, lost, hist, ring):
+    """(przyczyna, dowody) skoku rx-miss. lost = {port: pakiety od poprzedniego odczytu karty};
+    hist = [(czas, wektor maks., wywłaszczenia workerów, SMI na rdzeń albo None = bez pomiaru)] co sekundę;
+    ring = ring_capacity()."""
+    win = CFG["MISS_WINDOW"]
+    rec = [h for h in hist if 0 <= now - h[0] <= win]
+    vmax = max((h[1] for h in rec), default=0.0)
+    wk = sum(h[2] for h in rec)
+    smi_vals = [h[3] for h in rec if h[3] is not None]
+    smi = sum(smi_vals) if smi_vals else None
+    over = ["%s %s > %s" % (p, fmt_num(n), fmt_num(ring[p])) for p, n in sorted(lost.items()) if ring.get(p) and n > ring[p]]
+    stall = ("; strata większa niż wszystkie pierścienie RX portu razem (%s) — stały wszystkie workery albo jeden "
+             "przez kilka sekund" % ", ".join(over)) if over else ""
+    if vmax >= CFG["VEC_WARN"]:
+        why = "worker przeciążony (wektor %.0f) — za mało workerów albo atak" % vmax
+    elif wk:
+        why = "worker wywłaszczony z rdzenia (%d×, patrz WK_PREEMPT)" % wk
+    elif smi:
+        why = "SMI z BIOS-u na rdzeniach workerów (+%d na rdzeń)" % smi
+    elif over:
+        why = "zatrzymanie VPP bez przeciążenia, wywłaszczenia i SMI"
+    else:
+        why = ("burst jednego przepływu na jednej kolejce RSS: worker nie był przeciążony ani wywłaszczony%s "
+               "(pierścień num-rx-desc; router-top 5)" % (", bez SMI" if smi is not None else ""))
+    ev = "w ostatnich %d s: wektor maks. %.0f, wywłaszczenia %d, SMI %s" % (
+        win, vmax, wk, "+%d" % smi if smi is not None else "?")
+    return why + stall, ev
 
 
 # ------------------------------------------------------------------ główna pętla
@@ -3063,8 +3158,9 @@ def main():
     hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
-    smi_prev, wk_last_t, smi_last_t, smi_hist, wk_hist = {}, 0.0, 0.0, [], []
-    idle_loops, idle_saved_t, last_rx_pps = IdleLoops(IDLE_FILE), 0.0, None   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
+    smi_prev, smi_hist, wk_hist = {}, [], []
+    miss_hist, rings = [], ring_capacity()   # (czas, wektor maks., wywłaszczenia, SMI) co sekundę — dla explain_miss
+    idle_loops, idle_saved_t, last_rx_pps = IdleLoops(IDLE_FILE, vpp_config_sig()), 0.0, None   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -3150,7 +3246,7 @@ def main():
                 dt = t0 - prev_t
                 tot_pps = tot_bps = tot_tpps = tot_miss = tot_punt = 0.0
                 ifs = {}
-                miss_txt = []
+                lost = {}
                 for n, c in cur.items():
                     p = prev.get(n)
                     if p is None:
@@ -3163,28 +3259,25 @@ def main():
                         tot_miss += d[4]
                         ifs[n] = {"rx_pps": d[0], "rx_bps": d[1] * 8, "tx_pps": d[2],
                                   "tx_bps": d[3] * 8, "rx_miss_pps": d[4]}
-                        if d[4] >= CFG["RXMISS_PPS"]:
-                            miss_txt.append("%s %s pkt/s" % (n, fmt_num(d[4])))
+                        if c[4] > p[4]:
+                            lost[n] = c[4] - p[4]
                     tot_punt += d[5]
                 state["interfaces"] = ifs
                 state["rx_pps"], state["rx_bps"] = tot_pps, tot_bps
                 last_rx_pps = tot_pps
                 state["rx_miss_pps"], state["punt_pps"] = tot_miss, tot_punt
                 traffic = "rx %s pps / %sb/s" % (fmt_num(tot_pps), fmt_num(tot_bps))
-                # dlaczego: monitor ma już wszystkie dane, żeby nie zgadywać — przeciążenie (wektor), wywłaszczenie
-                # (WK_PREEMPT w ostatnich 3 s), SMI, albo nic z tego = burst jednego przepływu na jednej kolejce RSS
-                if a_load.active:
-                    why = "worker przeciążony (wektor %.0f) — za mało workerów albo atak" % state.get("vector_max", 0)
-                elif t0 - wk_last_t < 3:
-                    why = "worker wywłaszczony z rdzenia (patrz WK_PREEMPT)"
-                elif t0 - smi_last_t < 3:
-                    why = "SMI z BIOS-u na rdzeniach workerów (patrz SMI)"
+                # dlaczego: przeciążenie, wywłaszczenie, SMI albo nic z tego = burst jednego przepływu — szukane
+                # w całym oknie MISS_WINDOW (licznik karty skacze raz na ~10 s), z bieżącą sekundą włącznie
+                is_miss = tot_miss >= CFG["RXMISS_PPS"]
+                if is_miss:
+                    why, ev = explain_miss(t0, lost, miss_hist + [(t0, state.get("vector_max", 0.0), 0, None)], rings)
+                    txt = ("utrata pakietów na wejściu: %s (od poprzedniego odczytu karty, ≤%d s) — %s; %s; %s"
+                           % (", ".join("%s %s pkt" % (n, fmt_num(v)) for n, v in sorted(lost.items()))
+                              or fmt_num(tot_miss), CFG["MISS_WINDOW"], why, ev, traffic))
                 else:
-                    why = ("burst jednego przepływu na jednej kolejce RSS: worker nie był przeciążony ani wywłaszczony "
-                           "(pierścień num-rx-desc; router-top 5)")
-                a_miss.update(t0, tot_miss >= CFG["RXMISS_PPS"], tot_miss,
-                              "utrata pakietów na wejściu: %s — %s; %s"
-                              % (", ".join(miss_txt) or fmt_num(tot_miss), why, traffic))
+                    txt = ""
+                a_miss.update(t0, is_miss, sum(lost.values()), txt)
                 a_punt.update(t0, tot_punt >= CFG["PUNT_PPS"], tot_punt,
                               "ruch do control plane %s pkt/s; %s" % (fmt_num(tot_punt), traffic))
                 win["pps"] = max(win["pps"], tot_pps)
@@ -3225,6 +3318,9 @@ def main():
             try:
                 if vpp_pid is None or not os.path.isdir("%s/%d/task" % (PROC, vpp_pid)):
                     vpp_pid, wk_prev, vpp_seen_t = find_vpp_pid(), {}, t0
+                    if vpp_pid:   # nowa instancja VPP: konfiguracja z jej startu (luz workerów, pojemność pierścieni)
+                        idle_loops.reset_if(vpp_config_sig())
+                        rings = ring_capacity()
                 wk_now = read_worker_preempt(vpp_pid) if vpp_pid else {}
             except OSError:
                 wk_now = {}
@@ -3236,8 +3332,6 @@ def main():
                 hits = []
             tot = sum(h[0] for h in hits)
             state["wk_preempt"] = tot
-            if hits:
-                wk_last_t = t0
             wk_hist.append((t0, tot))
             while wk_hist and t0 - wk_hist[0][0] > CFG["WK_WINDOW"]:
                 wk_hist.pop(0)
@@ -3254,6 +3348,7 @@ def main():
                 wk_who = ""
 
         # ---------------------------------------------------------- SMI na rdzeniach workerów
+        smi_d = None                       # None = bez pomiaru (wyłączone, brak MSR, pierwszy odczyt)
         if CFG["SMI_PER_S"] > 0:
             smi_now = read_smi(wcores or sorted(isolated))
             if smi_now and smi_prev:
@@ -3265,13 +3360,17 @@ def main():
                 span = max(1.0, t0 - smi_hist[0][0]) if len(smi_hist) > 1 else 1.0
                 rate = sum(d for _t, d in smi_hist[1:]) / span if len(smi_hist) > 1 else float(per_core)
                 state["smi"] = round(rate, 2)
-                if per_core > 0:
-                    smi_last_t = t0
+                smi_d = max(0, per_core)
                 a_smi.update(t0, rate >= CFG["SMI_PER_S"], rate,
                              "SMI (przerwania BIOS-u) na rdzeniach workerów VPP: %.1f/s średnio z %d s — rdzenie stoją poza "
                              "kontrolą kernela (grozi rx-miss bez WK_PREEMPT). BIOS: System Profile = Performance, Memory "
                              "Patrol/Demand Scrub = Disabled, USB legacy = Off" % (rate, CFG["SMI_WINDOW"]))
             smi_prev = smi_now
+
+        # historia sekund dla explain_miss (przyczyna RX_MISS w oknie MISS_WINDOW przed skokiem licznika)
+        miss_hist.append((t0, state.get("vector_max", 0.0), state.get("wk_preempt", 0), smi_d))
+        while miss_hist and t0 - miss_hist[0][0] > CFG["MISS_WINDOW"] + 2:
+            miss_hist.pop(0)
 
         # ---------------------------------------------------------- rdzenie systemowe
         hk_now = read_proc_stat()
@@ -7888,19 +7987,28 @@ def bar(frac, width=24):
 IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", ROOT + "/var/lib/router/vpp-idle-loops.json")
 IDLE_VEC = 1.1
 IDLE_MIN_RX_PPS = 1000.0                                               # luz tylko przy realnym ruchu (jak router-monitor)
-IDLE_FMT = 2
+IDLE_FMT = 3
 IDLE_LOCAL = []                                                       # pomiary router-top (indeks = wątek VPP)
+IDLE_SIG = None                                                       # podpis konfiguracji VPP z IDLE_FILE
 BUSY_WARN, BUSY_CRIT = 70.0, 90.0
 
 
 def idle_loops(n):
-    """Pętle/s na luzie dla wątków 0..n-1: maksimum z IDLE_FILE i własnych pomiarów; brak → mediana innych workerów."""
+    """Pętle/s na luzie dla wątków 0..n-1: maksimum z IDLE_FILE i własnych pomiarów; brak → mediana innych workerów.
+    Gdy router-monitor zapisał luz dla innej konfiguracji VPP (restart VPP z nowym startup.conf), własne pomiary
+    z pamięci są odrzucane — były zrobione przy starym koszcie pustego obiegu."""
+    global IDLE_LOCAL, IDLE_SIG
     try:
         with open(IDLE_FILE) as f:
             d = json.load(f)
         saved = [float(x) for x in d.get("idle", [])] if d.get("v") == IDLE_FMT else []
+        sig = d.get("sig") if d.get("v") == IDLE_FMT else None
     except (OSError, ValueError, TypeError, AttributeError):
-        saved = []
+        saved, sig = [], None
+    if sig is not None and sig != IDLE_SIG:
+        if IDLE_SIG is not None:
+            IDLE_LOCAL = []
+        IDLE_SIG = sig
     if len(saved) != n:
         saved = []
     out = [max(saved[i] if saved else 0.0, IDLE_LOCAL[i] if i < len(IDLE_LOCAL) else 0.0) for i in range(n)]
@@ -9832,6 +9940,7 @@ Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-
 |---|---|---|
 | `VEC_WARN` / `VEC_CRIT` | 64 / 160 | obciążenie workera (wektor 1 = luz, 256 = pełne nasycenie) |
 | `RXMISS_PPS` | 1 | gubione pakiety na karcie |
+| `MISS_WINDOW` | 13 | s przed wpisem `RX_MISS`, w których monitor szuka przyczyny (VPP przepisuje licznik karty co ~10 s, więc strata mogła być wcześniej); w opisie: wektor maks., wywłaszczenia i przyrost SMI z tego okna |
 | `NIC_DISCARD_PPS` | 1 | odrzucenia sprzętowe karty |
 | `WK_PREEMPT` / `WK_WINDOW` / `WK_GRACE` | 5 / 60 / 120 | wywłaszczenia workerów VPP w ciągu 60 s (coś poza VPP na izolowanym rdzeniu; pojedyncze to szum); bez alarmu przez 120 s po starcie VPP |
 | `SMI_PER_S` / `SMI_WINDOW` | 5 / 60 | przerwania BIOS-u (SMI, MSR 0x34) na rdzeń workera na sekundę, średnio z 60 s; stałe ~1/s to tło; 0 = wyłącz |
@@ -10529,6 +10638,7 @@ upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (
     && [[ $thp == madvise || $thp == never ]] \
     && [[ -z $cur_rx || $cur_rx == "$want_rx" ]] && [[ -z $cur_tx || $cur_tx == "$VPP_TX_DESC" ]] \
     && [[ -z $cur_rx || $(grep -vE '^[[:space:]]*#' /etc/vpp/startup.conf 2>/dev/null | grep -oE 'devargs [^ }]+' | head -n1 | cut -d' ' -f2) == "${VPP_NIC_DEVARGS:-}" ]] \
+    && [[ -z $cur_rx || $(grep -vE '^[[:space:]]*#' /etc/vpp/startup.conf 2>/dev/null | grep -oE 'default-mtu [0-9]+' | head -n1 | cut -d' ' -f2) == "$(vpp_default_mtu)" ]] \
     && kernel_params_ok "$g" \
     && ((netflow_ok)) && return 0
   say "izolacja rdzeni / wątki kernela / deskryptory / NetFlow VPP w starym układzie — uzupełniam (ta sama liczba workerów)"
@@ -10558,6 +10668,10 @@ vpp_conf_diff() {   # vpp_conf_diff [vpp] — "vpp": tylko startup.conf i hugepa
   ctx=$(grep -oE 'num-tx-desc [0-9]+' "$f" 2>/dev/null | head -n1 | cut -d' ' -f2)
   [[ -z ${VPP_RX_DESC:-} || $crx == "$VPP_RX_DESC" ]] || { echo "  zmiana: pierścień RX ${crx:-brak} → $VPP_RX_DESC deskryptorów"; rc=0; }
   [[ -z ${VPP_TX_DESC:-} || $ctx == "$VPP_TX_DESC" ]] || { echo "  zmiana: pierścień TX ${ctx:-brak} → $VPP_TX_DESC deskryptorów"; rc=0; }
+  local cmtu
+  cmtu=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE 'default-mtu [0-9]+' | head -n1 | cut -d' ' -f2)
+  [[ -z ${PORT_MTU:-} || $cmtu == "$(vpp_default_mtu)" ]] \
+    || { echo "  zmiana: MTU kolejek karty (ethernet default-mtu) ${cmtu:-brak} → $(vpp_default_mtu) (bez wpisu VPP buduje kolejki dla 9000: 8 buforów na pakiet, odbiór skalarny)"; rc=0; }
   local cdv
   cdv=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE 'devargs [^ }]+' | head -n1 | cut -d' ' -f2)
   [[ $cdv == "${VPP_NIC_DEVARGS:-}" ]] || { echo "  zmiana: parametry karty (devargs) ${cdv:-brak} → ${VPP_NIC_DEVARGS:-brak}"; rc=0; }
@@ -11512,7 +11626,8 @@ EOF
 }
 
 st_vpp_config() {
-  local dpdk_devs="" idx=0 p i
+  local dpdk_devs="" idx=0 p i VPP_DEFAULT_MTU
+  VPP_DEFAULT_MTU=$(vpp_default_mtu)
   IFNAMES=()
   for p in "${NIC_PCI[@]}"; do
     IFNAMES+=("hu$idx")
@@ -11549,6 +11664,11 @@ buffers {
   buffers-per-numa $BUFFERS
   default data-size 2048
   page-size default-hugepage
+}
+
+# MTU, z jakim VPP buduje kolejki karty przy starcie (domyślnie 9000 = 8 buforów 2048 B na pakiet, odbiór skalarny)
+ethernet {
+  default-mtu $VPP_DEFAULT_MTU
 }
 
 statseg {
@@ -13809,6 +13929,8 @@ VEC_WARN=64
 VEC_CRIT=160
 # pakiety/s zgubione przez kartę, bo VPP nie nadąża (rx-miss + rx-no-buf)
 RXMISS_PPS=1
+# s, okno szukania przyczyny RX_MISS (VPP odświeża licznik karty co ~10 s — strata mogła być wcześniej niż wpis)
+MISS_WINDOW=13
 # co ile sekund router-ifaces-check sprawdza DDM wkładek (alarm %IFACE-OPTICS); 0 = nigdy. Każdy odczyt zatrzymuje
 # workery VPP na ~0,3–0,5 s na port (EEPROM w barierze) i gubi pakiety — włączaj świadomie, np. 86400 (raz na dobę)
 OPTICS_CHECK_EVERY=0
@@ -15118,7 +15240,7 @@ Zasada działania:
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
 - **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
-- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Liczbę workerów instalator liczy z wydajności procesora: maksymalne taktowanie × 0,8 i koszt pakietu (~1600 cykli bez NetFlow, ~4400 z NetFlow) dają pakiety/s na workera; workerów jest co najmniej tyle, ile karta sensownie rozkłada (zapas na ataki małymi pakietami), a więcej, gdy rdzeń jest za wolny na obsłużenie łącza przy typowym pakiecie `VPP_SIZING_PKT` (800 B) — najwyżej 2× i nigdy więcej niż wolnych rdzeni. Szacowaną pojemność routera (Mpps i Gb/s z NetFlow i bez) pokazuje raport audytu i `install-router set_workers --dry-run`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Sterownik karty (DPDK mlx5) dostaje `rxq_pkt_pad_en=1,rxq_cqe_comp_en=0` (`VPP_NIC_DEVARGS`) — odbiór jak w jądrze Linuksa: zapis pakietu do pełnej linii pamięci i bez kompresji CQE; bez tego karta gubiła pakiety we własnym buforze przy burstach (`rx_phy_discard`), czego Linux na tej samej karcie nie robił. Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Liczbę workerów instalator liczy z wydajności procesora: maksymalne taktowanie × 0,8 i koszt pakietu (~1600 cykli bez NetFlow, ~4400 z NetFlow) dają pakiety/s na workera; workerów jest co najmniej tyle, ile karta sensownie rozkłada (zapas na ataki małymi pakietami), a więcej, gdy rdzeń jest za wolny na obsłużenie łącza przy typowym pakiecie `VPP_SIZING_PKT` (800 B) — najwyżej 2× i nigdy więcej niż wolnych rdzeni. Szacowaną pojemność routera (Mpps i Gb/s z NetFlow i bez) pokazuje raport audytu i `install-router set_workers --dry-run`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Sterownik karty (DPDK mlx5) dostaje `rxq_pkt_pad_en=1,rxq_cqe_comp_en=0` (`VPP_NIC_DEVARGS`) — odbiór jak w jądrze Linuksa: zapis pakietu do pełnej linii pamięci i bez kompresji CQE; bez tego karta gubiła pakiety we własnym buforze przy burstach (`rx_phy_discard`), czego Linux na tej samej karcie nie robił. `startup.conf` ma też `ethernet { default-mtu }` równe MTU portów: VPP buduje kolejki karty tylko raz, przy starcie, i bez tego wpisu robi to dla MTU 9000 — każdy pakiet dostaje wtedy 8 buforów po 2048 B, DPDK odbiera skalarnie zamiast wektorowo, a pierścień 16384 deskryptorów mieści tylko 2048 pakietów (sprawdzenie: `vppctl show hardware-interfaces hu0 | grep 'rx burst mode'` — ma być `Vector`, nie `Scalar`). Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
 
 ---
 
@@ -15279,7 +15401,7 @@ Format jak w syslogu Cisco: `%OBSZAR-POZIOM-ZDARZENIE: opis`. Poziom: 1 = alarm 
 | `%VPP-4-LOAD_HIGH` | wektor workera ≥ `VEC_WARN` | obserwować; przy częstych wystąpieniach rozważyć więcej workerów |
 | `%VPP-2-LOAD_CRITICAL` | wektor ≥ `VEC_CRIT`, VPP blisko nasycenia | sprawdzić, czy to atak (NetFlow/FastNetMon), ewentualnie blackhole |
 | `%VPP-5-LOAD_NORMAL` | koniec przeciążenia, z czasem trwania i szczytem | — |
-| `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: przy dużym ruchu — zidentyfikować cel ataku, RTBH/Flowspec u upstreamu. Pojedyncze sekundy z kilkuset pakietami przy małym ruchu, bez `LOAD_HIGH` i bez `WK_PREEMPT` = burst jednego przepływu na jednej kolejce RSS (pierścień `VPP_RX_DESC`, 16384 — więcej nie: przy 32768 mlx5 z VPP 26.06 przestaje odbierać) |
+| `%VPP-2-RX_MISS` | karta gubi pakiety, VPP nie nadąża | to już utrata ruchu: przy dużym ruchu — zidentyfikować cel ataku, RTBH/Flowspec u upstreamu. Liczba to pakiety zgubione od poprzedniego odczytu karty (VPP odświeża licznik co ~10 s), a przyczyna jest szukana w `MISS_WINDOW` s przed wpisem. Kilkaset pakietów bez przeciążenia, wywłaszczenia i SMI = burst jednego przepływu na jednej kolejce RSS (pierścień `VPP_RX_DESC`, 16384 — więcej nie: przy 32768 mlx5 z VPP 26.06 przestaje odbierać). Strata większa niż wszystkie pierścienie portu razem (kolejki × `VPP_RX_DESC`) to zatrzymanie VPP, nie burst |
 | `%VPP-3-NIC_DISCARD` | karta odrzuca pakiety sprzętowo (`*discard*`) | bufor PHY/priorytetu karty, PCIe; przy stałym występowaniu — ConnectX-5 |
 | `%VPP-3-WK_PREEMPT` | worker VPP wywłaszczony z izolowanego rdzenia (w opisie: który worker, cpu, co na nim siedzi) | `router-kthreads -n` i `router-kthreads`; jeśli to proces użytkownika — `ps -eLo psr,comm` i jego `CPUAffinity` |
 | `%SYS-3-SMI` | przerwania BIOS-u (SMI) na rdzeniach workerów — rdzeń stoi poza kontrolą kernela, bez śladu w `/proc/interrupts` | BIOS: System Profile = Performance, Memory Patrol/Demand Scrub = Disabled, USB legacy = Off; iDRAC/BMC bez cyklicznych odpytań |
@@ -15303,7 +15425,7 @@ Każde zdarzenie jest logowane na początku, potem co `REPEAT_EVERY` s przypomni
 
 ```
 %VPP-4-LOAD_HIGH: worker 1 (cpu 5) wektor 100/256, pętle 90.0k/s, workery>64: 12/12
-%VPP-2-RX_MISS: utrata pakietów na wejściu: hu0 2.00M pkt/s (VPP nie nadąża lub brak buforów); rx 30.00M pps / 168.00Gb/s
+%VPP-2-RX_MISS: utrata pakietów na wejściu: hu0 2.00M pkt (od poprzedniego odczytu karty, ≤13 s) — worker przeciążony (wektor 256) — za mało workerów albo atak; w ostatnich 13 s: wektor maks. 256, wywłaszczenia 0, SMI +0; rx 30.00M pps / 168.00Gb/s
 %VPP-2-LOAD_CRITICAL: worker 1 (cpu 5) wektor 200/256 … (eskalacja po 2s)
 %VPP-5-LOAD_NORMAL: koniec po 8s, szczyt: worker 1 (cpu 5) wektor 200/256 …
 %VPP-6-STATS: szczyty 60s: wektor 200 (worker 1), rx 30.00M pps / 168.00Gb/s, rx-miss 4000000 pkt, …

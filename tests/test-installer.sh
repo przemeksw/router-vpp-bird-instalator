@@ -11,9 +11,11 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.48"                     '^SCRIPT_VERSION="1\.5\.48"' 1
+chk "wersja skryptu 1.5.50"                     '^SCRIPT_VERSION="1\.5\.50"' 1
 chk "karta: odbiór jak w jądrze (dopełnianie, bez kompresji CQE)" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1,rxq_cqe_comp_en=0"' 1
 chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
+chk "startup.conf: ethernet default-mtu z PORT_MTU"  '^  default-mtu \$VPP_DEFAULT_MTU$' 1
+chk "vpp_conf_diff i upgrade wykrywają default-mtu"  "grep -oE 'default-mtu \[0-9\]\+'" 2
 chk "stały ifIndex: moduł instalowany i łatka agenta" '^snmp_agent_ifindex\(\) \{|^  snmp_agent_ifindex \|\| true$|  if snmp_agent_ifindex \|\| ' 3
 chk "router-netflow: podmiana numerów interfejsów w IPFIX" 'data = router_ifindex.ipfix_rewrite\(data, templates, ifmap.get\(\)\)' 1
 chk "alarm wkładek domyślnie wyłączony (odczyt DDM w barierze VPP)" '^OPTICS_CHECK_EVERY=0$' 1
@@ -28,7 +30,7 @@ chk "loop0: podmiana adresu w ifaces.conf"       'cur_l0=\$\(awk' 1
 l0q=$(grep -n 'read -rp "  Adres loop0' install-router.sh | cut -d: -f1); aud=$(grep -n '^# AUDYT SPRZĘTU' install-router.sh | cut -d: -f1)
 if [[ -n $l0q && -n $aud ]] && ((l0q < aud)); then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  pytanie o loop0 nie jest przed audytem (linia $l0q, audyt $aud)"; fi
 chk "luz workerów uczony tylko przy realnym ruchu (monitor i top)" '^IDLE_MIN_RX_PPS = 1000\.0' 2
-chk "stary plik luzu (bez wersji) odrzucany" '^IDLE_FMT = 2' 2
+chk "stary plik luzu (bez wersji/podpisu VPP) odrzucany" '^IDLE_FMT = 3' 2
 chk "router-monitor: pomiar luzu nie nadpisywany przez zmienną rdzeni systemowych" '^    idle_loops, idle_saved_t, last_rx_pps = IdleLoops|        for c, \(tot, idle\) in hk_now' 2
 chk "router-monitor: nikt nie woła metod na 'idle'" '\bidle\.(learn|busy|save)\(' 0
 chk "lspci: LnkSta z tabulatorem (wcześniej nic nie łapało)" "LnkSta:\\[\\[:space:\\]\\]\\*Speed" 3
@@ -63,7 +65,7 @@ for a in 10.10.10.10 10.10.10.10/24 256.1.1.1/32 0.0.0.0/32 127.0.0.1/32 224.0.0
 done
 chk "router-top: karta 5 kolejki RX"           '5: \("Kolejki RX", QueueStats, screen_queues\)' 1
 chk "router-snmp: OID-y wywłaszczeń i SMI"     '\(22, "rvVppWkPreempt", "gauge"|\(23, "rvVppSmi", "gauge"' 2
-chk "router-monitor: RX_MISS z przyczyną"      'burst jednego przepływu na jednej kolejce RSS: worker nie był' 1
+chk "router-monitor: RX_MISS z przyczyną w oknie" '^def explain_miss\(now, lost, hist, ring\):|"MISS_WINDOW": 13,|^MISS_WINDOW=13$' 3
 chk "router-monitor: HK_GRACE po starcie"      '"HK_GRACE": 300,|^HK_GRACE=300$|uptime\(\) >= CFG\["HK_GRACE"\]' 3
 chk "router-ifaces: alarm wkładek z timera"    '^def optics_check\(state\):|optics_check\(state\)$' 2
 chk "router-ifaces: czeka na flowprobe params z bootstrap.vpp" '^def wait_flowprobe_params\(timeout\):|wait_flowprobe_params\(30\)' 2
@@ -341,7 +343,7 @@ else
   fail=$((fail+1)); echo "BŁĄD  brak list_mlx5_ports/choose_nic do testu"
 fi
 # set_workers: rozpoznanie zmian w startup.conf (rdzenie, bufory, sterta, porty), nie tylko rdzeni
-vd=$(sed -n '/^KERNEL_JITTER_PARAMS=/p; /^kernel_params_ok() {/,/^}/p; /^vpp_conf_diff() {/,/^}/p' install-router.sh)
+vd=$(sed -n '/^KERNEL_JITTER_PARAMS=/p; /^kernel_params_ok() {/,/^}/p; /^vpp_default_mtu() {/p; /^vpp_conf_diff() {/,/^}/p' install-router.sh)
 if [[ -n $vd ]]; then
   vdc=$(mktemp)
   cat >"$vdc" <<'EOC'
@@ -408,6 +410,15 @@ EOC
     dv=${want% *}; [[ $dv == - ]] && dv=""
     got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_RX_DESC=16384 VPP_TX_DESC=4096 VPP_NIC_DEVARGS=$dv WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
     if [[ $got == *"${want#* }"* && ( -z $dv || $got == *"parametry karty (devargs) brak → $dv"* ) ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff devargs '$dv': jest '$got'"; fi
+  done
+  # MTU kolejek karty: VPP buduje kolejki przy starcie z ethernet { default-mtu } (domyślnie 9000 → 8 buforów na pakiet,
+  # odbiór skalarny, pierścień 8× mniejszy); brak wpisu przy PORT_MTU=1500 = zmiana, zgodny wpis = brak zmian
+  for want in "brak rc=0" "1500 rc=1" "9000 rc=0"; do
+    mv=${want% *}; cp "$vdc" "$vdc.mtu"
+    [[ $mv == brak ]] || printf 'ethernet {\n  default-mtu %s\n}\n' "$mv" >>"$vdc.mtu"
+    got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc.mtu VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_RX_DESC=16384 VPP_TX_DESC=4096 VPP_NIC_DEVARGS= PORT_MTU=1500 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
+    if [[ $got == *"${want#* }"* && ( $mv == 1500 || $got == *"MTU kolejek karty (ethernet default-mtu) $mv → 1500"* ) ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff default-mtu '$mv': jest '$got'"; fi
+    rm -f "$vdc.mtu"
   done
   rm -f "$vdc.bak"
   rm -f "$vdg" "$vdt" "$vdt2"

@@ -178,7 +178,7 @@ class TestIfacesScreen(unittest.TestCase):
         top.IDLE_LOCAL = []
         top.IDLE_FILE = self.root + "/idle.json"
         with open(top.IDLE_FILE, "w") as f:                    # router-monitor zmierzył luz: 4 M pętli/s
-            json.dump({"v": 2, "idle": [100000, 4000000, 4000000, 0]}, f)
+            json.dump({"v": 3, "sig": "a", "idle": [100000, 4000000, 4000000, 0]}, f)
         cur = {"__workers__": [[1.0, 90000], [1.0, 2000000], [1.0, 400000], [2.0, 3000000]]}
         lines = top.screen_load(cur["__workers__"], 50000)
         rows = {t.split("(")[0].strip(): (t, st) for t, st in lines if t.startswith("  worker ")}
@@ -194,6 +194,19 @@ class TestIfacesScreen(unittest.TestCase):
         self.assertIn("?%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])   # bez ruchu: nie uczy się
         lines = top.screen_load([[1.0, 50000], [1.0, 3500000]], 50000)
         self.assertIn("  0%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])
+
+    def test_idle_local_dropped_when_vpp_config_changes(self):
+        """router-top działający przez restart VPP z inną konfiguracją nie może trzymać starego luzu w pamięci."""
+        top.IDLE_LOCAL, top.IDLE_SIG = [], None
+        top.IDLE_FILE = self.root + "/idle-sig.json"
+        with open(top.IDLE_FILE, "w") as f:
+            json.dump({"v": 3, "sig": "skalarny", "idle": [100000, 4400000]}, f)
+        top.learn_idle([[1.0, 100000], [1.0, 4500000]], 50000)
+        self.assertEqual(top.idle_loops(2)[1], 4500000)            # własny pomiar wyższy niż z pliku
+        with open(top.IDLE_FILE, "w") as f:                          # VPP wstał z nową konfiguracją
+            json.dump({"v": 3, "sig": "wektorowy", "idle": [100000, 2950000]}, f)
+        self.assertEqual(top.idle_loops(2)[1], 2950000)            # stary pomiar z pamięci odrzucony
+        self.assertEqual(top.IDLE_LOCAL, [])
 
     def test_scrolling_keeps_table_header(self):
         lines = [("naglowek", "head")] + [("wiersz %d" % i, "") for i in range(100)]
