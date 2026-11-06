@@ -11,7 +11,13 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.32"                     '^SCRIPT_VERSION="1\.5\.32"' 1
+chk "wersja skryptu 1.5.33"                     '^SCRIPT_VERSION="1\.5\.33"' 1
+chk "router-top: karta 5 kolejki RX"           '5: \("Kolejki RX", QueueStats, screen_queues\)' 1
+chk "router-snmp: OID-y wywłaszczeń i SMI"     '\(22, "rvVppWkPreempt", "gauge"|\(23, "rvVppSmi", "gauge"' 2
+chk "router-monitor: RX_MISS z przyczyną"      'burst jednego przepływu na jednej kolejce RSS: worker nie był' 1
+chk "router-monitor: HK_GRACE po starcie"      '"HK_GRACE": 300,|^HK_GRACE=300$|uptime\(\) >= CFG\["HK_GRACE"\]' 3
+chk "router-ifaces: alarm wkładek z timera"    '^def optics_check\(state\):|optics_check\(state\)$' 2
+chk "router-ifaces: czeka na flowprobe params z bootstrap.vpp" '^def wait_flowprobe_params\(timeout\):|wait_flowprobe_params\(30\)' 2
 chk "router-kthreads: przerwania (plan_irqs)"  '^def plan_irqs\(irqlist, isolated, present\):' 1
 chk "router-kthreads: tryb timera --quiet → ISOL_FIX" 'line = "%SYS-4-ISOL_FIX: " \+ msg' 1
 chk "router-kthreads-check.timer w st_isolation" 'systemctl enable --now router-kthreads-check.timer' 1

@@ -241,6 +241,20 @@ vpp fake link-down hu0 >/dev/null
 t "optics: port up bez linku = alarm"       1 $RI optics
 t "optics --json: link down"                0 has '"link": "down"' $RI optics --json
 vpp fake link-down >/dev/null
+
+echo "13b. alarm wkładek z timera (check --log)"
+ALOG=$W/root/var/log/router/alarmy.log
+$RI check --log >/dev/null 2>&1
+t "wkładki w normie: bez OPTICS w logu"      1 grep -q 'OPTICS' "$ALOG"
+sed -i.bak 's#0.7000 mW (-1.55 dBm)#0.0000 mW (-inf dBm)#' "$W/ddm-hu0"       # tor 2 bez światła (oba porty mają ten plik)
+$RI check --log >/dev/null 2>&1
+t "tor bez światła → %IFACE-3-OPTICS"        0 grep -q 'IFACE-3-OPTICS' "$ALOG"
+t "OPTICS: port, tor i wartość w opisie"     0 grep -q 'hu0 \[ALARM\] RX tor 2 -inf dBm \[ALARM' "$ALOG"
+$RI check --log >/dev/null 2>&1
+t "OPTICS logowany raz (bez powtórek co 5 min)" 0 test "$(grep -c 'IFACE-3-OPTICS' "$ALOG")" = 1
+sed -i.bak 's#0.0000 mW (-inf dBm)#0.7000 mW (-1.55 dBm)#' "$W/ddm-hu0"
+$RI check --log >/dev/null 2>&1
+t "powrót do normy → OPTICS_END"             0 grep -q 'IFACE-5-OPTICS_END' "$ALOG"
 watch2() {   # optics -w: co najmniej dwa odświeżenia w ~2,5 s, Ctrl+C kończy z kodem 0
   python3 - "$@" <<'P'
 import signal, subprocess, sys, time

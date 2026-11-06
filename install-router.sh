@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.32"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.33"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -1080,6 +1080,23 @@ def wait_vpp(phys_needed, timeout):
     return False
 
 
+def wait_flowprobe_params(timeout):
+    """Przy starcie: VPP otwiera cli.sock, zanim skończy wykonywać bootstrap.vpp (exec w unix{}), a "flowprobe params"
+    są na jego końcu, za tworzeniem TAP-ów. Gdy nasz "flowprobe feature add-del loop0" (kotwica) zdąży pierwszy,
+    bootstrap kończy się w logu VPP błędem "Couldn't change flowperpacket params when feature is enabled" —
+    nieszkodliwym, ale mylącym. Czekamy do timeout s, aż parametry będą ustawione; gdyby bootstrap ich nie miał,
+    plan() ustawi je sam (zabezpieczenie niżej)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if read_vpp().flowprobe_params_ok:
+                return True
+        except VppError:
+            pass
+        time.sleep(1)
+    return False
+
+
 # --------------------------------------------------------------------------- plan zmian
 class Cmd:
     def __init__(self, op, kind, args, why=""):
@@ -1451,6 +1468,8 @@ def do_apply(args, boot=False):
         if not wait_vpp(envphys or [], args.timeout):
             event(2, "APPLY_FAIL", "VPP nie odpowiada po %d s — interfejsy nie zostały skonfigurowane" % args.timeout)
             return 3
+        if NETFLOW_INSTALLED:
+            wait_flowprobe_params(30)
     desired, errs, text = get_desired(CONF, quiet=boot)
     if errs or desired is None:
         if boot and os.path.exists(LASTGOOD):
@@ -1630,6 +1649,7 @@ def do_check(args):
         if pending and not state.get("pending_logged"):
             event(6, "PENDING", "%s zmieniony, ale nie zastosowany (router-ifaces diff / apply)" % CONF, mail=False)
         state["drift"], state["pending_logged"] = key, pending
+        optics_check(state)
         save_state(state)
         return 1 if cmds else 0
     if cmds:
@@ -1853,6 +1873,52 @@ def read_optics():
 
 def _f(v, fmt):
     return "-" if v is None else "-inf" if v == float("-inf") else fmt % v
+
+
+def optics_summary(res):
+    """[(port, ALARM/WARN, opis)] z read_optics: wartości DDM poza progami zapisanymi w module, brak linku na
+    włączonym porcie, flagi modułu. Porty bez wkładki/bez DDM (np. DAC) są pomijane — to nie jest degradacja."""
+    out = []
+    for r in res:
+        why = []
+        if r.get("admin") == "up" and r.get("link") == "down":
+            why.append("port włączony, brak linku")
+        if not r.get("error"):
+            thr = r["thr"]
+            for kind, name, unit, fmt in (("temp", "temperatura", "°C", "%.1f"), ("volt", "zasilanie", "V", "%.2f")):
+                st = ddm_state(r.get(kind), thr.get(kind))
+                if st in ("ALARM", "WARN"):
+                    why.append("%s %s%s [%s]" % (name, _f(r[kind], fmt), unit, st))
+            for no, ln in sorted(r["lanes"].items()):
+                for kind, name, unit in (("rx", "RX", "dBm"), ("tx", "TX", "dBm"), ("bias", "bias", "mA")):
+                    st = ln.get(kind + "_state")
+                    if st in ("ALARM", "WARN"):
+                        t = thr.get(kind, {})
+                        lo, hi = ("low alarm", "high alarm") if st == "ALARM" else ("low warning", "high warning")
+                        why.append("%s tor %d %s %s [%s, zakres %s…%s]" % (
+                            name, no, _f(ln.get(kind), "%.2f"), unit, st, _f(t.get(lo), "%.1f"), _f(t.get(hi), "%.1f")))
+            if r.get("flags"):
+                why.append("flagi modułu: " + ", ".join(r["flags"]))
+        if why:
+            out.append((r["port"], "ALARM" if r.get("state") == "ALARM" else "WARN", "; ".join(why)))
+    return out
+
+
+def optics_check(state):
+    """Co 5 min (router-ifaces check --log): wkładki poza progami → %IFACE-3/4-OPTICS raz (do zmiany listy), powrót → OPTICS_END.
+    Spadająca moc RX na LR4 to typowy zwiastun awarii włókna/wkładki na tygodnie przed błędami CRC."""
+    try:
+        bad = optics_summary(read_optics())
+    except Exception:          # noqa: BLE001 — VPP w restarcie albo brak INST_NIC_PCI: sprawdzimy następnym razem
+        return
+    key = sha("\n".join("%s %s %s" % b for b in bad)) if bad else ""
+    if bad and key != state.get("optics"):
+        sev = 3 if any(s == "ALARM" for _p, s, _w in bad) else 4
+        event(sev, "OPTICS", "wkładki poza progami modułu: %s — szczegóły: router-ifaces optics"
+              % "; ".join("%s [%s] %s" % (p, s, w) for p, s, w in bad))
+    elif not bad and state.get("optics"):
+        event(5, "OPTICS_END", "wkładki znów w normie (DDM w zakresie progów modułu)")
+    state["optics"] = key
 
 
 def _st(text, state):
@@ -2210,6 +2276,7 @@ CFG = {
     "PUNT_PPS": 20000.0,    # pkt/s do control plane
     "HK_CPU_PCT": 90.0,     # % zajętości rdzenia systemowego
     "HK_CPU_SECONDS": 5,    # przez ile sekund z rzędu
+    "HK_GRACE": 300,        # s od startu systemu bez alarmu CPU_HIGH (BIRD wczytuje tablicę, Routinator pobiera VRP)
     "REPEAT_EVERY": 10,     # s, przypomnienie o trwającym zdarzeniu
     "SUMMARY_EVERY": 0,     # s, linia %VPP-6-STATS (0 = wyłączone; w logu mają być tylko ostrzeżenia i zdarzenia)
     "LOG_MAX_SEV": 4,       # najwyższy poziom zapisywany w alarmy.log (4 = ostrzeżenia i groźniejsze; 6 = także informacje)
@@ -2429,6 +2496,15 @@ def read_proc_stat():
     return out
 
 
+def uptime():
+    """Sekundy od startu systemu (/proc/uptime); bez /proc (testy) — "dawno", żeby nic nie wyciszać."""
+    try:
+        with open("%s/uptime" % PROC) as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 1e9
+
+
 def read_proc_cpu(isolated=()):
     """Czas CPU procesów na rdzeniach systemowych: {pid: (nazwa, ticki user+system)} — suma po wątkach,
     z pominięciem wątków na izolowanych rdzeniach. Liczone per proces workery VPP (12 × 100% swojego rdzenia)
@@ -2634,7 +2710,7 @@ def main():
     hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
-    smi_prev = {}
+    smi_prev, wk_last_t, smi_last_t = {}, 0.0, 0.0
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -2731,9 +2807,20 @@ def main():
                 state["rx_pps"], state["rx_bps"] = tot_pps, tot_bps
                 state["rx_miss_pps"], state["punt_pps"] = tot_miss, tot_punt
                 traffic = "rx %s pps / %sb/s" % (fmt_num(tot_pps), fmt_num(tot_bps))
+                # dlaczego: monitor ma już wszystkie dane, żeby nie zgadywać — przeciążenie (wektor), wywłaszczenie
+                # (WK_PREEMPT w ostatnich 3 s), SMI, albo nic z tego = burst jednego przepływu na jednej kolejce RSS
+                if a_load.active:
+                    why = "worker przeciążony (wektor %.0f) — za mało workerów albo atak" % state.get("vector_max", 0)
+                elif t0 - wk_last_t < 3:
+                    why = "worker wywłaszczony z rdzenia (patrz WK_PREEMPT)"
+                elif t0 - smi_last_t < 3:
+                    why = "SMI z BIOS-u na rdzeniach workerów (patrz SMI)"
+                else:
+                    why = ("burst jednego przepływu na jednej kolejce RSS: worker nie był przeciążony ani wywłaszczony "
+                           "(pierścień num-rx-desc; router-top 5)")
                 a_miss.update(t0, tot_miss >= CFG["RXMISS_PPS"], tot_miss,
-                              "utrata pakietów na wejściu: %s (VPP nie nadąża lub brak buforów); %s"
-                              % (", ".join(miss_txt) or fmt_num(tot_miss), traffic))
+                              "utrata pakietów na wejściu: %s — %s; %s"
+                              % (", ".join(miss_txt) or fmt_num(tot_miss), why, traffic))
                 a_punt.update(t0, tot_punt >= CFG["PUNT_PPS"], tot_punt,
                               "ruch do control plane %s pkt/s; %s" % (fmt_num(tot_punt), traffic))
                 win["pps"] = max(win["pps"], tot_pps)
@@ -2785,6 +2872,8 @@ def main():
                 hits = []
             tot = sum(h[0] for h in hits)
             state["wk_preempt"] = tot
+            if hits:
+                wk_last_t = t0
             if hits and t0 - wk_who_t >= 10:          # kto stoi na tym rdzeniu — skan /proc tylko przy zdarzeniu
                 wk_who, wk_who_t = tasks_on_cpu(hits[0][2], vpp_pid), t0
             a_wk.update(t0, tot >= CFG["WK_PREEMPT"], tot,
@@ -2804,6 +2893,8 @@ def main():
                                   reverse=True)
                 tot = sum(h[0] for h in smi_hits)
                 state["smi"] = tot
+                if smi_hits:
+                    smi_last_t = t0
                 a_smi.update(t0, tot >= CFG["SMI_PER_S"], tot,
                              "SMI (przerwanie BIOS-u) na rdzeniach workerów VPP: %s — rdzeń stoi poza kontrolą kernela "
                              "(grozi rx-miss bez WK_PREEMPT). BIOS: System Profile = Performance, Memory Patrol/Demand Scrub = "
@@ -2822,7 +2913,9 @@ def main():
                 if busy > hk_max:
                     hk_max, hk_core = busy, c
         hk_prev = hk_now
-        hk_over = hk_over + 1 if hk_max >= CFG["HK_CPU_PCT"] else 0
+        # po starcie systemu BIRD wczytuje pełną tablicę, a Routinator pobiera VRP — 100% rdzenia przez ~30 s to
+        # rozruch, nie przeciążenie: przez HK_GRACE s od bootu bez alarmu
+        hk_over = hk_over + 1 if hk_max >= CFG["HK_CPU_PCT"] and uptime() >= CFG["HK_GRACE"] else 0
         # przy przeciążeniu: które procesy zjadają CPU (różnica czasu CPU z ostatniej sekundy)
         if hk_over:
             procs = read_proc_cpu(isolated)
@@ -6276,6 +6369,8 @@ SCALARS = [
         (19, "rvBird6Routes", "gauge", "", "Sieci IPv6 w tablicy master6 BIRD"),
         (20, "rvFibDiffPct", "gauge", "%", "Najwieksza roznica FIB VPP wzgledem BIRD (IPv4/IPv6), %"),
         (21, "rvIfacesDrift", "int", "", "1 = interfejsy VPP roznia sie od ifaces.conf"),
+        (22, "rvVppWkPreempt", "gauge", "", "Wywlaszczenia workerow VPP na sekunde (cos poza VPP na izolowanym rdzeniu)"),
+        (23, "rvVppSmi", "gauge", "", "Przerwania BIOS (SMI) na rdzeniach workerow VPP na sekunde"),
     ]),
     (8, "rvFirewall", "Firewall tranzytu (router-fw)", [
         (1, "rvFwEnabled", "int", "", "1 = firewall aktywny na stale (router-fw enable)"),
@@ -6830,7 +6925,8 @@ class Collector:
         mon = load_json(MONSTATE, {})
         if s["rvVppUp"] and time.time() - mon.get("time", 0) < 15:
             for key, name in (("vector_max", "rvVppVectorMax"), ("punt_pps", "rvVppPuntPps"),
-                              ("rx_miss_pps", "rvVppRxMissPps"), ("nic_discard_pps", "rvVppNicDiscardPps")):
+                              ("rx_miss_pps", "rvVppRxMissPps"), ("nic_discard_pps", "rvVppNicDiscardPps"),
+                              ("wk_preempt", "rvVppWkPreempt"), ("smi", "rvVppSmi")):
                 if key in mon:
                     s[name] = int(round(mon[key]))
             cores = [c for c in env_value(ENVF, "INST_WORKERS").split(",") if c]
@@ -7255,7 +7351,8 @@ prog_router_top() {
   router-top [N]          start na karcie N (domyślnie 1)
   karty:     1 VPP (obciążenie workerów, ruch łącznie)   2 interfejsy (porty i VLAN-y: Gb/s, pkt/s)
              3 firewall (liczniki ACL)   4 guard (naruszenia na żywo)
-  klawisze:  1-4 karta   ↑ ↓ PgUp PgDn Home End przewijanie (także j k)   p pauza   q wyjście
+             5 kolejki RX (rozkład ruchu po kolejkach RSS = workerach, przepełnienia pierścienia rx_out_of_buffer)
+  klawisze:  1-5 karta   ↑ ↓ PgUp PgDn Home End przewijanie (także j k)   p pauza   q wyjście
   router-top --once N     jeden odczyt ekranu N jako zwykły tekst (skrypty, diagnostyka)
 
 Tylko odczyt — niczego nie zmienia w VPP. Liczniki interfejsów i ACL są dokładne; lista zdarzeń guard to
@@ -7273,6 +7370,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -7473,6 +7571,88 @@ def screen_ifaces(cur, prev, dt):
     return lines
 
 
+# --------------------------------------------------------------------------- karta 5: kolejki RX
+# Jedna kolejka RSS = jeden worker = jeden pierścień num-rx-desc. Przepływ (5-tuple) trafia zawsze do tej samej
+# kolejki, więc jeden duży przepływ obciąża jeden worker i może przepełnić jego pierścień (rx_out_of_buffer),
+# choć pozostałe kolejki mają luz — na kartach 1 i 2 tego nie widać.
+VPPCTL = os.environ.get("ROUTER_TOP_VPPCTL", "vppctl")
+HW_TEXT = os.environ.get("ROUTER_TOP_HW_TEXT", "")                    # tylko testy: show hardware-interfaces z pliku
+HW_PORT_RE = re.compile(r"^(\S+)\s+\d+\s+(up|down)\b")
+HW_Q_RE = re.compile(r"^\s+rx_q(\d+)_(packets|bytes)\s+(\d+)\s*$")
+HW_DROP_RE = re.compile(r"^\s+(rx_out_of_buffer|rx_discards_phy|rx_prio\d+_buf_discard_packets)\s+(\d+)\s*$")
+
+
+def parse_hw_queues(text):
+    """{port: {"q": {nr: (pakiety, bajty)}, "oob": rx_out_of_buffer, "disc": odrzucenia PHY}} z 'show hardware-interfaces'."""
+    res, cur = {}, None
+    for line in text.splitlines():
+        m = HW_PORT_RE.match(line)
+        if m:
+            cur = m.group(1)
+            res[cur] = {"q": {}, "oob": 0, "disc": 0}
+            continue
+        if cur is None:
+            continue
+        m = HW_Q_RE.match(line)
+        if m:
+            n, kind, v = int(m.group(1)), m.group(2), int(m.group(3))
+            p, b = res[cur]["q"].get(n, (0, 0))
+            res[cur]["q"][n] = (v, b) if kind == "packets" else (p, v)
+            continue
+        m = HW_DROP_RE.match(line)
+        if m:
+            res[cur]["oob" if m.group(1) == "rx_out_of_buffer" else "disc"] += int(m.group(2))
+    return {p: d for p, d in res.items() if d["q"]}
+
+
+class QueueStats:
+    """Liczniki kolejek RX z 'show hardware-interfaces' (odczyt xstats DPDK w wątku głównym, bez bariery)."""
+    def sample(self):
+        if HW_TEXT:
+            with open(HW_TEXT) as f:
+                return parse_hw_queues(f.read())
+        r = subprocess.run([VPPCTL, "show", "hardware-interfaces"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "vppctl: błąd")
+        return parse_hw_queues(r.stdout)
+
+
+def screen_queues(cur, prev, dt):
+    lines = [("  KOLEJKI RX (kolejka = worker; przepływ trafia zawsze do tej samej kolejki)", "head"),
+             ("  %-8s %-7s %10s %13s %7s  %-18s %s" % ("port", "kolejka", "pkt/s", "b/s", "udział", "rozkład", "rdzeń"), "head")]
+    if not cur:
+        lines.append(("  Brak danych o kolejkach (show hardware-interfaces).", "dim"))
+        return lines
+    cores = [c for c in read_kv(ENV_FILE, "INST_WORKERS").split(",") if c]
+    for port in sorted(cur, key=natkey):
+        d, o = cur[port], prev.get(port, cur[port])
+        rates = {}
+        for n, (p, b) in sorted(d["q"].items()):
+            op, ob = o["q"].get(n, (p, b))
+            rates[n] = (max(0, p - op) / dt, max(0, b - ob) / dt)
+        tot = sum(r[0] for r in rates.values())
+        oob = max(0, d["oob"] - o["oob"]) / dt
+        disc = max(0, d["disc"] - o["disc"]) / dt
+        lines.append(("  %-8s %-7s %10s %13s %7s  %s" % (
+            port, "razem", fmt_pps(tot), fmt_bps(8 * sum(r[1] for r in rates.values())), "",
+            "rx_out_of_buffer %s/s — pierścień pełny" % fmt_pps(oob) if oob else "bez przepełnień pierścienia"),
+            "miss" if oob else "bold"))
+        peak = max((r[0] for r in rates.values()), default=0.0)
+        for n, (pps, bps) in sorted(rates.items()):
+            share = pps / tot if tot else 0.0
+            skew = tot > 0 and len(rates) > 1 and share > 2.0 / len(rates)
+            lines.append(("  %-8s %-7s %10s %13s %6.1f%%  %s %s%s" % (
+                "", "q%d" % n, fmt_pps(pps), fmt_bps(8 * bps), 100 * share, bar(pps / peak if peak else 0.0, 16),
+                cores[n] if n < len(cores) else "?", "  ← skupienie ruchu" if skew else ""), "warn" if skew else ""))
+        if disc:
+            lines.append(("  %-8s odrzucenia PHY karty: %s/s" % ("", fmt_pps(disc)), "miss"))
+        lines.append(("", ""))
+    lines.append(("  udział > 2× średniej = jeden/kilka przepływów obciąża jeden worker (RSS nie rozkłada jednego 5-tuple).", "dim"))
+    lines.append(("  rx_out_of_buffer = pierścień RX pełny: burst jednego przepływu albo worker nie nadąża (num-rx-desc w startup.conf).",
+                  "dim"))
+    return lines
+
+
 # --------------------------------------------------------------------------- karta 3: firewall
 class FwView:
     def __init__(self):
@@ -7653,7 +7833,8 @@ def screen_guard(cur, prev, dt):
 
 # --------------------------------------------------------------------------- pętla
 SCREENS = {1: ("VPP", IfStats, screen_vpp), 2: ("Interfejsy", IfStats, screen_ifaces),
-           3: ("Firewall (ACL)", FwView, screen_fw), 4: ("Guard", GuardView, screen_guard)}
+           3: ("Firewall (ACL)", FwView, screen_fw), 4: ("Guard", GuardView, screen_guard),
+           5: ("Kolejki RX", QueueStats, screen_queues)}
 
 
 class App:
@@ -8847,7 +9028,7 @@ Powłoka w netns dataplane (BIRD, SSH/SNMP na loop0): `router dataplane` albo `d
 ## 2. Codzienna kontrola (2 minuty)
 
 ```
-router-top                            # NA ŻYWO: 1 obciążenie VPP, 2 porty/VLAN-y, 3 firewall, 4 guard (q = wyjście)
+router-top                            # NA ŻYWO: 1 obciążenie VPP, 2 porty/VLAN-y, 3 firewall, 4 guard, 5 kolejki RX (q = wyjście)
 router-check                          # pełna kontrola: usługi, VPP, BGP, interfejsy, firewall, logi
 tail -n 30 /var/log/router/alarmy.log # co się działo
 birdc show protocols                  # sesje BGP: wszystkie "Established"?
@@ -9072,6 +9253,7 @@ Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-
 | `SMI_PER_S` | 1 | przerwania BIOS-u (SMI, MSR 0x34) na rdzeniach workerów na sekundę; 0 = wyłącz |
 | `PUNT_PPS` | 20000 | ruch do samego routera |
 | `HK_CPU_PCT` / `HK_CPU_SECONDS` | 90 / 5 | przeciążony rdzeń systemowy |
+| `HK_GRACE` | 300 | sekundy od startu systemu bez `CPU_HIGH` (rozruch BIRD/Routinatora) |
 | `HANG_SECONDS` / `HANG_RESTART` | 30 / 1 | VPP nie odpowiada → po 30 s restart VPP |
 
 Po zmianie: `systemctl restart router-monitor`. Bieżący stan: `/run/router-monitor/state.json`.
@@ -12597,7 +12779,7 @@ EOF
   systemctl daemon-reload
   systemctl enable --now router-ifaces-check.timer >/dev/null 2>&1 || warn "nie włączono router-ifaces-check.timer"
   man_add service router-ifaces.service "odtwarza interfejsy po starcie VPP (przed BIRD)"
-  man_add service router-ifaces-check.timer "co 5 min: rozjazd VPP vs ifaces.conf → %IFACE-4-DRIFT"
+  man_add service router-ifaces-check.timer "co 5 min: rozjazd VPP vs ifaces.conf → %IFACE-4-DRIFT; wkładki poza progami DDM → %IFACE-3/4-OPTICS"
   man_add dir /var/lib/router "stan router-ifaces (ifaces.state.json, ifaces.last-good.conf)"
   man_add file /var/log/router/ifaces.log "log router-ifaces: każde polecenie vppctl z wynikiem"
 
@@ -12854,7 +13036,7 @@ st_monitor() {
   prog_router_monitor | put_file /opt/router/bin/router-monitor "router-monitor: obciążenie VPP, rx-miss, CPU, RAID w czasie rzeczywistym" 755
   prog_router_top | put_file /opt/router/bin/router-top "router-top: podgląd na żywo — interfejsy (Gb/s, pkt/s), liczniki ACL, guard" 755
   ln -sfn /opt/router/bin/router-top /usr/local/sbin/router-top
-  man_add file /usr/local/sbin/router-top "polecenie router-top (1 VPP, 2 interfejsy, 3 firewall, 4 guard)"
+  man_add file /usr/local/sbin/router-top "polecenie router-top (1 VPP, 2 interfejsy, 3 firewall, 4 guard, 5 kolejki RX)"
   put_file /etc/router/router-monitor.conf "progi router-monitor (zmiana: edytuj i systemctl restart router-monitor)" <<EOF
 # router-monitor — progi alarmów. Po zmianie: systemctl restart router-monitor
 INTERVAL=1
@@ -12876,6 +13058,8 @@ PUNT_PPS=20000
 # rdzenie systemowe (poza VPP): % zajętości przez ile sekund
 HK_CPU_PCT=90
 HK_CPU_SECONDS=5
+# sekundy od startu systemu bez alarmu CPU_HIGH (rozruch: BIRD wczytuje tablicę, Routinator pobiera VRP)
+HK_GRACE=300
 # przypomnienie o trwającym zdarzeniu co N s
 REPEAT_EVERY=10
 # najwyższy poziom zapisywany w alarmy.log: 4 = tylko ostrzeżenia, błędy i zdarzenia krytyczne (plus zakończenia alarmów);
@@ -14175,7 +14359,7 @@ Po restarcie serwera wstają same, w tej kolejności:
 | 9 | `router-notify.service` | wysyła alarmy e-mailem (kolejka `/var/spool/router-notify`) | restart po 10 s |
 | — | `router-snmp.service` | co 30 s zbiera dane dla SNMP (BGP, VPP, firewall, guard, RPKI, RAID, dyski) do `/run/router-snmp/cache.json`; podgląd: `router-snmp walk` | restart po 10 s |
 | 10 | `router-bootcheck.service` | po starcie: wykrywa nieczysty restart / kernel panic, sprawdza usługi, wynik do logu i e-mailem | przy starcie i zamknięciu systemu |
-| — | `router-ifaces-check.timer` | co 5 min: czy VPP zgadza się z ifaces.conf (rozjazd → alarm) | — |
+| — | `router-ifaces-check.timer` | co 5 min: czy VPP zgadza się z ifaces.conf (rozjazd → alarm); DDM wkładek poza progami → alarm | — |
 | — | `mdmonitor` / `smartd` | zdarzenia RAID / zdrowie dysków | — |
 | — | `irqbalance` | przerwania z pominięciem rdzeni VPP | — |
 
@@ -14398,7 +14582,7 @@ Zmiany działają w ciągu 5 sekund (bez restartu). Test: `router-notify test`. 
 | `VPP_PUNT` | `%VPP-4-PUNT_HIGH` |
 | `SYS_CPU` | `%SYS-4-CPU_HIGH` |
 | `FIREWALL` | `%FW-5-APPLIED`, `%FW-4-DRIFT`, `%FW-2-CONFIG_ERROR`, `%FW-5-BLOCK` (rozdział 10a) |
-| `IFACES` | `%IFACE-5-CONFIG_APPLIED`, `%IFACE-4-DRIFT`, `%IFACE-2-CONFIG_ERROR`, `%IFACE-3-APPLY_FAIL` (rozdział 10) |
+| `IFACES` | `%IFACE-5-CONFIG_APPLIED`, `%IFACE-4-DRIFT`, `%IFACE-2-CONFIG_ERROR`, `%IFACE-3-APPLY_FAIL`, `%IFACE-3/4-OPTICS` (wkładki poza progami DDM) (rozdział 10) |
 | `STATS` | `%VPP-6-STATS` (po włączeniu `SUMMARY_EVERY`) — zwykle nie chcesz tego mailem |
 | `OTHER` | wszystko, co nie pasuje do powyższych |
 | `ALL` | wszystkie kategorie |
@@ -14498,11 +14682,14 @@ Po restarcie:
 
 Wykrywanie rozjazdu: co 5 minut `router-ifaces-check.timer` porównuje VPP z ostatnio zastosowaną konfiguracją. Gdy ktoś zmieni coś ręcznie albo odtworzenie się nie uda, w logu pojawi się `%IFACE-4-DRIFT` (raz, z listą różnic), a po naprawie `%IFACE-5-DRIFT_END`. Sama edycja pliku bez `apply` nie jest rozjazdem — w logu jest tylko informacja `%IFACE-6-PENDING`.
 
+Ten sam timer pilnuje **wkładek**: gdy DDM modułu (moc RX/TX, bias, temperatura, zasilanie) wyjdzie poza progi zapisane w samym module albo włączony port nie ma linku, w logu pojawia się `%IFACE-4-OPTICS` (ostrzeżenie) lub `%IFACE-3-OPTICS` (alarm modułu) — raz, z wartością i zakresem — a po powrocie `%IFACE-5-OPTICS_END`. Spadająca moc RX na LR4 to typowy zwiastun problemu z włóknem na tygodnie przed błędami CRC; szczegóły: `router-ifaces optics`.
+
 | Komunikat | Znaczenie |
 |---|---|
 | `%IFACE-5-CONFIG_APPLIED` | zastosowano zmiany (utworzone/usunięte interfejsy, adresy, opisy) |
 | `%IFACE-6-RESTORED` | konfiguracja odtworzona po starcie VPP |
 | `%IFACE-4-DRIFT` / `%IFACE-5-DRIFT_END` | VPP różni się od pliku / znów zgodny |
+| `%IFACE-3-OPTICS`, `%IFACE-4-OPTICS` / `%IFACE-5-OPTICS_END` | wkładka poza progami DDM modułu lub włączony port bez linku / znów w normie |
 | `%IFACE-6-PENDING` | plik zmieniony, jeszcze nie zastosowany |
 | `%IFACE-2-CONFIG_ERROR` | przy starcie plik miał błąd — użyto ostatniej poprawnej wersji |
 | `%IFACE-3-APPLY_FAIL`, `%IFACE-2-APPLY_FAIL` | części zmian nie dało się zastosować / VPP nie odpowiadał |

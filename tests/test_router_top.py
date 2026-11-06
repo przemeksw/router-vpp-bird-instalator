@@ -63,6 +63,41 @@ class TestIfacesScreen(unittest.TestCase):
         self.assertLess(text.index("hu0 "), text.index("└ hu0.100"))
         self.assertLess(text.index("└ hu0.100"), text.index("└ hu0.300"))
 
+    def test_rx_queues_screen(self):
+        hw = ("              Name                Idx   Link  Hardware\n"
+              "hu0                                1     up   hu0\n"
+              "  Link speed: 100 Gbps\n"
+              "    rx_q0_packets                       1000\n"
+              "    rx_q1_packets                       1000\n"
+              "    rx_q2_packets                       1000\n"
+              "    rx_q0_bytes                       100000\n"
+              "    rx_q1_bytes                       100000\n"
+              "    rx_q2_bytes                       100000\n"
+              "    rx_out_of_buffer                     307\n"
+              "    rx_discards_phy                        0\n"
+              "hu1                                2    down  hu1\n"
+              "    rx_q0_packets                          0\n"
+              "local0                             0    down  local0\n")
+        prev = top.parse_hw_queues(hw)
+        self.assertEqual(prev["hu0"]["q"], {0: (1000, 100000), 1: (1000, 100000), 2: (1000, 100000)})
+        self.assertEqual((prev["hu0"]["oob"], prev["hu0"]["disc"]), (307, 0))
+        self.assertNotIn("local0", prev)
+        cur = top.parse_hw_queues(hw.replace("rx_q2_packets                       1000", "rx_q2_packets                      21000")
+                                  .replace("rx_out_of_buffer                     307", "rx_out_of_buffer                     649"))
+        with open(self.root + "/router.env", "w") as f:
+            f.write('INST_WORKERS="5,7,9"\n')
+        top.ENV_FILE = self.root + "/router.env"
+        text = "\n".join(t for t, _s in top.screen_queues(cur, prev, 1.0))
+        self.assertIn("rx_out_of_buffer 342/s", text)           # 649 - 307 w tej sekundzie
+        self.assertIn("q2", text)
+        self.assertIn("skupienie ruchu", text)                   # 20k z 20k = 100% na jednej kolejce
+        self.assertIn("100.0%", text)
+        self.assertIn(" 9", text)                                # rdzeń workera kolejki q2
+        quiet = "\n".join(t for t, _s in top.screen_queues(prev, prev, 1.0))
+        self.assertIn("bez przepełnień", quiet)
+        self.assertNotIn("skupienie", quiet)
+        self.assertIn("Kolejki RX", top.header(5, False))
+
     def test_vpp_load_per_worker(self):
         with open(self.root + "/etc/router/router.env", "w") as f:
             f.write('INST_WORKERS=5,6,7\n')

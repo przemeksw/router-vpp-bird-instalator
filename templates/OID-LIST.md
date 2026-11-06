@@ -32,6 +32,8 @@ Typy: int = Integer32, gauge = Gauge32, counter = Counter32, counter64 = Counter
 | `1.3.6.1.4.1.8072.9999.9999.630.2.19.0` | rvBird6Routes | gauge |  | Sieci IPv6 w tablicy master6 BIRD |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.20.0` | rvFibDiffPct | gauge | % | Najwieksza roznica FIB VPP wzgledem BIRD (IPv4/IPv6), % |
 | `1.3.6.1.4.1.8072.9999.9999.630.2.21.0` | rvIfacesDrift | int |  | 1 = interfejsy VPP roznia sie od ifaces.conf |
+| `1.3.6.1.4.1.8072.9999.9999.630.2.22.0` | rvVppWkPreempt | gauge |  | Wywlaszczenia workerow VPP na sekunde (cos poza VPP na izolowanym rdzeniu) |
+| `1.3.6.1.4.1.8072.9999.9999.630.2.23.0` | rvVppSmi | gauge |  | Przerwania BIOS (SMI) na rdzeniach workerow VPP na sekunde |
 | `1.3.6.1.4.1.8072.9999.9999.630.3.1.1` | rvWorkerIndex | int |  | Numer workera |
 | `1.3.6.1.4.1.8072.9999.9999.630.3.1.2` | rvWorkerName | string |  | Worker i rdzen CPU |
 | `1.3.6.1.4.1.8072.9999.9999.630.3.1.3` | rvWorkerVector | gauge |  | Sredni rozmiar wektora (1 = luz, 256 = nasycenie) |

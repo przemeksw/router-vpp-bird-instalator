@@ -218,6 +218,20 @@ rvIfacesDrift OBJECT-TYPE
     DESCRIPTION "1 = interfejsy VPP roznia sie od ifaces.conf"
     ::= { rvVpp 21 }
 
+rvVppWkPreempt OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wywlaszczenia workerow VPP na sekunde (cos poza VPP na izolowanym rdzeniu)"
+    ::= { rvVpp 22 }
+
+rvVppSmi OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Przerwania BIOS (SMI) na rdzeniach workerow VPP na sekunde"
+    ::= { rvVpp 23 }
+
 rvFirewall OBJECT IDENTIFIER ::= { routerVppMIB 8 }
 
 rvFwEnabled OBJECT-TYPE
