@@ -175,6 +175,10 @@ echo "9b. router-kthreads (wątki kernela poza rdzeniami VPP)"
 python3 tests/test_router_kthreads.py || fail=$((fail + 1))
 
 echo
+echo "9c. stały ifIndex (SNMP = NetFlow)"
+python3 tests/test_router_ifindex.py || fail=$((fail + 1))
+
+echo
 echo "10. router-top"
 python3 tests/test_router_top.py || fail=$((fail + 1))
 

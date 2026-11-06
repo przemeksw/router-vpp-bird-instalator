@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.46"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.47"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -603,6 +603,142 @@ fi
 EOF
 }
 
+prog_router_ifindex() {
+  cat <<'ROUTER_IFINDEX_PY'
+#!/usr/bin/env python3
+# Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>
+"""router_ifindex — stały ifIndex interfejsów VPP, wspólny dla SNMP i NetFlow (jak "snmp ifindex persist" w Cisco).
+
+VPP numeruje interfejsy (sw_if_index) w kolejności tworzenia: po restarcie VPP albo dopisaniu VLAN-u w środku
+ifaces.conf numery się przesuwają, a vpp-snmp-agent liczył ifIndex = 1000 + sw_if_index — Cacti/LibreNMS
+przypisywały wykresy złym interfejsom. NetFlow (flowprobe) podaje w przepływach sam sw_if_index, więc Akvorado nie
+dopasowywało nazw interfejsów do ifIndex z SNMP.
+
+Tutaj: tabela {nazwa interfejsu VPP: ifIndex} w MAP. Interfejs dostaje numer raz i na zawsze (także po restarcie VPP,
+zmianie kolejności, usunięciu i ponownym dodaniu — wraca ten sam numer); numerów nie przydziela się ponownie innym
+nazwom. Pierwsze wypełnienie = dotychczasowe 1000 + sw_if_index, żeby wdrożenie niczego nie przesunęło.
+Używają: vpp-snmp-agent (poprawka nakładana przez instalator) i router-netflow (ipfix_rewrite).
+"""
+import fcntl
+import json
+import os
+import struct
+
+MAP = os.environ.get("ROUTER_IFINDEX_MAP", "/var/lib/router/snmp-ifindex.json")
+BASE = 1000
+_cache = {"mtime": None, "map": {}}
+
+
+def _load():
+    try:
+        mt = os.stat(MAP).st_mtime_ns
+    except OSError:
+        _cache["mtime"], _cache["map"] = None, {}
+        return {}
+    if _cache["mtime"] != mt:
+        try:
+            with open(MAP) as f:
+                d = json.load(f)
+            _cache["map"] = {str(k): int(v) for k, v in d.get("ifindex", {}).items()}
+            _cache["mtime"] = mt
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+    return _cache["map"]
+
+
+def _save(m):
+    tmp = MAP + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"ifindex": dict(sorted(m.items(), key=lambda x: x[1]))}, f, indent=1)
+    os.replace(tmp, MAP)
+    _cache["mtime"], _cache["map"] = os.stat(MAP).st_mtime_ns, dict(m)
+
+
+def resolve(names):
+    """names: nazwy interfejsów VPP w kolejności sw_if_index (pozycja = sw_if_index, jak /if/names w statystykach).
+    Zwraca listę ifIndex tej samej długości (None dla pustych pozycji). Nowe nazwy dostają kolejny wolny numer."""
+    names = [str(n) if n else "" for n in names]
+    m = _load()
+    if any(n and n not in m for n in names):
+        os.makedirs(os.path.dirname(MAP) or ".", exist_ok=True)
+        with open(MAP + ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)              # vpp-snmp-agent i router-netflow mogą przydzielać naraz
+            _cache["mtime"] = None
+            m = dict(_load())
+            first = not m
+            nxt = max(list(m.values()) + [BASE - 1]) + 1
+            for i, n in enumerate(names):
+                if n and n not in m:
+                    if first:
+                        m[n] = BASE + i                  # pierwsze wypełnienie: dotychczasowa numeracja agenta
+                    else:
+                        m[n], nxt = nxt, nxt + 1
+            _save(m)
+    return [m.get(n) if n else None for n in names]
+
+
+# ---------------------------------------------------------------------- IPFIX (NetFlow v10)
+IE_IN, IE_OUT = 10, 14                                   # ingressInterface, egressInterface
+
+
+def ipfix_rewrite(data, templates, sw2idx):
+    """Podmienia w pakiecie IPFIX numery interfejsów (pola 10 i 14) wg sw2idx {sw_if_index: ifIndex}.
+    templates: słownik {(domena, id szablonu): (długość rekordu, [(przesunięcie, długość pola)])} — uzupełniany
+    z zestawów szablonów w kolejnych pakietach. Pakiety, których nie da się bezpiecznie przepisać (nie IPFIX,
+    nieznany szablon, pola zmiennej długości), wracają bez zmian."""
+    if len(data) < 16 or data[0:2] != b"\x00\x0a":
+        return data
+    buf = bytearray(data)
+    end = min(len(buf), struct.unpack_from("!H", buf, 2)[0])
+    dom = struct.unpack_from("!I", buf, 12)[0]
+    off = 16
+    while off + 4 <= end:
+        sid, slen = struct.unpack_from("!HH", buf, off)
+        if slen < 4 or off + slen > end:
+            break
+        p, send = off + 4, off + slen
+        if sid == 2:                                     # zestaw szablonów
+            while p + 4 <= send:
+                tid, cnt = struct.unpack_from("!HH", buf, p)
+                p += 4
+                fields, o, ok = [], 0, True
+                for _ in range(cnt):
+                    if p + 4 > send:
+                        ok = False
+                        break
+                    ie, fl = struct.unpack_from("!HH", buf, p)
+                    p += 4
+                    if ie & 0x8000:                      # pole firmowe (enterprise): +4 bajty numeru
+                        p += 4
+                        ie = -1
+                    if fl == 0xFFFF:                     # zmienna długość — przesunięć dalej nie da się liczyć
+                        ok = False
+                        continue
+                    if ie in (IE_IN, IE_OUT) and fl in (2, 4):
+                        fields.append((o, fl))
+                    o += fl
+                if tid < 256:
+                    continue
+                if cnt == 0 or not ok:
+                    templates.pop((dom, tid), None)
+                else:
+                    templates[(dom, tid)] = (o, fields)
+        elif sid >= 256:                                 # zestaw danych
+            t = templates.get((dom, sid))
+            if t and t[0] > 0 and t[1]:
+                rl, fields = t
+                while p + rl <= send:
+                    for fo, fl in fields:
+                        v = int.from_bytes(buf[p + fo:p + fo + fl], "big")
+                        n = sw2idx.get(v) if v else None
+                        if n is not None and n < (1 << (8 * fl)):
+                            buf[p + fo:p + fo + fl] = n.to_bytes(fl, "big")
+                    p += rl
+        off = send
+    return bytes(buf)
+ROUTER_IFINDEX_PY
+}
+
 prog_router_netflow() {
   cat <<EOF
 #!/usr/bin/env python3
@@ -612,13 +748,50 @@ każdy pakiet UDP do kolektorów z /etc/router/netflow.conf (jeden "IP:PORT" na 
 VPP ma tylko jeden eksporter — to jedyny sposób na kilka realnych kolektorów naraz (np. FastNetMon +
 Akvorado), bez żadnej zewnętrznej zależności (replikacja w kilkunastu liniach Pythona).
 Po zmianie /etc/router/netflow.conf: systemctl restart router-netflow
+
+Numery interfejsów: VPP podaje w przepływach swój wewnętrzny sw_if_index, który przesuwa się po restarcie VPP
+i zmianach interfejsów. Przed wysłaniem do kolektorów router-netflow podmienia je (ingressInterface,
+egressInterface) na stały ifIndex z /var/lib/router/snmp-ifindex.json — ten sam, który podaje SNMP
+(vpp-snmp-agent). Dzięki temu Akvorado/FastNetMon dopasowują nazwy i opisy interfejsów jak przy Cisco.
+Bez modułu router_ifindex albo statystyk VPP pakiety idą bez zmian (jak dawniej).
 """
 import os
 import socket
 import sys
+import time
 
 CONF = os.environ.get("ROUTER_NETFLOW_CONF", "/etc/router/netflow.conf")
 PORT = int(os.environ.get("ROUTER_NETFLOW_PORT", "$NETFLOW_PORT"))
+sys.path.insert(0, os.environ.get("ROUTER_LIB", "/opt/router/lib"))
+try:
+    import router_ifindex
+except ImportError:
+    router_ifindex = None
+NAMES_EVERY = 10.0                       # s, odświeżenie nazw interfejsów VPP (segment statystyk, bez bariery)
+
+
+class IfMap:
+    """{sw_if_index: stały ifIndex} z nazw interfejsów w segmencie statystyk VPP i tabeli router_ifindex."""
+    def __init__(self):
+        self.stats, self.map, self.t = None, {}, 0.0
+
+    def get(self):
+        if router_ifindex is None or time.time() - self.t < NAMES_EVERY:
+            return self.map
+        self.t = time.time()
+        try:
+            if self.stats is None:
+                from vpp_papi.vpp_stats import VPPStats
+                self.stats = VPPStats(socketname="/run/vpp/stats.sock", timeout=2)
+                self.stats.connect()
+            names = list(self.stats["/if/names"])
+            idx = router_ifindex.resolve(names)
+            self.map = {i: x for i, x in enumerate(idx) if x is not None}
+        except Exception as ex:          # noqa: BLE001 — restart VPP: zostaje ostatnia mapa, połączenie od nowa
+            print("router-netflow: brak nazw interfejsów VPP (%s) — numery bez zmian do kolejnej próby" % ex,
+                  file=sys.stderr)
+            self.stats = None
+        return self.map
 
 
 def load_dests():
@@ -646,11 +819,17 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", PORT))
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ifmap, templates = IfMap(), {}
     while True:
         try:
             data, _addr = sock.recvfrom(65535)
         except OSError:
             continue
+        if router_ifindex is not None:
+            try:
+                data = router_ifindex.ipfix_rewrite(data, templates, ifmap.get())
+            except Exception as ex:      # noqa: BLE001 — uszkodzony pakiet: wysyłamy oryginał
+                print("router-netflow: nie przepisano numerów interfejsów: %s" % ex, file=sys.stderr)
         for host, port in dests:
             try:
                 out.sendto(data, (host, port))
@@ -10102,6 +10281,48 @@ EOF
 }
 
 # router-snmp: usługa kolektora, blok pass_persist w obu snmpd, IF-MIB w dataplane tylko z VPP (instalacja i upgrade_script)
+# Stały ifIndex (SNMP = NetFlow, jak "snmp ifindex persist" w Cisco): moduł /opt/router/lib/router_ifindex.py
+# i poprawka vpp-snmp-agent (ifIndex z trwałej tabeli zamiast 1000 + sw_if_index). Poprawka jest nakładana na kod
+# pobrany z git.ipng.ch tylko wtedy, gdy pasuje dokładnie oczekiwany fragment — inaczej agent zostaje bez zmian
+# i jest ostrzeżenie. Kod wyjścia 0 = agent został zmieniony (do restartu).
+snmp_agent_ifindex() {
+  local f=/opt/router/vpp-snmp-agent/vpp-snmp-agent.py rc
+  mkdir -p /opt/router/lib
+  prog_router_ifindex | put_file /opt/router/lib/router_ifindex.py "router_ifindex: stały ifIndex interfejsów VPP dla SNMP i NetFlow" 644
+  [[ -f $f ]] || return 1
+  grep -q 'router_ifindex' "$f" && return 1
+  python3 - "$f" <<'PATCH'
+import sys
+f = sys.argv[1]
+src = open(f, encoding="utf-8").read()
+old = ('        for i in range(len(self.vppstat["/if/names"])):\n'
+       '            ifname = self.vppstat["/if/names"][i]\n'
+       '            idx = 1000 + i\n')
+new = ('        _rv_idx = router_ifindex.resolve(list(self.vppstat["/if/names"]))  # install-router: stały ifIndex\n'
+       '        for i in range(len(self.vppstat["/if/names"])):\n'
+       '            ifname = self.vppstat["/if/names"][i]\n'
+       '            idx = _rv_idx[i] or (1000 + i)\n')
+if src.count(old) != 1:
+    sys.exit(2)
+lines = src.replace(old, new).split("\n")
+at = next(i for i, ln in enumerate(lines) if ln.startswith(("import ", "from ")))
+lines[at:at] = ["import sys as _rv_sys  # install-router: stały ifIndex (SNMP = NetFlow)",
+                '_rv_sys.path.insert(0, "/opt/router/lib")',
+                "import router_ifindex"]
+open(f + ".new", "w", encoding="utf-8").write("\n".join(lines))
+compile(open(f + ".new", encoding="utf-8").read(), f, "exec")
+PATCH
+  rc=$?
+  if ((rc == 0)); then
+    mv -f "$f.new" "$f"
+    ok "vpp-snmp-agent: stały ifIndex z /var/lib/router/snmp-ifindex.json (ten sam numer w SNMP i NetFlow)"
+    return 0
+  fi
+  rm -f "$f.new"
+  warn "vpp-snmp-agent: nowa wersja agenta nie pasuje do poprawki stałego ifIndex — zostaje 1000 + sw_if_index (zgłoś autorowi skryptu)"
+  return 1
+}
+
 snmp_router_ext() {
   local f changed=0
   put_file /etc/systemd/system/router-snmp.service "router-snmp collect: dane dla SNMP co 30 s (/run/router-snmp/cache.json)" <<'EOF'
@@ -10227,6 +10448,13 @@ do_upgrade() {
   ln -sfn /opt/router/bin/router-snmp /usr/local/sbin/router-snmp
   [[ -e /opt/router/bin/router-rpki ]] && ln -sfn /opt/router/bin/router-rpki /usr/local/sbin/router-rpki
   snmp_router_ext
+  # stały ifIndex: moduł + poprawka agenta; restart agenta i router-netflow, gdy coś się zmieniło
+  local ifx_before
+  ifx_before=$(md5sum /opt/router/lib/router_ifindex.py 2>/dev/null)
+  if snmp_agent_ifindex || [[ $(md5sum /opt/router/lib/router_ifindex.py 2>/dev/null) != "$ifx_before" ]]; then
+    [[ " ${restart[*]} " == *" vpp-snmp-agent.service "* ]] || restart+=(vpp-snmp-agent.service)
+    [[ " ${restart[*]} " == *" router-netflow.service "* ]] || restart+=(router-netflow.service)
+  fi
 
   # 4. restart tylko usług, których program się zmienił (nigdy VPP ani BIRD)
   for unit in "${restart[@]}"; do
@@ -13368,6 +13596,8 @@ EOF
   cp -a "$sdir" /opt/router/vpp-snmp-agent
   rm -rf /opt/router/vpp-snmp-agent/.git
   man_add dir /opt/router/vpp-snmp-agent "vpp-snmp-agent (AgentX: liczniki interfejsów z VPP do SNMP)"
+  snmp_agent_ifindex || true
+  man_add file /opt/router/lib/router_ifindex.py "stały ifIndex interfejsów VPP (SNMP = NetFlow); tabela: /var/lib/router/snmp-ifindex.json"
   put_file /etc/systemd/system/vpp-snmp-agent.service "vpp-snmp-agent w netns dataplane" <<'EOF'
 [Unit]
 Description=SNMP AgentX for VPP dataplane statistics
@@ -14943,6 +15173,7 @@ Pakiety VPP i BIRD są zablokowane przed automatyczną aktualizacją (`apt-mark 
 | `/opt/router/vpp-snmp-agent/` | agent SNMP dla VPP |
 | `/etc/router/ifaces.conf` | **interfejsy: porty, VLAN-y, adresy IPv4/IPv6, loopbacki, opisy** (edytujesz Ty) |
 | `/etc/router/snmp-ifaces.yaml` | opisy dla SNMP (ifAlias) — generowany przez `router-ifaces`, nie edytuj |
+| `/var/lib/router/snmp-ifindex.json` | stały ifIndex interfejsów (SNMP i NetFlow) — nie edytuj |
 | `/etc/router/router.env` | parametry instalacji (porty, rdzenie, community SNMP) |
 | `/etc/router/router-monitor.conf` | progi alarmów router-monitor |
 | `/etc/router/notify.conf` | SMTP i odbiorcy alarmów (tylko root, poza historią etckeeper — zawiera hasło) |
@@ -15595,6 +15826,8 @@ ip netns exec dataplane snmpwalk -v2c -c <community> -On 127.0.0.1 1.3.6.1.2.1.3
 ```
 
 Community SNMP: `/etc/router/router.env` (zmienna `SNMP_COMMUNITY`). snmpd działa w netns `dataplane`, więc LibreNMS odpytuje router przez adres skonfigurowany w VPP — najlepiej loopback (`loop0` w `/etc/router/ifaces.conf`). Opisy portów w LibreNMS (ifAlias) pochodzą z kolumny opisu w `ifaces.conf`.
+
+**Stały ifIndex (SNMP = NetFlow, jak `snmp ifindex persist` w Cisco).** VPP numeruje interfejsy w kolejności tworzenia, więc po restarcie VPP albo dopisaniu VLAN-u numery by się przesuwały, a Cacti/LibreNMS przypisywałyby wykresy złym interfejsom. Dlatego każdy interfejs dostaje ifIndex raz, na zawsze: tabela `/var/lib/router/snmp-ifindex.json` (nazwa interfejsu VPP → ifIndex). Usunięty i ponownie dodany interfejs wraca ze swoim numerem, numery nie są przydzielane innym nazwom. Ten sam numer trafia do przepływów NetFlow/IPFIX: `router-netflow` podmienia w nich wewnętrzny numer VPP (pola `ingressInterface`/`egressInterface`) na ifIndex z tabeli, zanim wyśle je do kolektorów — Akvorado i FastNetMon widzą nazwy i opisy interfejsów z SNMP. Tabeli nie edytuj; jej skasowanie przenumeruje interfejsy od nowa (1000 + bieżący numer VPP).
 
 ---
 

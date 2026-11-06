@@ -11,7 +11,9 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.46"                     '^SCRIPT_VERSION="1\.5\.46"' 1
+chk "wersja skryptu 1.5.47"                     '^SCRIPT_VERSION="1\.5\.47"' 1
+chk "stały ifIndex: moduł instalowany i łatka agenta" '^snmp_agent_ifindex\(\) \{|^  snmp_agent_ifindex \|\| true$|  if snmp_agent_ifindex \|\| ' 3
+chk "router-netflow: podmiana numerów interfejsów w IPFIX" 'data = router_ifindex.ipfix_rewrite\(data, templates, ifmap.get\(\)\)' 1
 chk "alarm wkładek domyślnie wyłączony (odczyt DDM w barierze VPP)" '^OPTICS_CHECK_EVERY=0$' 1
 chk "optics: ostrzeżenie o przerwie w ruchu"     '^OPTICS_WARN = \(' 1
 chk "router-top karta 5: pasek = zajętość workera, nie porównanie kolejek" 'zajętość workera \(0–100%\)' 1
