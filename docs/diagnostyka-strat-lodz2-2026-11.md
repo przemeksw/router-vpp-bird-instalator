@@ -1,7 +1,7 @@
 # Diagnostyka strat pakietów — lodz2-vpp, 5–6 listopada 2026
 
 Router: Dell R630, 2× Xeon E5-2698 v4 (20 rdzeni, 2,2 GHz, turbo do 3,6 GHz), ConnectX-4 2×100G (`hu0`, `hu1`, NUMA 1),
-VPP 26.06 + BIRD, 12 workerów (rdzenie 5–27 nieparzyste), `vpp_main` na rdzeniu 3. Instalator: wersja 1.5.46.
+VPP 26.06 + BIRD, 12 workerów (rdzenie 5–27 nieparzyste), `vpp_main` na rdzeniu 3. Instalator: wersja 1.5.48.
 Porównanie: `lodz1` — ten sam typ karty (ConnectX-4, firmware 12.24) pod zwykłym Linuksem, bez VPP.
 
 ## Skąd brały się straty — przyczyny znalezione i usunięte
@@ -12,6 +12,8 @@ Porównanie: `lodz1` — ten sam typ karty (ConnectX-4, firmware 12.24) pod zwyk
 | 2 | Przerwania RCU (~1/s) na rdzeniach workerów, IOMMU tłumaczące adresy DMA | domyślne parametry jądra | `rcupdate.rcu_normal_after_boot=1 iommu=pt skew_tick=1 tsc=reliable` w GRUB | 1.5.36 |
 | 3 | `RX_MISS` ~4 tys. pakietów **co 5 minut** | alarm wkładek (DDM) w `router-ifaces-check.timer`: odczyt EEPROM wkładki VPP wykonuje w barierze — wszystkie workery stały ~0,4 s | alarm wkładek domyślnie wyłączony (`OPTICS_CHECK_EVERY=0`), ręczne `router-ifaces optics` z ostrzeżeniem | 1.5.46 |
 | 4 | router-monitor zgłaszał `DOWN/UP` co sekundę | błąd w kodzie (nadpisana zmienna) | poprawione + test pętli monitora | 1.5.39 |
+| 5 | Odrzucenia w buforze karty (`rx_phy_discard`) ~1 na mln pakietów; Linux na tej samej karcie: 0 | DPDK mlx5 inaczej niż jądro: bez dopełniania zapisu pakietu do pełnej linii 64 B (częściowe zapisy linii spowalniają DMA na Xeonie) i z kompresją CQE | `VPP_NIC_DEVARGS="rxq_pkt_pad_en=1,rxq_cqe_comp_en=0"` — odbiór jak w jądrze. Pomiar: bez opcji ~1,1/mln → samo dopełnianie ~0,2/mln → oba **0** | 1.5.48 |
+| 6 | Cacti przypisywał wykresy złym interfejsom po restarcie VPP / dodaniu VLAN-u; Akvorado bez nazw interfejsów | `vpp-snmp-agent`: ifIndex = 1000 + numer VPP (przesuwa się); NetFlow podawał sam numer VPP | stały ifIndex (`/var/lib/router/snmp-ifindex.json`) w SNMP, `router-netflow` podmienia ten sam numer w IPFIX — jak `snmp ifindex persist` w Cisco | 1.5.47 |
 
 ## Sprawdzone i wykluczone
 
@@ -23,46 +25,28 @@ Porównanie: `lodz1` — ten sam typ karty (ConnectX-4, firmware 12.24) pod zwyk
 - **Rozkład RSS** — skrót z adresów i portów dla IPv4 i IPv6 (optymalny). Jedno połączenie zawsze idzie przez jedną kolejkę — tak ma być.
 - **MPRQ** — karta obsługuje, ale VPP nie umie buforów „doczepionych” przez sterownik; działałoby tylko z kopiowaniem każdego pakietu, a pojemność kolejki w pakietach się nie zmienia. Odłożone.
 
-## Co zostało (stan 6.11, 13:35)
+## Co zostało (stan 6.11, 14:50)
 
-1. **Bursty jednego połączenia** — `RX_MISS` co kilkadziesiąt minut, kilkadziesiąt–kilkaset pakietów. Jedno połączenie wysłane z pełną prędkością 100G zapełnia pierścień swojej kolejki w ~1,7 ms. Fizyczny limit przy pierścieniu 16384.
-2. **Odrzucenia w buforze karty (`rx_phy_discard`)** — ~1 na milion pakietów przy ~600 tys. pkt/s, podczas gdy `lodz1` (Linux) przy ~540 tys. pkt/s miał 0.
+- **Bursty jednego połączenia** — sporadyczne `RX_MISS` (kilkadziesiąt–kilkaset pakietów): jedno połączenie z pełną prędkością 100G zapełnia pierścień swojej kolejki w ~1,7 ms. Fizyczny limit przy pierścieniu 16384.
+- Odrzucenia w buforze karty: po 1.5.48 (`rxq_pkt_pad_en=1,rxq_cqe_comp_en=0`) **0** w teście 30-minutowym przy ~700 kpps.
 
-### Test w toku: dopełnianie zapisu pakietu (`rxq_pkt_pad_en=1`)
+Przebieg testów (pomiar `pik-watch`, co 2 s, 30 min; straty w buforze karty na milion pakietów):
 
-Sterownik jądra (Linux) domyślnie kończy zapis każdego pakietu na pełnej linii pamięci 64 B; DPDK domyślnie nie. Częściowe zapisy linii na Xeon E5 v4 spowalniają zapis karty do pamięci → bufor karty szybciej się zapełnia przy burstach.
-
-- 6.11 ~13:24: dopisane **ręcznie** w `/etc/vpp/startup.conf` (`devargs rxq_pkt_pad_en=1` na `hu0` i `hu1`), kopia: `/etc/vpp/startup.conf.przed-pad`, restart VPP.
-- Wynik po 7,5 min: **0,12 straty na milion** (przed: ~1,1) — obiecujący, do potwierdzenia pomiarem godzinnym.
-- Do czasu dodania do instalatora **nie uruchamiać `install-router set_workers`** (przepisze `startup.conf` i usunie opcję).
-- Cofnięcie: `cp /etc/vpp/startup.conf.przed-pad /etc/vpp/startup.conf && systemctl restart vpp`.
-
-Punkty pomiarowe (`lodz2`):
-
-| Czas | `rx_phy_discard` | `rx packets` (hu0) |
+| Ustawienie | Ruch średnio | Straty / mln |
 |---|---|---|
-| 13:25:47 (start po restarcie) | 70 | 39 571 623 |
-| 13:26:57 | 104 | 76 914 643 |
-| 13:34:25 | 135 | 337 313 792 |
+| bez opcji (domyślne DPDK) | ~600 kpps | ~1,1 |
+| `rxq_pkt_pad_en=1` | ~700 kpps | ~0,2 |
+| `rxq_pkt_pad_en=1,rxq_cqe_comp_en=0` | ~700 kpps | 0 |
 
-Punkt odniesienia `lodz1` (Linux, `eth4`), 13:17:42: `rx_out_of_buffer` 186 283 104, `rx_discards_phy` 147 500 487 (bez przyrostu w ~25 min), `rx_packets` 6 658 679 792 534.
-
-### Zbieranie danych o pikach ruchu
-
-`/root/pik-watch.sh` w tmux `pikwatch` zapisuje co 2 s (przez 30 min) do `/root/pik-watch.log`: czas, `rx frames ok`, `rx_phy_discard`, `rx_out_of_buffer`. Analiza:
-
-```
-awk 'NR>1 {dp=$2-p; dd=$3-d; if (dd>0) printf "%s  ruch %6.0f kpps  STRATA %d pkt\n", $1, dp/2000, dd} {p=$2; d=$3}' /root/pik-watch.log
-awk 'NR>1 {dp=($2-p)/2000; s+=dp; n++; if (dp>m) m=dp} {p=$2} END {printf "średnio %.0f kpps, maks %.0f kpps\n", s/n, m}' /root/pik-watch.log
-```
+Na `lodz2` opcje zostały dopisane ręcznie przed 1.5.48 — ta sama wartość jest teraz domyślna w instalatorze, więc `upgrade_script` i `set_workers` niczego nie zmienią (kopie ręczne: `/etc/vpp/startup.conf.przed-pad`, `.przed-cqe`).
 
 ## Kolejne kroki
 
-1. Wynik testu `rxq_pkt_pad_en` po godzinie (pomiar jak wyżej). Jeśli straty na milion zostaną ~0,1–0,2 → dodać do instalatora jako domyślne dla kart Mellanox (`VPP_NIC_DEVARGS`).
-2. Jeśli nie pomoże: w oknie serwisowym `rxq_cqe_comp_en=0` (Linux ma kompresję CQE wyłączoną).
-3. Osobny test: 16 workerów zamiast 12 (`lodz1` ma 20 kolejek; NVIDIA radzi więcej kolejek przy `rx_phy_discard`) — `install-router set_workers 16`, restart serwera, pomiar strat na milion.
-4. Porównanie dobowe `lodz1` vs `lodz2` (straty na milion odebranych pakietów, ten sam okres, bez przenoszenia ruchu).
-5. Włączyć maile z alarmami (`/etc/router/notify.conf`, `router-notify test`), ponownie zaimportować szablony monitoringu z `templates/`.
+1. Kilka dni obserwacji `RX_MISS` i `NIC_DISCARD` (każdy `RX_MISS` ma przyczynę w opisie).
+2. Ewentualnie test 16 workerów zamiast 12 (`install-router set_workers 16`, restart serwera) — tylko jeśli bursty będą częstsze.
+3. Porównanie dobowe z `lodz1` (straty na milion odebranych pakietów).
+4. Włączyć maile z alarmami (`/etc/router/notify.conf`, `router-notify test`), ponownie zaimportować szablony monitoringu z `templates/`, w Cacti jednorazowo „Reload Data Query” po wdrożeniu stałego ifIndex.
+5. Próg `NIC_DISCARD_PPS` (dziś 1 pkt/s) — rozważyć 100, żeby pojedyncze bursty nie dawały alarmów.
 
 ## Pojemność (pomiar `show runtime`, koszt pakietu ~1300–1450 cykli bez NetFlow)
 

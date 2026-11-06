@@ -11,7 +11,9 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.47"                     '^SCRIPT_VERSION="1\.5\.47"' 1
+chk "wersja skryptu 1.5.48"                     '^SCRIPT_VERSION="1\.5\.48"' 1
+chk "karta: odbiór jak w jądrze (dopełnianie, bez kompresji CQE)" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1,rxq_cqe_comp_en=0"' 1
+chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
 chk "stały ifIndex: moduł instalowany i łatka agenta" '^snmp_agent_ifindex\(\) \{|^  snmp_agent_ifindex \|\| true$|  if snmp_agent_ifindex \|\| ' 3
 chk "router-netflow: podmiana numerów interfejsów w IPFIX" 'data = router_ifindex.ipfix_rewrite\(data, templates, ifmap.get\(\)\)' 1
 chk "alarm wkładek domyślnie wyłączony (odczyt DDM w barierze VPP)" '^OPTICS_CHECK_EVERY=0$' 1
@@ -400,6 +402,12 @@ EOC
   for want in "32768 rc=0" "16384 rc=1"; do
     got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_GRUB_CONF=$vdg VPP_NUMA_BALANCING=0 VPP_THP_FILE=$vdt2 VPP_COMPACT_PROACTIVE=0 VPP_KTHREADS_UNIT=$vdt2 VPP_KTHREADS_TIMER=$vdt2 VPP_RX_DESC=${want% *} VPP_TX_DESC=4096 WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037 NOHZ_CSV=5,7,9 HK_CSV=0-2; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
     if [[ $got == *"${want#* }"* && ( ${want% *} == 16384 || $got == *"pierścień RX 16384 → 32768"* ) ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff pierścień RX ${want% *}: jest '$got'"; fi
+  done
+  # devargs karty: brak w startup.conf przy domyślnym VPP_NIC_DEVARGS = zmiana; zgodne = brak zmian
+  for want in "rxq_pkt_pad_en=1,rxq_cqe_comp_en=0 rc=0" "- rc=1"; do
+    dv=${want% *}; [[ $dv == - ]] && dv=""
+    got=$( ( eval "$vd"; VPP_STARTUP_CONF=$vdc VPP_SYSCTL_CONF=$vds VPP_BOOTSTRAP=$vdb NETFLOW_ACTIVE_TIMER=60 NETFLOW_PASSIVE_TIMER=300 ROUTER_ID=10.10.10.10 NETFLOW_PORT=2055 NETFLOW_ENABLE=yes NETFLOW_TAP_VPP=192.0.2.1 NETFLOW_TAP_LINUX=192.0.2.2 NETFLOW_TAP_FIB=100 NETFLOW_TEMPLATE_INTERVAL=20 VPP_RX_DESC=16384 VPP_TX_DESC=4096 VPP_NIC_DEVARGS=$dv WORKERS_CSV=5,7,9 BUFFERS=262144 MAIN_HEAP=4G HUGEPAGES_2M=8037; NIC_PCI=(0000:82:00.0 0000:82:00.1); vpp_conf_diff vpp; echo "rc=$?" ) | tr '\n' ' ' )
+    if [[ $got == *"${want#* }"* && ( -z $dv || $got == *"parametry karty (devargs) brak → $dv"* ) ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  vpp_conf_diff devargs '$dv': jest '$got'"; fi
   done
   rm -f "$vdc.bak"
   rm -f "$vdg" "$vdt" "$vdt2"
