@@ -91,8 +91,10 @@ PART_NO=$(cat "/sys/class/block/${ESP_DST##*/}/partition")
 # Nazwy /dev/sdX potrafią zamienić się miejscami między restartami (kolejność wykrywania dysków) — dlatego wpis
 # UEFI rozpoznajemy po identyfikatorze partycji GPT (PARTUUID, ten sam, który efibootmgr pokazuje w HD(...)),
 # a nie po nazwie dysku; w etykiecie jest początek PARTUUID zamiast "sda"/"sdb".
-DST_PUUID=$(lsblk -no PARTUUID "$ESP_DST" | tr 'A-F' 'a-f')
-SRC_PUUID=$(lsblk -no PARTUUID "$ESP_SRC" | tr 'A-F' 'a-f')
+DST_PUUID=$(lsblk -no PARTUUID "$ESP_DST" | tr '[:upper:]' '[:lower:]')
+SRC_PUUID=$(lsblk -no PARTUUID "$ESP_SRC" | tr '[:upper:]' '[:lower:]')
+# wpisy UEFI raz, małymi literami (bez potoku z grep -q: przy pipefail wcześniejsze zakończenie grep daje fałsz)
+efi_entries() { efibootmgr -v 2>/dev/null | tr '[:upper:]' '[:lower:]' || true; }
 
 # --- kopia ESP (wspólna dla instalacji i hooka apt)
 sync_esp() {
@@ -156,7 +158,7 @@ ok "ESP skopiowana"
 command -v efibootmgr >/dev/null || run apt-get install -y efibootmgr
 if ((DRY)) && ! command -v efibootmgr >/dev/null; then
   say "[dry-run] efibootmgr nie jest zainstalowany — wpis UEFI zostałby dodany po instalacji"
-elif [[ -n $DST_PUUID ]] && efibootmgr -v | tr 'A-F' 'a-f' | grep -q "gpt,${DST_PUUID},"; then
+elif [[ -n $DST_PUUID && $(efi_entries) == *"gpt,${DST_PUUID},"* ]]; then
   ok "wpis UEFI startujący z partycji EFI $ESP_DST (PARTUUID $DST_PUUID) już istnieje — bez zmian"
 else
   order=$(efibootmgr | sed -n 's/^BootOrder: //p')
@@ -190,7 +192,7 @@ fi
 
 printf '\n'
 ((DRY)) || efibootmgr -v | grep -i debian | sed 's/^/    /'
-dups=$( { efibootmgr -v 2>/dev/null || true; } | tr 'A-F' 'a-f' | { grep -oE 'gpt,[0-9a-f-]{36},' || true; } | sort | uniq -d | wc -l)
+dups=$(efi_entries | { grep -oE 'gpt,[0-9a-f-]{36},' || true; } | sort | uniq -d | wc -l)
 ((dups > 0)) && warn "kilka wpisów UEFI startuje z tej samej partycji EFI (zwykle po zamianie nazw sda/sdb) — działają, ale można zostawić po jednym: efibootmgr -v, potem efibootmgr -b XXXX -B dla zbędnych"
 cat <<EOF
 
