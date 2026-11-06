@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.43"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.44"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2341,7 +2341,9 @@ CFG = {
     "VEC_CRIT": 160.0,
     "RXMISS_PPS": 1.0,      # pkt/s zgubione przez kartę (rx-miss + rx-no-buf) => alarm
     "NIC_DISCARD_PPS": 1.0, # pkt/s odrzucone sprzętowo (xstats *discard*; rx_out_of_buffer to ten sam licznik co rx-miss)
-    "WK_PREEMPT": 1.0,      # wywłaszczenia workerów VPP na sekundę (nr_involuntary_switches) => alarm
+    "WK_PREEMPT": 5.0,      # wywłaszczenia workerów VPP w oknie WK_WINDOW s => alarm. Pojedyncze (wątek kernela
+                            # tego rdzenia, µs) to nie problem; kcompactd na lodz2-vpp dawał ~30/min
+    "WK_WINDOW": 60,        # s, okno liczenia wywłaszczeń
     "WK_GRACE": 120,        # s po starcie VPP bez alarmu WK_PREEMPT: każdy worker dostaje 2 wywłaszczenia przy
                             # tworzeniu wątków i przypinaniu do rdzeni (po restarcie: 12 × "1×" dwa razy — szum)
     "SMI_PER_S": 5.0,       # SMI na rdzeń workera na sekundę, średnio z SMI_WINDOW s => alarm (0 = wyłącz).
@@ -2852,7 +2854,7 @@ def main():
     hk_procs, hk_procs_t, hk_top = None, 0.0, ""
     xs_prev, xs_t, xs_paths = None, 0.0, None
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
-    smi_prev, wk_last_t, smi_last_t, smi_hist = {}, 0.0, 0.0, []
+    smi_prev, wk_last_t, smi_last_t, smi_hist, wk_hist = {}, 0.0, 0.0, [], []
     idle_loops, idle_saved_t, last_rx_pps = IdleLoops(IDLE_FILE), 0.0, None   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
     md_t = 0.0
     sum_t = time.time()
@@ -3027,12 +3029,16 @@ def main():
             state["wk_preempt"] = tot
             if hits:
                 wk_last_t = t0
+            wk_hist.append((t0, tot))
+            while wk_hist and t0 - wk_hist[0][0] > CFG["WK_WINDOW"]:
+                wk_hist.pop(0)
+            wk_sum = sum(n for _t, n in wk_hist)
             if hits and t0 - wk_who_t >= 10:          # kto stoi na tym rdzeniu — skan /proc tylko przy zdarzeniu
                 wk_who, wk_who_t = tasks_on_cpu(hits[0][2], vpp_pid), t0
-            a_wk.update(t0, tot >= CFG["WK_PREEMPT"], tot,
-                        "worker VPP wywłaszczony z izolowanego rdzenia: %s%s — coś poza VPP działa na jego CPU%s; "
-                        "kolejka RX tego workera stoi (grozi rx-miss). Sprawdź: router-kthreads -n; ps -eLo psr,comm"
-                        % (", ".join("vpp_wk_%d (cpu %d) %d×" % (w, cpu, d) for d, w, cpu in hits[:4]),
+            a_wk.update(t0, wk_sum >= CFG["WK_PREEMPT"], wk_sum,
+                        "workery VPP wywłaszczone %d× w %d s: %s%s — coś poza VPP działa na ich CPU%s; "
+                        "kolejka RX takiego workera stoi (grozi rx-miss). Sprawdź: router-kthreads -n; ps -eLo psr,comm"
+                        % (wk_sum, CFG["WK_WINDOW"], ", ".join("vpp_wk_%d (cpu %d) %d×" % (w, cpu, d) for d, w, cpu in hits[:4]),
                            " (+%d workerów)" % (len(hits) - 4) if len(hits) > 4 else "",
                            " (na rdzeniu: %s)" % wk_who if wk_who else ""))
             if not a_wk.active:
@@ -3471,20 +3477,22 @@ fi
 rm -f "$STATE/clean-shutdown"
 touch "$STATE/booted-before"
 
+# "active" w systemd nie znaczy "gotowe": BIRD startuje po odtworzeniu interfejsów, a jego gniazdo sterujące
+# pojawia się dopiero po wczytaniu konfiguracji — czekamy także na odpowiedź vppctl i birdc (do 3 minut)
 deadline=$((SECONDS + 180))
 while :; do
   bad=""
   for u in $UNITS; do systemctl is-active --quiet "$u" || bad="$bad $u"; done
+  vver=$(vppctl show version 2>/dev/null | awk '{print $2}')
+  bird=$(birdc show status 2>/dev/null | grep -c 'Daemon is up and running')
+  [[ -n $vver ]] || bad="$bad vpp-cli"
+  [[ $bird -ge 1 ]] || bad="$bad bird-cli"
   [[ -z $bad || $SECONDS -ge $deadline ]] && break
   sleep 5
 done
 ports=$(vppctl show interface 2>/dev/null | awk '$1 ~ /^hu[0-9]+$/ {print $1"="$3}' | xargs)
-vver=$(vppctl show version 2>/dev/null | awk '{print $2}')
-bird=$(birdc show status 2>/dev/null | grep -c 'Daemon is up and running')
 hp=$(awk '/HugePages_Total/{print $2}' /proc/meminfo)
 iso=$(cat /sys/devices/system/cpu/isolated 2>/dev/null)
-[[ -n $vver ]] || bad="$bad vpp-cli"
-[[ $bird -ge 1 ]] || bad="$bad bird-cli"
 [[ -n $iso ]] || bad="$bad isolcpus"
 if [[ -z $bad ]]; then
   report local0.notice "%SYS-5-BOOT_OK: router gotowy po ${SECONDS}s: VPP $vver, porty: ${ports:-brak}, BIRD działa, hugepages $hp, izolowane CPU $iso"
@@ -9585,7 +9593,7 @@ Działa cały czas, co sekundę czyta liczniki VPP. Progi w `/etc/router/router-
 | `VEC_WARN` / `VEC_CRIT` | 64 / 160 | obciążenie workera (wektor 1 = luz, 256 = pełne nasycenie) |
 | `RXMISS_PPS` | 1 | gubione pakiety na karcie |
 | `NIC_DISCARD_PPS` | 1 | odrzucenia sprzętowe karty |
-| `WK_PREEMPT` / `WK_GRACE` | 1 / 120 | wywłaszczenia workera VPP na sekundę (coś poza VPP na izolowanym rdzeniu); bez alarmu przez 120 s po starcie VPP |
+| `WK_PREEMPT` / `WK_WINDOW` / `WK_GRACE` | 5 / 60 / 120 | wywłaszczenia workerów VPP w ciągu 60 s (coś poza VPP na izolowanym rdzeniu; pojedyncze to szum); bez alarmu przez 120 s po starcie VPP |
 | `SMI_PER_S` / `SMI_WINDOW` | 5 / 60 | przerwania BIOS-u (SMI, MSR 0x34) na rdzeń workera na sekundę, średnio z 60 s; stałe ~1/s to tło; 0 = wyłącz |
 | `PUNT_PPS` | 20000 | ruch do samego routera |
 | `HK_CPU_PCT` / `HK_CPU_SECONDS` | 90 / 5 | przeciążony rdzeń systemowy |
@@ -13506,9 +13514,10 @@ VEC_WARN=64
 VEC_CRIT=160
 # pakiety/s zgubione przez kartę, bo VPP nie nadąża (rx-miss + rx-no-buf)
 RXMISS_PPS=1
-# wywłaszczenia workera VPP na sekundę: coś poza VPP działa na izolowanym rdzeniu (router-kthreads -n);
-# WK_GRACE = sekundy po starcie VPP bez tego alarmu (start workerów to zawsze 2 wywłaszczenia na rdzeń)
-WK_PREEMPT=1
+# wywłaszczenia workerów VPP w oknie WK_WINDOW s: coś poza VPP działa na izolowanym rdzeniu (router-kthreads -n);
+# pojedyncze (wątek kernela tego rdzenia, µs) to nie problem. WK_GRACE = sekundy po starcie VPP bez tego alarmu
+WK_PREEMPT=5
+WK_WINDOW=60
 WK_GRACE=120
 # SMI (przerwania BIOS-u, MSR 0x34) na rdzeń workera na sekundę, średnio z SMI_WINDOW s; 0 = wyłącz.
 # Stałe ~1/s z BIOS-u/BMC to tło na wielu serwerach — alarm dopiero przy wyraźnie większej częstości.

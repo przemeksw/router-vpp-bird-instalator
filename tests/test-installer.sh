@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.43"                     '^SCRIPT_VERSION="1\.5\.43"' 1
+chk "wersja skryptu 1.5.44"                     '^SCRIPT_VERSION="1\.5\.44"' 1
 chk "router-top: karta 6 alarmy"               '6: \("Alarmy", AlarmView, screen_alarms\)' 1
 chk "router-monitor: aktywne alarmy w state.json" 'state\["alarms"\] = \[' 1
 chk "menu: skróty do kart 5 i 6 router-top"    '\["router-top", "(5|6)"\]' 2
@@ -238,7 +238,9 @@ chk "router-monitor: filtr alarmy.log"        'fh\.addFilter\(AlarmFilter\(\)\)'
 chk "router-monitor: alarm WK_PREEMPT"        'Alarm\("VPP", 3, "WK_PREEMPT", "WK_PREEMPT_END"\)' 1
 chk "router-monitor: liczniki z /proc/<pid>/task" '^def read_worker_preempt\(pid\):' 1
 chk "router-monitor: PID VPP po nazwie wątku (bez pidfile)" '^def find_vpp_pid\(\):' 1
-chk "router-monitor.conf: próg WK_PREEMPT"    '^WK_PREEMPT=1$' 1
+chk "router-monitor.conf: próg WK_PREEMPT"    '^WK_PREEMPT=5$' 1
+chk "WK_PREEMPT liczone w oknie (pojedyncze to szum)" 'a_wk.update\(t0, wk_sum >= CFG\["WK_PREEMPT"\]' 1
+chk "bootcheck czeka na vppctl i birdc, nie tylko na systemd" '  \[\[ -z \$bad \|\| \$SECONDS -ge \$deadline \]\] && break' 1
 chk "router-notify: WK_PREEMPT w kategorii VPP_DROPS" 'VPP-\(RX_MISS\|NIC_DISCARD\|WK_PREEMPT\)' 1
 chk "NIC_DISCARD bez rx_out_of_buffer (= rx-miss, liczony podwójnie)" '\(\?:discard\|out_of_buffer\)' 0
 chk "xstats discard: router-monitor i router-snmp" '\]\]\*discard\[A-Za-z0-9_' 3
@@ -249,7 +251,7 @@ chk "sysctl: proaktywna kompakcja wyłączona"  '^vm.compaction_proactiveness = 
 chk "upgrade_vpp_sync sprawdza kompakcję i usługę" 'sysctl -n vm.compaction_proactiveness 2>/dev/null\) == 0 \]\]' 1
 chk "vpp_conf_diff: kompakcja i usługa (z nadpisaniem w testach)" 'VPP_COMPACT_PROACTIVE-|VPP_KTHREADS_UNIT:-' 3
 chk "router-kthreads w router.target"         'vpp.service router-kthreads.service router-ifaces.service' 1
-chk "--check: wywłaszczenia workerów"         'nr_involuntary_switches' 7
+chk "--check: wywłaszczenia workerów"         'nr_involuntary_switches' 6
 chk "stopka z autorem (ifaces, fw, guard) definiowana"  '^def signature\(\):' 3
 chk "stopka z autorem wołana po poleceniu"    '^    signature\(\)$' 3
 chk "tryb set_workers w argumentach"          'set_workers\|--set-workers\) MODE=workers' 1
