@@ -1150,6 +1150,30 @@ class TestReviewFixes(Cli):
         conf, _e = parse("zone a internet\ninternet-> deny tcp 10.0.0.0/8 any any any x\ninternet-> deny tcp any any any 25 y\n")
         self.assertEqual(fw.analyze(conf), [])
 
+    def test_apply_and_boot_turn_off_l4_match_of_nonfirst_fragments(self):
+        # acl-plugin domyślnie dopasowuje niepierwszy fragment do pierwszej reguły z tym samym protokołem bez portów
+        # ("deny udp ... dport 445" zjadał każdy fragment UDP) — apply i boot muszą to wyłączyć przed podpięciem ACL
+        from types import SimpleNamespace
+        state = self.env["FAKEVPP_STATE"]
+        self.fw("apply", "-y")
+        with open(state) as f:
+            self.assertEqual(json.load(f).get("acl_frag"), 0)
+        with open(state) as f:
+            st = json.load(f)
+        st["acl_frag"] = 1                      # restart VPP = wartość domyślna
+        with open(state, "w") as f:
+            json.dump(st, f)
+        os.environ["FAKEVPP_STATE"] = state
+        saved = fw.VPPCTL
+        fw.VPPCTL = self.env["ROUTER_FW_VPPCTL"]
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(fw.do_apply(SimpleNamespace(yes=True, confirm=0, timeout=3), boot=True), 0)
+        finally:
+            fw.VPPCTL = saved
+        with open(state) as f:
+            self.assertEqual(json.load(f).get("acl_frag"), 0)
+
     # I6 -------------------------------------------------------------------------------------------------
     def test_apply_tells_vpp_whether_counters_should_be_on(self):
         from types import SimpleNamespace

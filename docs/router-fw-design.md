@@ -11,4 +11,5 @@ Pełny projekt: `docs/superpowers/specs/2026-10-12-router-fw-design.md`. Plan: `
 - `apply --confirm N` uzbraja `systemd-run` z cofnięciem; `router-fw confirm` je anuluje.
 - `block`/`unblock`/`expire` wgrywają ostatnio zastosowaną konfigurację (last-good) + blokady; last-good zawiera listy `include` w postaci rozwiniętej; `rollback` i `boot` po niepotwierdzonym `apply --confirm` przywracają też plik `firewall.conf` (odrzucony: `fw.rejected.conf`).
 - Liczniki trafień: segment statystyk VPP `/acl/<indeks>/matches`, włączane API `acl_stats_intf_counters_enable`; VPP zeruje je przy zmianie treści listy.
+- Niepierwsze fragmenty IP: `apply`/`boot` wykonują `set acl-plugin l4-match-nonfirst-fragment 0` przed podpięciem list (domyślne 1 dopasowuje fragment do pierwszej reguły z tym protokołem bez portów — `public_inlines.h`). Ustawienie żyje do restartu VPP, CLI go nie pokazuje, więc jest wysyłane przy każdym apply; błąd = zdarzenie `FRAG_MODE`, apply idzie dalej.
 - Poza zakresem: firewall stanowy, NAT, Flowspec, `ip punt policer` (`set punt-limit`) — składnia policera niepotwierdzona.

@@ -82,6 +82,8 @@ router-fw counters -w            # liczniki trafień reguł na żywo
 
 **Instalator nie uruchamia firewalla** — po dopasowaniu `/etc/router/firewall.conf`: `router-fw check` → `diff` → `apply --confirm 120` → `confirm` → **`router-fw enable`** (aktywacja na stałe: reguły wracają po każdym restarcie). `router-fw disable` wyłącza. Szczegóły: README routera, rozdział 10a „Aktywacja na stałe”.
 
+**Fragmenty IP:** niepierwszy fragment nie ma portów, a acl-plugin domyślnie dopasowuje go do pierwszej reguły z tym samym protokołem bez sprawdzania portów — `deny udp … dport 445` odrzucał każdy niepierwszy fragment UDP (IKEv2/IPsec, duże odpowiedzi DNS, OpenVPN). Od 1.5.52 `router-fw` przy każdym `apply`/`boot` wykonuje `set acl-plugin l4-match-nonfirst-fragment 0`: fragmenty sprawdzają tylko reguły adresowe (bogony, blokady), pierwszy fragment jest filtrowany normalnie.
+
 Pierwsze wdrożenie na działającym routerze: `bash /root/install-router.sh --from 22` (etap 22 wgrywa program i jednostki systemd; `upgrade_script` podmienia potem tylko program `router-fw`). Przed użyciem na produkcji przejdź `docs/router-fw-lab-checklist.md`. Ruchu do samego routera ten mechanizm nie filtruje — to zadanie netfiltera.
 
 ## Ochrona przed odbiciami (`router-guard`)

@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.51"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.52"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -4442,6 +4442,25 @@ def run_steps(steps):
     return done, None, ""
 
 
+# Niepierwszy fragment IP nie ma nagłówka L4. acl-plugin domyślnie (l4_match_nonfirst_fragment = 1) dopasowuje go
+# do PIERWSZEJ reguły z tym samym protokołem bez sprawdzania portów (public_inlines.h, single_acl_match_5tuple) —
+# przy "deny udp ... dport 135,137-139,445" każdy niepierwszy fragment UDP był odrzucany (IKEv2/IPsec, duże
+# odpowiedzi DNS, OpenVPN). Z 0 fragmenty sprawdzają tylko reguły adresowe (proto any), jak ACL na routerach;
+# pierwszy fragment ma porty i jest filtrowany normalnie. Ustawienie żyje do restartu VPP — dlatego przy każdym apply.
+FRAG_CMD = "set acl-plugin l4-match-nonfirst-fragment 0"
+
+
+def set_fragment_mode():
+    """Fragmenty bez portów nie trafiają w reguły z portami (patrz FRAG_CMD); błąd nie blokuje apply."""
+    try:
+        cli(FRAG_CMD)
+        return True
+    except VppError as ex:
+        log("fragmenty: nie udało się wykonać '%s' (%s)" % (FRAG_CMD, ex))
+        event(4, "FRAG_MODE", "nie udało się wyłączyć dopasowania fragmentów do reguł z portami: %s" % str(ex)[:120])
+        return False
+
+
 def enable_counters(on):
     """Włącza (API acl_stats_intf_counters_enable) liczniki per reguła w segmencie statystyk VPP."""
     if STATS_JSON or os.environ.get("ROUTER_FW_NO_PAPI"):
@@ -4641,6 +4660,7 @@ def do_apply(args, boot=False, source=None, lenient=False):
         report_plan(ctx)
     if args.confirm and steps and not boot and not arm_rollback(args.confirm):
         return 4
+    set_fragment_mode()                       # przed podpięciem list ACL (ważne przy boot po restarcie VPP)
     done, failed, err = run_steps(steps)
     enable_counters(conf.settings["counters"] == "on")
     frozen = freeze(text, conf)

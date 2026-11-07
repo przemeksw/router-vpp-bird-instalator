@@ -191,6 +191,8 @@ def vppctl(cmd):
             del st["if"][n]
         elif t[:4] == ["delete", "loopback", "interface", "intfc"]:
             del st["if"][t[4]]
+        elif t[:3] == ["set", "acl-plugin", "l4-match-nonfirst-fragment"]:
+            st["acl_frag"] = int(t[3])
         elif t[:3] == ["set", "acl-plugin", "acl"]:
             body, idx = cmd[len("set acl-plugin acl"):].strip(), None
             m = re.match(r"index (\d+)\s+(.*)$", body)

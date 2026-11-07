@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.51"                     '^SCRIPT_VERSION="1\.5\.51"' 1
+chk "wersja skryptu 1.5.52"                     '^SCRIPT_VERSION="1\.5\.52"' 1
 chk "karta: dopełnianie do linii, kompresja CQE włączona" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"' 1
 chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
 chk "startup.conf: ethernet default-mtu z PORT_MTU"  '^  default-mtu \$VPP_DEFAULT_MTU$' 1
