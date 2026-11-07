@@ -89,6 +89,19 @@ odrzucany, gdy VPP wstanie z inną konfiguracją (też w router-top), stary form
 liczona od nowa przy każdym restarcie VPP. Doraźnie: `rm /var/lib/router/vpp-idle-loops.json; systemctl restart
 router-monitor` i ponowne uruchomienie router-top.
 
+## Po poprawce MTU (6.11 17:04 – 7.11)
+
+Od restartu VPP z `ethernet { default-mtu 1500 }` (odbiór wektorowy, 1 bufor na pakiet) przez dobę **brak wpisów
+`RX_MISS` i `NIC_DISCARD` w logu router-monitor** (próg logu: ≥ 10 pakietów w oknie 10 s). Wcześniej `NIC_DISCARD`
+pojawiał się co ~2 min. Najpewniej 8 buforów na pakiet (deskryptor 8× większy, odbiór skalarny) odpowiadało też za
+odrzucenia w buforze karty, nie tylko za mały pierścień. Do potwierdzenia: surowe liczniki od startu VPP
+(`rx_phy_discard_packets`, `rx-miss` z segmentu statystyk) — log nie pokazuje okien poniżej progu.
+
+**1.5.51:** `VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"` — kompresja CQE z powrotem włączona. Wdrożenie: `upgrade_script`
+wykrywa zmianę devargs, działa po restarcie VPP (okno serwisowe, sesje BGP spadną). Po restarcie: `rx burst mode`
+ma być nadal `Vector`; jeśli `NIC_DISCARD` wróci — przywrócić `rxq_cqe_comp_en=0` (`VPP_NIC_DEVARGS` w `router.env`
+albo kopia `/etc/vpp/startup.conf.przed-cqe`).
+
 ## Co zostało (stan 6.11, 15:05)
 
 Log z 14:37–15:05 (ruch 0,66–0,98 Mpps, 5,7–9 Gb/s):
@@ -97,7 +110,7 @@ Log z 14:37–15:05 (ruch 0,66–0,98 Mpps, 5,7–9 Gb/s):
 ≥ ~390 pakietów na ~1,1–1,6 mld odebranych → **~0,3/mln** (dolna granica). To tyle, ile dało samo
 `rxq_pkt_pad_en=1` (~0,2/mln). **Potwierdza to sam `pik-watch` z oboma opcjami:** 11 zdarzeń między 14:18:46
 a 14:40:24, razem 204 pakiety (4–53 w próbce 2 s), ruch średnio 768 kpps, w szczycie 1346 kpps. Wpis „0” w tabeli
-testów był błędny. Nie ma dowodu, że `rxq_cqe_comp_en=0` cokolwiek zmienia; zostaje, bo nie szkodzi.
+testów był błędny. Nie ma dowodu, że `rxq_cqe_comp_en=0` cokolwiek zmienia. **Od 1.5.51 kompresja CQE wraca (domyślne DPDK)** — oszczędza PCIe przy zalewie małymi pakietami (DDoS), a jej wyłączenie nic nie dało; patrz „Po poprawce MTU”.
 Do sprawdzenia:
 - czy opcje dalej działają: `grep devargs /etc/vpp/startup.conf`, `systemctl show vpp -p ActiveEnterTimestamp`
   (czy VPP był restartowany po dopisaniu);
@@ -262,7 +275,13 @@ Na `lodz2` opcje zostały dopisane ręcznie przed 1.5.48 — ta sama wartość j
    ma od startu ~22/mln w buforze karty. Ewentualnie doba zapisu obu routerów naraz; poza tym zaakceptować i
    podnieść próg alarmu (punkt 7).
    Liczyć straty na milion pakietów w porze największego ruchu, nie tylko przy ~700 kpps.
-4. Ewentualnie test 16 workerów zamiast 12 (`install-router set_workers 16`, restart serwera) — tylko jeśli bursty będą częstsze.
+4. **Decyzja 7.11: 18 workerów** (cały węzeł karty: main 3, workery 5–39 nieparzyste) — zapas na ataki małymi
+   pakietami, nie wydajność przy zwykłym ruchu (workery zajęte w 14–18%). Karta nie jest granicą: ConnectX-4 100GbE
+   w raporcie Mellanox (DPDK 17.05, test #4, E5-2697A v4, 8 rdzeni l3fwd) — 93,88 Mpps przy 64 B bez strat, a na
+   wejściu `lodz2` jest najwyżej 40 Gb/s (59,5 Mpps przy 64 B). Kolejek mlx5 ma tysiące; 18 kolejek (nie potęga 2) →
+   tablica RSS 512 pozycji, rozkład nierówny o ~2%. Dry-run: pierścień zostaje 16384, bufory 2 916 352 bez zmian
+   (potrzeba ~1,5 mln). W oknie serwisowym razem z 1.5.51: `upgrade_script`, `set_workers 18`, restart serwera;
+   po starcie `rx burst mode: Vector`, 18 kolejek RX na port, doba obserwacji `RX_MISS`/`NIC_DISCARD`.
 5. Porównanie dobowe z `lodz1` (straty na milion odebranych pakietów).
 6. Włączyć maile z alarmami (`/etc/router/notify.conf`, `router-notify test`), ponownie zaimportować szablony monitoringu z `templates/`, w Cacti jednorazowo „Reload Data Query” po wdrożeniu stałego ifIndex.
 7. Próg `NIC_DISCARD_PPS` (dziś 1 pkt/s ≈ 10 pakietów w oknie 10 s) — rozważyć wyższy, żeby pojedyncze bursty nie dawały alarmów.

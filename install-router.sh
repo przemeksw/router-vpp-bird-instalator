@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.50"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.51"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -68,13 +68,14 @@ VPP_RX_DESC=16384              # deskryptory RX na kolejkę. NIE więcej niż 16
 VPP_RX_DESC_MAX=16384          # górna granica sprawdzona na żywym ruchu (podnosić tylko po teście w oknie serwisowym)
 VPP_TX_DESC=4096               # deskryptory TX na kolejkę (errno -95 przy wyższych wartościach to był stary firmware 12.20, nie liczba deskryptorów —
                                 # od firmware >= 12.21.1000 (audyt st_firmware/do_audit wymusza aktualizację) nieaktualne)
-VPP_NIC_DEVARGS="rxq_pkt_pad_en=1,rxq_cqe_comp_en=0"   # parametry sterownika DPDK mlx5 — odbiór jak w jądrze Linuksa:
+VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"   # parametry sterownika DPDK mlx5:
                                 # rxq_pkt_pad_en=1   zapis pakietu dopełniany do pełnej linii pamięci 64 B (jądro mlx5e robi
                                 #                    to domyślnie, DPDK nie); częściowe zapisy linii spowalniają DMA karty
                                 #                    na Xeonach → przepełnienie bufora karty przy burstach (rx_phy_discard)
-                                # rxq_cqe_comp_en=0  bez kompresji wpisów o odebranych pakietach (CQE) — jak w jądrze
+                                # Kompresja CQE (rxq_cqe_comp_en) zostaje włączona (domyślne DPDK): oszczędza PCIe przy dużej
+                                # liczbie pakietów/s (zalew małymi pakietami). Wyłączenie jej (1.5.48) nie dało mierzalnego efektu.
                                 # Pomiar lodz2-vpp (ConnectX-4, E5-2698 v4, 2026-11-06), straty w buforze karty na milion
-                                # pakietów: bez opcji ~1,1; z dopełnianiem ~0,2–0,3 (drugie ustawienie bez mierzalnego efektu).
+                                # pakietów: bez opcji ~1,1; z dopełnianiem ~0,2–0,3; po ethernet { default-mtu } (1.5.50) doba bez wpisów w logu.
 PORT_MTU=1500                  # MTU portów VPP i VLAN-ów: standard Ethernet (ustawiane przy starcie VPP, przed podniesieniem portu).
                                 # Trafia też do startup.conf jako "ethernet { default-mtu }": VPP buduje kolejki karty raz, przy
                                 # starcie, z tym MTU (domyślnie 9000) — późniejsze "set interface mtu" kolejek nie przebudowuje.
@@ -10721,13 +10722,13 @@ workers_plan() {
   printf '  po zmianie:                %d workerów na rdzeniach %s (rdzeń główny VPP: %s)\n' "$VPP_WORKERS" "$WORKERS_CSV" "$MAIN_CORE"
   printf '  izolowane rdzenie:         %s\n' "$ISOL_CSV"
   printf '  maksimum na węźle %s:      %d (rdzenie fizyczne bez %d systemowych i głównego VPP)\n' "$NUMA" "$avail_w" "$HK_RES"
-  printf '  zalecane dla %s:   %d (wydajność rdzenia: potrzeba %d na łącze przy %d B)\n' "$NIC_MODEL" "$NIC_CAP" "${NEED_W:-0}" "$VPP_SIZING_PKT"
+  printf '  domyślnie (auto) dla %s: %d (wydajność rdzenia: potrzeba %d na łącze przy %d B)\n' "$NIC_MODEL" "$NIC_CAP" "${NEED_W:-0}" "$VPP_SIZING_PKT"
   printf '  pojemność (szacunek):      %s\n' "${CAPACITY:-?}"
   printf '  porty VPP (%d): %s — bufory i kolejki RX liczone dla każdego; inny port: install-router set_workers N --choose-nic\n' \
     "${#NIC_PCI[@]}" "${NIC_PCI[*]}"
   printf '  bufory VPP: %d (tryb %s, maksimum %d), sterta %s, hugepages %d × 2 MB\n' "$BUFFERS" "$VPP_BUFFERS" "$BUF_MAX" "$MAIN_HEAP" "$HUGEPAGES_2M"
   if ((VPP_WORKERS > NIC_CAP)); then
-    warn "$VPP_WORKERS workerów to więcej niż zalecane $NIC_CAP dla $NIC_MODEL — dodatkowe rdzenie dają zapas, nie większą przepustowość karty"
+    say "$VPP_WORKERS workerów to więcej niż domyślne $NIC_CAP dla $NIC_MODEL — dodatkowe rdzenie to zapas na ataki małymi pakietami (granicą jest procesor, nie karta); przy zwykłym ruchu bez zmian"
   fi
   if d=$(vpp_conf_diff); then
     printf '%s\n' "$d"
@@ -11023,6 +11024,12 @@ fi
 
 # ------------------------------------------------------------- karta sieciowa
 sect "Karta sieciowa"
+# NIC_CAP = domyślna liczba workerów (VPP_WORKERS=auto) dla modelu karty, NIE limit karty. Karta przyjmie więcej:
+# ConnectX-4 100GbE w raporcie Mellanox (DPDK 17.05, test #4, E5-2697A v4) — 93,88 Mpps przy 64 B bez strat
+# z 8 rdzeniami l3fwd (kilkadziesiąt taktów na pakiet). VPP z firewallem to ~1000–3400 taktów na pakiet, więc
+# przy zalewie małymi pakietami granicą jest procesor — więcej workerów (set_workers N) = więcej zapasu.
+# Kolejek RX mlx5 ma tysiące (min(max_cq, max_qp)); przy liczbie kolejek innej niż potęga 2 tablica RSS ma 512
+# pozycji — rozkład nierówny o ~2% (18 kolejek), bez znaczenia.
 NIC_DEV=$(cat "/sys/bus/pci/devices/${NIC_PCI[0]}/device")
 case $NIC_DEV in
   0x1013) NIC_MODEL="ConnectX-4";        NIC_CAP=12; NIC_LINE=100000 ;;
@@ -11160,7 +11167,7 @@ NEED_W=$(( (need_pps + PPS_W - 1) / PPS_W ))
 audit INFO "Wydajność rdzenia" "$((cpu_khz / 1000)) MHz maks., do obliczeń $EFF_MHZ MHz" \
   "worker: ~$(fmt_mpps "$PPS_W") Mpps bez NetFlow, ~$(fmt_mpps "$PPS_W_NF") Mpps z NetFlow; na ${line_gbps} Gb/s przy ${VPP_SIZING_PKT} B potrzeba $NEED_W"
 if [[ $VPP_WORKERS == auto ]]; then
-  # Co najmniej tyle, ile karta sensownie rozkłada (NIC_CAP — zapas na ataki małymi pakietami); więcej tylko,
+  # Co najmniej NIC_CAP (domyślne dla karty — zapas na ataki małymi pakietami); więcej tylko,
   # gdy procesor jest za wolny, żeby z NIC_CAP workerami obsłużyć łącze (najwyżej 2× NIC_CAP) — i zawsze
   # w granicach wolnych rdzeni węzła karty.
   want=$(( NEED_W > NIC_CAP ? NEED_W : NIC_CAP ))
@@ -11170,7 +11177,7 @@ if [[ $VPP_WORKERS == auto ]]; then
     audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w, procesor ${EFF_MHZ} MHz" \
       "$VPP_WORKERS (więcej niż $NIC_CAP dla karty, bo rdzeń za wolny na łącze z $NIC_CAP workerami)"
   else
-    audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w" "$VPP_WORKERS (powyżej $NIC_CAP karta i tak nie nadąży)"
+    audit AUTO "Workery VPP" "$NIC_MODEL, wolnych rdzeni: $avail_w" "$VPP_WORKERS (domyślne dla karty; więcej = zapas na ataki małymi pakietami: install-router set_workers N)"
   fi
   ((NEED_W > avail_w)) && rec 2 "sprzęt" "Szybszy procesor albo więcej rdzeni na węźle karty" \
     "do obsługi ${line_gbps} Gb/s przy ${VPP_SIZING_PKT} B potrzeba ~$NEED_W workerów, a jest $avail_w wolnych rdzeni"
@@ -15240,7 +15247,7 @@ Zasada działania:
 - **linux-cp** tworzy w netns `dataplane` odpowiedniki interfejsów VPP. Ruch do samego routera (BGP, SSH, SNMP) VPP przekazuje do Linuksa.
 - **BIRD** działa w netns `dataplane`, wpisuje najlepsze trasy do tablicy kernela, a plugin **linux-nl** przenosi je do tablicy VPP.
 - **NetFlow/IPFIX** (wtyczka VPP `flowprobe`) eksportuje do dedykowanego TAP-a `nf-export` (nie do `loop0` — pakiet wygenerowany wewnętrznie przez eksporter nie przechodzi przez mechanizm "punt do Linuksa", z którego korzystają SSH/BGP/SNMP) — VPP ma tylko jeden eksporter, więc **router-netflow** (własny Python, w netns `dataplane`) odbiera ten jeden strumień i rozsyła kopię do każdego kolektora z `/etc/router/netflow.conf` (np. FastNetMon + Akvorado naraz).
-- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Liczbę workerów instalator liczy z wydajności procesora: maksymalne taktowanie × 0,8 i koszt pakietu (~1600 cykli bez NetFlow, ~4400 z NetFlow) dają pakiety/s na workera; workerów jest co najmniej tyle, ile karta sensownie rozkłada (zapas na ataki małymi pakietami), a więcej, gdy rdzeń jest za wolny na obsłużenie łącza przy typowym pakiecie `VPP_SIZING_PKT` (800 B) — najwyżej 2× i nigdy więcej niż wolnych rdzeni. Szacowaną pojemność routera (Mpps i Gb/s z NetFlow i bez) pokazuje raport audytu i `install-router set_workers --dry-run`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Sterownik karty (DPDK mlx5) dostaje `rxq_pkt_pad_en=1,rxq_cqe_comp_en=0` (`VPP_NIC_DEVARGS`) — odbiór jak w jądrze Linuksa: zapis pakietu do pełnej linii pamięci i bez kompresji CQE; bez tego karta gubiła pakiety we własnym buforze przy burstach (`rx_phy_discard`), czego Linux na tej samej karcie nie robił. `startup.conf` ma też `ethernet { default-mtu }` równe MTU portów: VPP buduje kolejki karty tylko raz, przy starcie, i bez tego wpisu robi to dla MTU 9000 — każdy pakiet dostaje wtedy 8 buforów po 2048 B, DPDK odbiera skalarnie zamiast wektorowo, a pierścień 16384 deskryptorów mieści tylko 2048 pakietów (sprawdzenie: `vppctl show hardware-interfaces hu0 | grep 'rx burst mode'` — ma być `Vector`, nie `Scalar`). Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
+- Rdzenie VPP (`@@ISOL@@`) należą tylko do VPP: bez procesów, bez przerwań, bez pracy kernela (`isolcpus=managed_irq,domain`, `nohz_full` na workerach, `rcu_nocbs`, `irqaffinity`, workqueue i watchdog na rdzeniach systemowych, wszystkie usługi przez `CPUAffinity` systemd). Karta i VPP pracują na tym samym węźle NUMA (@@NUMA@@). Dodatkowo wyłączone `kernel.numa_balancing` i `transparent_hugepage=madvise` — bez tego kernel w tle skanuje/defragmentuje pamięć procesu VPP nawet na w pełni izolowanym rdzeniu (to nie chroni przed tym `isolcpus`), co może zablokować workera na dłużej niż trzeba do przepełnienia ringu RX karty. Linia kernela ma też parametry z profilu `cpu-partitioning` (standard dla DPDK): `rcupdate.rcu_normal_after_boot=1` (bez przerwań RCU wysyłanych do każdego rdzenia przy zmianach w sieci), `iommu=pt` (DMA karty bez tłumaczenia adresów — bez chybień IOTLB przy 100G), `skew_tick=1` i — gdy wszystkie CPU mają stabilny zegar — `tsc=reliable`. Liczbę workerów instalator liczy z wydajności procesora: maksymalne taktowanie × 0,8 i koszt pakietu (~1600 cykli bez NetFlow, ~4400 z NetFlow) dają pakiety/s na workera; workerów jest co najmniej tyle, ile domyślnie dla modelu karty (ConnectX-4: 12 — to nie limit karty, tylko punkt wyjścia; więcej workerów to większy zapas na ataki małymi pakietami), a więcej, gdy rdzeń jest za wolny na obsłużenie łącza przy typowym pakiecie `VPP_SIZING_PKT` (800 B) — najwyżej 2× i nigdy więcej niż wolnych rdzeni. Szacowaną pojemność routera (Mpps i Gb/s z NetFlow i bez) pokazuje raport audytu i `install-router set_workers --dry-run`. Na serwerze z jednym procesorem instalator zostawia dla systemu (BIRD, SNMP, kernel) co najmniej 2 rdzenie, a przy większych 1/8 rdzeni; przy dwóch procesorach system ma cały drugi. Pierścień RX (`num-rx-desc`) jest zmniejszany automatycznie, gdy przy małej ilości RAM nie zmieściłby się w buforach. Sterownik karty (DPDK mlx5) dostaje `rxq_pkt_pad_en=1` (`VPP_NIC_DEVARGS`) — zapis pakietu do pełnej linii pamięci, jak w jądrze Linuksa (kompresja CQE zostaje włączona, bo oszczędza PCIe przy zalewie małymi pakietami); bez tego karta gubiła pakiety we własnym buforze przy burstach (`rx_phy_discard`), czego Linux na tej samej karcie nie robił. `startup.conf` ma też `ethernet { default-mtu }` równe MTU portów: VPP buduje kolejki karty tylko raz, przy starcie, i bez tego wpisu robi to dla MTU 9000 — każdy pakiet dostaje wtedy 8 buforów po 2048 B, DPDK odbiera skalarnie zamiast wektorowo, a pierścień 16384 deskryptorów mieści tylko 2048 pakietów (sprawdzenie: `vppctl show hardware-interfaces hu0 | grep 'rx burst mode'` — ma być `Vector`, nie `Scalar`). Osobna sprawa to wątki kernela z własną maską CPU: `kcompactdN`/`kswapdN` dostają maskę całego węzła NUMA (razem z rdzeniami workerów) i `isolcpus` ich nie powstrzymuje — `router-kthreads` (usługa `router-kthreads.service` przy starcie, `router-kthreads-check.timer` co 5 min, `router-kthreads -n` = podgląd) przypina je do rdzeni systemowych — tak samo każde przerwanie sprzętowe, którego maska obejmuje rdzeń VPP — a `vm.compaction_proactiveness=0` wyłącza cykliczne budzenie kcompactd. Nic tu nie jest zaszyte pod konkretny serwer: lista izolowanych rdzeni, węzły NUMA, nazwy wątków i wektorów są czytane z działającego systemu. Wywłaszczenie workera widać od razu jako `%VPP-3-WK_PREEMPT`, a przerwania BIOS-u (SMI — jedyne, czego nie da się zablokować z Linuksa) jako `%SYS-3-SMI` w router-monitor.
 
 ---
 

@@ -179,7 +179,7 @@ Wtyczka jest budowana razem z VPP (etap 10); na działającym routerze wymaga `i
 
 ## Liczba workerów VPP (bez ponownej instalacji)
 
-Worker to wątek VPP przypięty do jednego odizolowanego rdzenia na węźle NUMA karty; każdy obsługuje własną kolejkę RX. Domyślnie `VPP_WORKERS=auto` (mniejsza z wartości: zalecane dla karty — ConnectX-4: 12 — oraz wolne rdzenie fizyczne węzła minus 2). Zmiana na działającym routerze:
+Worker to wątek VPP przypięty do jednego odizolowanego rdzenia na węźle NUMA karty; każdy obsługuje własną kolejkę RX. Domyślnie `VPP_WORKERS=auto` (mniejsza z wartości: domyślne dla karty — ConnectX-4: 12 — oraz wolne rdzenie fizyczne węzła minus 2). Domyślna liczba to nie limit karty: ConnectX-4 100GbE przyjmuje ~94 Mpps przy 64 B (raport Mellanox, DPDK 17.05), a VPP z firewallem potrzebuje ~1000–3400 taktów na pakiet, więc przy zalewie małymi pakietami granicą jest procesor. Na serwerze z dwoma procesorami można oddać VPP cały węzeł karty (maksimum = rdzenie węzła minus 1 systemowy i główny VPP, np. 18 przy 20 rdzeniach) — przy zwykłym ruchu nic to nie zmienia, przy ataku daje zapas. Zmiana na działającym routerze:
 
 ```bash
 router                                          # 8 → „Układ rdzeni i maksimum workerów” / „Zmień liczbę workerów”
