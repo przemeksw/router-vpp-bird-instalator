@@ -145,6 +145,14 @@ t "hu0.100 (ma v6) dostał link-local"       0 has '"ifname": "hu0.100"' $W/bin/
 t "link-local tylko na hu0.100 i loop0"     0 bash -c "$W/bin/fakeip -n dataplane -j addr show | python3 -c 'import json,sys; d=json.load(sys.stdin); ll=sorted(x[\"ifname\"] for x in d if any(a[\"scope\"]==\"link\" for a in x[\"addr_info\"])); sys.exit(0 if ll==[\"hu0.100\",\"loop0\"] else 1)'"
 t "IPv6 w VPP tylko hu0.100 i loop0"        0 bash -c "[ \"\$($W/bin/fakevppctl show ip6 interface | grep -c 'is admin')\" = 2 ]"
 t "check: zgodne"                           0 $RI check
+# hu0.48 z produkcji: tryb już eui64 (wcześniejsze "ip link set addrgenmode eui64"), a link-local brak —
+# samo ponowne ustawienie trybu przez netlink nic nie da; apply musi wymusić nadanie adresu (sysctl 1 → 0)
+$W/bin/fakeip -n dataplane link set dev hu0.100 addrgenmode eui64
+$W/bin/fakeip -n dataplane -6 addr flush dev hu0.100 scope link
+t "tryb eui64 bez link-local = rozjazd"     1 $RI check
+t "apply nadaje link-local (jeden przebieg)" 0 $RI apply -y
+t "hu0.100 znów ma link-local"              0 bash -c "$W/bin/fakeip -n dataplane -j addr show | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(a[\"scope\"]==\"link\" for x in d if x[\"ifname\"]==\"hu0.100\" for a in x[\"addr_info\"]) else 1)'"
+t "check po naprawie link-local: zgodne"    0 $RI check
 cp "$W/good.conf" "$CONF"; $RI apply -y >/dev/null 2>&1
 
 bash tests/test-upgrade.sh || fail=$((fail + 1))

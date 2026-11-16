@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.53"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.54"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -1519,9 +1519,14 @@ def plan(desired, act, managed, aliases=True):
             continue
         host = act.lcp.get(e.name)
         if any(a.version == 6 for a in e.addrs):
-            # Linux potrzebuje link-local, żeby rozwiązywać sąsiadów IPv6 (ND) — inaczej BIRD nie zestawi sesji v6
+            # Linux potrzebuje link-local, żeby rozwiązywać sąsiadów IPv6 (ND) — inaczej BIRD nie zestawi sesji v6.
+            # Nie "ip link set addrgenmode eui64": netlink tylko zapisuje tryb, a na interfejsie już podniesionym
+            # (linux-cp podnosi go od razu) kernel nada link-local dopiero przy następnym podniesieniu łącza.
+            # Zapis przez sysctl przy ZMIANIE wartości nadaje adresy od razu — stąd 1 → 0 (gdy tryb już jest
+            # eui64, samo 0 nic by nie zmieniło). Łącza nie ruszamy: down/up w Linuksie położyłby interfejs w VPP.
             if aliases and host and host in act.alias and host not in act.lll:
-                cmds.append(Cmd("+", "ip", ["-n", NETNS, "link", "set", "dev", host, "addrgenmode", "eui64"],
+                agm = "net/ipv6/conf/%s/addr_gen_mode" % host
+                cmds.append(Cmd("+", "ip", ["netns", "exec", NETNS, "sysctl", "-q", "-w", agm + "=1", agm + "=0"],
                                 "link-local IPv6 w Linuksie (ND, BGP po IPv6)"))
             continue
         if aliases and host and host in act.lll:

@@ -349,8 +349,33 @@ def vppctl(cmd):
     return out
 
 
+def fake_sysctl(st, args):
+    """ip netns exec dataplane sysctl -q -w net/ipv6/conf/<if>/addr_gen_mode=<v> ... — jak kernel
+    (addrconf_sysctl_addr_gen_mode): zmiana wartości od razu nadaje adresy automatyczne (eui64 → link-local)."""
+    for kv in [x for x in args if not x.startswith("-")]:
+        k, v = kv.split("=")
+        p = k.split("/")
+        if p[:3] != ["net", "ipv6", "conf"] or p[4:] != ["addr_gen_mode"] or v not in ("0", "1"):
+            sys.exit("fake sysctl: unsupported %s" % kv)
+        h, v = p[3], int(v)
+        if h not in st["linux"]:
+            sys.exit("sysctl: cannot stat /proc/sys/%s: No such file or directory" % k)
+        agm = st.setdefault("agm", {})
+        cur = agm.get(h, 0 if st.get("ll_default", True) else 1)
+        agm[h] = v
+        if v != cur and v == 0:             # kernel nadaje link-local, linux-cp włącza IPv6 w VPP
+            st.setdefault("ll", {})[h] = True
+            for n, hh in st["lcp"].items():
+                if hh == h:
+                    st["if"][n]["ip6"] = True
+    save(st)
+
+
 def ipcmd(argv):
     st = load()
+    if argv[:3] == ["netns", "exec", "dataplane"] and argv[3:4] == ["sysctl"]:
+        fake_sysctl(st, argv[4:])
+        return
     if argv[:2] != ["-n", "dataplane"]:
         sys.exit("fake ip: only -n dataplane")
     a = argv[2:]
@@ -393,11 +418,9 @@ def ipcmd(argv):
     if a[:3] == ["link", "set", "dev"] and a[4:5] == ["addrgenmode"] and a[5] in ("none", "eui64"):
         if a[3] not in st["linux"]:
             sys.exit("Cannot find device \"%s\"" % a[3])
-        if a[5] == "eui64":                 # kernel nadaje link-local, linux-cp włącza IPv6 w VPP
-            st.setdefault("ll", {})[a[3]] = True
-            for n, hh in st["lcp"].items():
-                if hh == a[3]:
-                    st["if"][n]["ip6"] = True
+        # jak prawdziwy kernel (inet6_set_link_af): netlink tylko zapisuje tryb — na interfejsie, który już
+        # jest "up", link-local NIE powstaje (dopiero przy następnym podniesieniu łącza)
+        st.setdefault("agm", {})[a[3]] = 0 if a[5] == "eui64" else 1
         save(st)
         return
     if a[:3] == ["-6", "addr", "flush"] and a[3] == "dev" and a[5:] == ["scope", "link"]:
