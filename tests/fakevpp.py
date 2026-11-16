@@ -51,8 +51,31 @@ def sync_addr(st, name, a, add):
         lst.remove(a)
 
 
+# --- trasy BIRD przez interfejs (model awarii lodz2-vpp 16.11: VPP padł po usunięciu VLAN-u)
+# Każde wywołanie vppctl/ip to jeden "takt". Gdy z interfejsu zniknie ostatni adres, BIRD po bird_lag taktach
+# wycofuje trasy przez niego z Linuksa; linux-nl przenosi to do VPP po kolejnych nl_lag taktach — ale tylko jeśli
+# para linux-cp jeszcze istnieje (inaczej nie wie, którego interfejsu VPP dotyczy, i w FIB zostaje martwa ścieżka).
+# Usunięcie interfejsu, przez który VPP ma jeszcze ścieżki = "crash" (prawdziwy VPP pada przy następnej zmianie
+# takiego wpisu IPv6: fib_path_resolve → fib_table_get_table_id_for_sw_if_index, SIGSEGV).
+def tick(st):
+    st["tick"] = st.get("tick", 0) + 1
+    for r in st.get("routes", []):
+        w = r.get("withdraw_at")
+        if w is None:
+            continue
+        if r["lx"] and st["tick"] >= w:
+            r["lx"] = False
+        if r["vpp"] and st["tick"] >= w + st.get("nl_lag", 5):
+            if r["via"] in st["lcp"]:
+                r["vpp"] = False
+            else:
+                r["stale"] = True
+    st["routes"] = [r for r in st.get("routes", []) if r["lx"] or r["vpp"]]
+
+
 def vppctl(cmd):
     st = load()
+    tick(st)
     t = cmd.split()
     out = ""
     try:
@@ -71,6 +94,21 @@ def vppctl(cmd):
                 out += "%s (%s):\n" % (n, "up" if i["up"] else "dn")
                 for a in i["addrs"]:
                     out += "  L3 %s\n" % a
+        elif t[:3] == ["fake", "route", "add"]:   # fake route add <if VPP> <cel> [sticky]
+            st.setdefault("routes", []).append({"via": t[3], "dst": t[4], "lx": True, "vpp": True,
+                                                "sticky": t[5:6] == ["sticky"]})
+        elif t[:3] == ["fake", "route", "del"]:   # trasa wycofana normalnie (para linux-cp istnieje)
+            st["routes"] = [r for r in st.get("routes", []) if not (r["via"] == t[3] and r["dst"] == t[4])]
+        elif t[:2] == ["fake", "lag"]:            # fake lag <bird> <linux-nl>
+            st["bird_lag"], st["nl_lag"] = int(t[2]), int(t[3])
+        elif t[:3] == ["show", "ip6", "fib"] and len(t) == 4:
+            for r in st.get("routes", []):
+                if r["vpp"] and r["dst"] == t[3]:
+                    out += ("%s fib:0 index:7 locks:2\n  lcp-rt-dynamic refs:1 src-flags:added,contributing,active,\n"
+                            "    path-list:[9] locks:1 flags:shared, uPRF-list:8 len:1 itfs:[%d, ]\n"
+                            "      path:[9] pl-index:9 ip6 weight=1 pref=0 attached-nexthop:  oper-flags:resolved,\n"
+                            "        2001:db8:100::1 %s\n          [@0]: ipv6 via 2001:db8:100::1 %s: mtu:1500 next:5\n"
+                            % (r["dst"], st["if"].get(r["via"], {}).get("idx", 99), r["via"], r["via"]))
         elif t[:2] == ["fake", "ll-default"]:   # tylko testy: netns z addr_gen_mode=1 (nowe interfejsy bez link-local)
             st["ll_default"] = t[2] == "on"
         elif cmd == "show ip6 interface":
@@ -160,6 +198,10 @@ def vppctl(cmd):
                     raise ValueError("address not found")
                 st["if"][n]["addrs"].remove(a)
                 sync_addr(st, n, a, False)
+                if not st["if"][n]["addrs"]:          # sieć zniknęła: BIRD przeniesie trasy na inne next-hopy
+                    for r in st.get("routes", []):
+                        if r["via"] == n and not r.get("sticky") and r.get("withdraw_at") is None:
+                            r["withdraw_at"] = st["tick"] + st.get("bird_lag", 10)
             else:
                 for n2, i2 in st["if"].items():
                     for a2 in i2["addrs"]:
@@ -185,6 +227,9 @@ def vppctl(cmd):
             st.get("laddr", {}).pop(h, None)
         elif t[:2] == ["delete", "sub-interface"]:
             n = t[2]
+            held = [r["dst"] for r in st.get("routes", []) if r["via"] == n and r["vpp"]]
+            if held:
+                st["crash"] = "usunięto %s, a FIB ma ścieżki przez niego: %s" % (n, ", ".join(held))
             if n in st["lcp"]:
                 st["linux"].pop(st["lcp"].pop(n), None)
             st.get("flowprobe", {}).pop(n, None)
@@ -373,6 +418,8 @@ def fake_sysctl(st, args):
 
 def ipcmd(argv):
     st = load()
+    tick(st)
+    save(st)
     if argv[:3] == ["netns", "exec", "dataplane"] and argv[3:4] == ["sysctl"]:
         fake_sysctl(st, argv[4:])
         return
@@ -394,6 +441,20 @@ def ipcmd(argv):
                 ai.append({"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"})
             out.append({"ifname": h, "addr_info": ai})
         print(json.dumps(out))
+        return
+    if len(a) == 7 and a[0] in ("-4", "-6") and a[1:3] == ["route", "show"] and a[3] == "dev" and a[5:] == ["table", "all"]:
+        h = a[4]
+        if h not in st["linux"]:
+            sys.exit("Cannot find device \"%s\"" % h)
+        v6 = a[0] == "-6"
+        vpp = [n for n, hh in st["lcp"].items() if hh == h]
+        for r in st.get("routes", []):
+            if r["lx"] and vpp and r["via"] == vpp[0] and (":" in r["dst"]) == v6:
+                print("%s via %s proto bird metric 32" % (r["dst"], "2001:db8:100::1" if v6 else "192.0.2.1"))
+        if v6 and st.get("ll", {}).get(h, True):
+            print("fe80::/64 proto kernel metric 256 pref medium")
+            print("multicast ff00::/8 table local proto kernel metric 256 pref medium")
+            print("local fe80::1 table local proto kernel metric 0 pref medium")
         return
     if a[:1] == ["addr"] and a[1] in ("add", "del"):
         lst = st.setdefault("laddr", {}).setdefault(a[4], [])

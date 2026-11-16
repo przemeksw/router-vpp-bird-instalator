@@ -155,6 +155,31 @@ t "hu0.100 znów ma link-local"              0 bash -c "$W/bin/fakeip -n datapla
 t "check po naprawie link-local: zgodne"    0 $RI check
 cp "$W/good.conf" "$CONF"; $RI apply -y >/dev/null 2>&1
 
+echo "5c. usunięcie VLAN-u, przez który BIRD ma trasy (awaria lodz2-vpp 16.11)"
+# Symulator: po zniknięciu adresów BIRD wycofuje trasy z Linuksa po 10 taktach, linux-nl czyści VPP po kolejnych 5 —
+# tylko póki para linux-cp istnieje. Usunięcie interfejsu ze ścieżkami w FIB = "crash" (prawdziwy VPP: SIGSEGV).
+export ROUTER_IFACES_ROUTE_POLL=0.05 ROUTER_IFACES_ROUTE_WAIT=3
+vpp fake lag 10 5 >/dev/null
+for r in 2001:db8:5::/48 2001:db8:6::/48 198.51.100.0/24; do vpp fake route add hu0.100 $r >/dev/null; done
+sed -i.bak '/^hu0  *100 /d' "$CONF"
+t "diff: czekanie na trasy przed usunięciem"  0 bash -c "$RI diff | grep -A2 'czekaj, aż trasy przez hu0.100' | grep -q 'lcp delete hu0.100'"
+t "apply czeka na trasy i usuwa VLAN"       0 $RI apply -y
+t "VLAN 100 usunięty"                       1 has "hu0.100" vpp show interface
+t "FIB bez ścieżek przez usunięty VLAN"     1 grep -q '"crash"' "$FAKEVPP_STATE"
+cp "$W/good.conf" "$CONF"; $RI apply -y >/dev/null 2>&1
+vpp fake route add hu0.100 2001:db8:7::/48 sticky >/dev/null
+sed -i.bak '/^hu0  *100 /d' "$CONF"
+t "trasa niewycofana: apply nie usuwa VLAN-u" 4 $RI apply -y
+t "komunikat podaje trasę"                  0 has "2001:db8:7::/48" $RI apply -y
+t "VLAN 100 nadal jest"                     0 has "hu0.100" vpp show interface
+t "para linux-cp nadal jest"                0 has "hu0.100" vpp show lcp
+t "bez awarii VPP"                          1 grep -q '"crash"' "$FAKEVPP_STATE"
+vpp fake route del hu0.100 2001:db8:7::/48 >/dev/null
+t "po wycofaniu trasy apply usuwa VLAN"     0 $RI apply -y
+t "VLAN 100 usunięty"                       1 has "hu0.100" vpp show interface
+unset ROUTER_IFACES_ROUTE_POLL ROUTER_IFACES_ROUTE_WAIT
+cp "$W/good.conf" "$CONF"; $RI apply -y >/dev/null 2>&1
+
 bash tests/test-upgrade.sh || fail=$((fail + 1))
 
 echo

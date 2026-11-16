@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.54"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.55"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -943,6 +943,10 @@ SYSTEMD = os.environ.get("ROUTER_IFACES_SYSTEMD", "1") == "1"
 # używane tylko jako zabezpieczenie przed wyścigiem ze startem VPP (patrz plan(), "flowprobe params")
 FLOWPROBE_ACTIVE_TIMER = int(os.environ.get("ROUTER_IFACES_FLOWPROBE_ACTIVE", "60"))
 FLOWPROBE_PASSIVE_TIMER = int(os.environ.get("ROUTER_IFACES_FLOWPROBE_PASSIVE", "60"))
+# Usuwanie VLAN-u/loopbacku: ile najwyżej czekać, aż BIRD i linux-nl wycofają trasy przez niego (patrz wait_routes_gone)
+ROUTE_WAIT = float(os.environ.get("ROUTER_IFACES_ROUTE_WAIT", "120"))
+ROUTE_POLL = float(os.environ.get("ROUTER_IFACES_ROUTE_POLL", "2"))
+ROUTE_SAMPLE = 50     # ile tras IPv6 sprawdzać w FIB VPP (show ip6 fib <prefiks> — jedno vppctl na trasę)
 
 
 def _inst_netflow_enable():
@@ -1246,7 +1250,7 @@ def read_vpp(with_alias=False):
         t = line.split()
         if len(t) >= 4 and t[1].isdigit():
             m = t[3].split("/")[0]
-            st.ifaces[t[0]] = {"up": t[2] == "up", "mtu": int(m) if m.isdigit() else None}
+            st.ifaces[t[0]] = {"up": t[2] == "up", "mtu": int(m) if m.isdigit() else None, "idx": int(t[1])}
     if not st.ifaces:
         raise VppError("VPP nie zwrócił listy interfejsów")
     cur = None
@@ -1363,12 +1367,16 @@ def wait_flowprobe_params(timeout):
 
 # --------------------------------------------------------------------------- plan zmian
 class Cmd:
-    def __init__(self, op, kind, args, why=""):
+    def __init__(self, op, kind, args, why="", iface=None):
         self.op, self.kind, self.args, self.why = op, kind, args, why   # op: + - ~
+        self.iface = iface    # usuwany interfejs: po nieudanym "wait" jego dalsze polecenia są pomijane
+        self.snap = []        # "wait": trasy przez interfejs w Linuksie sprzed usunięcia adresów
 
     def text(self):
         if self.kind == "vpp":
             return self.args
+        if self.kind == "wait":
+            return "czekaj, aż trasy przez %s znikną z Linuksa i VPP (BIRD, linux-nl)" % self.args["name"]
         return "ip " + " ".join(shlex.quote(a) for a in self.args)
 
     def __eq__(self, o):
@@ -1398,13 +1406,22 @@ def plan(desired, act, managed, aliases=True):
             cmds.append(Cmd("-", "vpp", "flowprobe feature add-del %s %s disable" % (name, act.flowprobe[name]),
                             "NetFlow/IPFIX: interfejs usunięty z ifaces.conf"))
         if kind in ("vlan", "loop"):
+            # Interfejs znika z VPP dopiero, gdy nic już przez niego nie prowadzi. Na lodz2-vpp (16.11) usunięcie
+            # adresów, pary linux-cp i VLAN-u w jednej sekundzie zostawiło w FIB ścieżki IPv6 przez nieistniejący
+            # interfejs: Linux wycofał trasy, ale linux-nl dostał to już po "lcp delete" i nie umiał ich przypisać.
+            # Przy następnej zmianie takiego wpisu VPP padł (fib_path_resolve → SIGSEGV). Dlatego: najpierw adresy
+            # (wyżej), potem czekanie z żywą parą linux-cp, aż BIRD przeniesie trasy, a linux-nl wyczyści FIB.
+            cmds.append(Cmd("~", "wait", {"name": name, "host": act.lcp.get(name),
+                                          "idx": act.ifaces[name].get("idx")},
+                            "inaczej w FIB VPP zostają ścieżki przez usunięty interfejs i VPP pada", iface=name))
             if name in act.lcp:
-                cmds.append(Cmd("-", "vpp", "lcp delete %s" % name, "usunięty z ifaces.conf"))
+                cmds.append(Cmd("-", "vpp", "lcp delete %s" % name, "usunięty z ifaces.conf", iface=name))
             if kind == "vlan":
-                cmds.append(Cmd("-", "vpp", "delete sub-interface %s" % name, "VLAN usunięty z ifaces.conf"))
+                cmds.append(Cmd("-", "vpp", "delete sub-interface %s" % name, "VLAN usunięty z ifaces.conf",
+                                iface=name))
             else:
                 cmds.append(Cmd("-", "vpp", "delete loopback interface intfc %s" % name,
-                                "loopback usunięty z ifaces.conf"))
+                                "loopback usunięty z ifaces.conf", iface=name))
     # 3. porty, loopbacki, VLAN-y
     # Zabezpieczenie przed wyścigiem ze startem VPP: router-ifaces.service rusza, gdy systemd zgłosi
     # "vpp.service aktywny", a nie, gdy VPP skończy wykonywać bootstrap.vpp (gdzie są "flowprobe params").
@@ -1547,7 +1564,86 @@ def show_cmds(cmds, prefix="  "):
         print(prefix + color("%s %s" % (c.op, c.text()), col) + why)
 
 
+LINUX_SKIP_TYPES = ("local", "broadcast", "multicast", "anycast", "unreachable", "blackhole", "prohibit", "throw", "nat")
+
+
+def linux_routes(host):
+    """Trasy w netns dataplane przez interfejs Linuksa, bez tablicy local, link-local (fe80::/64) i multicastu:
+    [(4|6, cel, linia)]. Brak interfejsu = brak tras."""
+    out = []
+    for fam in ("-4", "-6"):
+        r = subprocess.run([IPCMD, "-n", NETNS, fam, "route", "show", "dev", host, "table", "all"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            if "Cannot find device" in (r.stderr or ""):
+                return []
+            raise OSError((r.stderr or "").strip() or "ip route: kod %d" % r.returncode)
+        for line in r.stdout.splitlines():
+            t = line.split()
+            if not t or t[0] in LINUX_SKIP_TYPES:
+                continue
+            if "table" in t[:-1] and t[t.index("table") + 1] == "local":
+                continue
+            if t[0].lower().startswith(("fe80:", "ff")):
+                continue
+            out.append((6 if fam == "-6" else 4, t[0], line.strip()))
+    return out
+
+
+def _v6_prefix(dst):
+    return "::/0" if dst == "default" else dst if "/" in dst else dst + "/128"
+
+
+def vpp_paths_via(name, idx, prefixes):
+    """Prefiksy IPv6, których wpis w FIB VPP ma jeszcze ścieżkę przez interfejs (nazwa albo if_index, gdy ścieżka
+    jest już martwa). IPv6, bo tam linux-nl dokłada ścieżki do wpisu (path_add2) — i tam VPP padł."""
+    pat = re.compile(r"(?<![\w.:])%s(?![\w.])|\bif_index:%s\b" % (re.escape(name), idx if idx is not None else "x"))
+    return [p for p in prefixes if pat.search(cli("show ip6 fib %s" % p))]
+
+
+def _sample(items, n):
+    if len(items) <= n:
+        return list(items)
+    step = len(items) / float(n)
+    return [items[int(i * step)] for i in range(n)]
+
+
+def wait_routes_gone(c):
+    """Czeka (najwyżej ROUTE_WAIT s), aż w Linuksie nie będzie tras przez interfejs, a w FIB VPP — ścieżek przez
+    niego (próbka tras IPv6, które Linux miał przed usunięciem adresów). (ok, opis)."""
+    a = c.args
+    v6 = _sample([_v6_prefix(d) for f, d, _ in c.snap if f == 6], ROUTE_SAMPLE)
+    t0 = time.time()
+    lx, vp, err = [], [], ""
+    while True:
+        try:
+            lx = linux_routes(a["host"]) if a.get("host") else []
+            vp = vpp_paths_via(a["name"], a.get("idx"), v6) if v6 else []
+            err = ""
+        except (OSError, subprocess.SubprocessError, VppError) as ex:
+            err = str(ex)
+        if not err and not lx and not vp:
+            dt = time.time() - t0
+            return True, ("trasy wycofane po %.0f s" % dt) if dt >= 1 else ""
+        if time.time() - t0 >= ROUTE_WAIT:
+            break
+        time.sleep(ROUTE_POLL)
+    parts = []
+    if lx:
+        parts.append("Linux: %s (np. %s)" % (pl(len(lx), "trasa", "trasy", "tras"), "; ".join(x[2] for x in lx[:3])))
+    if vp:
+        parts.append("VPP: %s ze ścieżką przez %s (np. %s)" % (pl(len(vp), "wpis", "wpisy", "wpisów"), a["name"],
+                                                              ", ".join(vp[:3])))
+    if err:
+        parts.append("nie da się sprawdzić tras: %s" % err)
+    return False, ("po %.0f s wciąż: %s — %s NIE został usunięty (zostaje bez adresów). Wyłącz w BIRD to, co z niego "
+                   "korzysta (sesje BGP, trasy statyczne), i ponów: router-ifaces apply"
+                   % (time.time() - t0, "; ".join(parts), a["name"]))
+
+
 def run_cmd(c):
+    if c.kind == "wait":
+        return wait_routes_gone(c)
     if c.kind == "vpp":
         try:
             out = cli(c.args).strip()
@@ -1668,13 +1764,24 @@ def get_desired(path, quiet=False):
 def converge(desired, managed, verbose=True, max_pass=4):
     """Stosuje różnice aż do zgodności. Zwraca (wykonane, nieudane, pozostałe)."""
     done, failed, prev = [], [], None
+    blocked = set()     # interfejsy, przez które trasy nie zniknęły — nie usuwamy ich (ani w kolejnych przebiegach)
     for _ in range(max_pass):
         act = read_vpp(with_alias=True)
         cmds = plan(desired, act, managed)
         if not cmds or (prev is not None and cmds == prev):
             break
         for c in cmds:
+            if c.kind == "wait" and c.args["name"] not in blocked:
+                try:                # trasy sprzed usunięcia adresów: które wpisy FIB sprawdzić potem w VPP
+                    c.snap = linux_routes(c.args["host"]) if c.args.get("host") else []
+                except (OSError, subprocess.SubprocessError):
+                    c.snap = []
+        for c in cmds:
+            if c.iface in blocked:
+                continue
             ok, out = run_cmd(c)
+            if c.kind == "wait" and not ok:
+                blocked.add(c.iface)
             mark = "OK " if ok else "BŁĄD"
             log("%s %s%s" % (mark, c.text(), (" -> " + out.replace("\n", " | ")) if out else ""))
             if verbose:
@@ -1699,7 +1806,11 @@ def summarize(cmds, limit=8):
     g = dict(groups)
     for c in cmds:
         t = c.text().split() if c.kind == "vpp" else []
-        if c.kind == "ip" and c.args[2] == "addr":
+        if c.kind == "wait":
+            g["inne"].append("%s czeka na wycofanie tras" % c.args["name"])
+        elif c.kind == "ip" and c.args[:2] == ["netns", "exec"]:
+            g["inne"].append("link-local IPv6 %s" % c.args[-1].split("/")[3])
+        elif c.kind == "ip" and c.args[2] == "addr":
             g["dodano adresy" if c.args[3] == "add" else "usunięto adresy"].append("%s %s (Linux)" % (c.args[6], c.args[4]))
         elif c.kind == "ip":
             g["opisy"].append(c.args[5])
@@ -3001,18 +3112,34 @@ class NodeBusy:
         self.vppctl = vppctl or (lambda: runtime_text())
         self.reset()
 
+    # Węzły wejściowe trzeba odczytywać ponownie: tuż po starcie VPP porty nie są jeszcze podniesione, dpdk-input
+    # nie działa i "show runtime" go nie pokazuje — zostaje sam unix-epoll-input. Zapamiętany raz taki zbiór liczył
+    # dpdk-input jako graf: obiegi = wywołania unix-epoll-input, graf w każdym obiegu → 100% na wszystkich workerach
+    # (lodz2-vpp po samoczynnym restarcie VPP). Typ węzła się nie zmienia, więc zbiór tylko rośnie (suma odczytów);
+    # często w pierwszych minutach instancji, potem rzadko (show runtime robi barierę).
+    INPUTS_EARLY, INPUTS_EARLY_EVERY, INPUTS_EVERY = 300, 30, 300
+
     def reset(self):
         """Nowa instancja VPP: inne indeksy węzłów i liczniki od zera."""
         self.prev, self.inputs, self.inputs_t, self.last, self.note = None, None, -1e9, {}, ""
+        self.t_start = None
 
     def _load_inputs(self, t0):
-        if self.inputs or t0 - self.inputs_t < 30:          # raz na start VPP (show runtime robi barierę)
-            return
+        if self.t_start is None:
+            self.t_start = t0
+        every = self.INPUTS_EARLY_EVERY if not self.inputs or t0 - self.t_start < self.INPUTS_EARLY \
+            else self.INPUTS_EVERY
+        if t0 - self.inputs_t < every:
+            return False
         self.inputs_t = t0
         try:
-            self.inputs = input_nodes(self.vppctl() or "") or None
+            new = input_nodes(self.vppctl() or "")
         except (OSError, subprocess.SubprocessError):
-            self.inputs = None
+            return False
+        if not new or (self.inputs and new <= self.inputs):
+            return False
+        self.inputs = (self.inputs or set()) | new
+        return True
 
     def sample(self, stats, threads, t0):
         """Zajętość w % dla wątków z listy threads (indeksy VPP); None = nieznana."""
@@ -3022,7 +3149,8 @@ class NodeBusy:
         except (KeyError, IndexError, TypeError, ValueError):
             self.note = "brak liczników węzłów VPP (startup.conf: statseg { per-node-counters on }, restart VPP)"
             return [None for _ in threads]
-        self._load_inputs(t0)
+        if self._load_inputs(t0):
+            self.last = {}                                  # wyniki liczone z niepełnym zbiorem węzłów — do kosza
         if not self.inputs:
             self.note = "nie znam węzłów wejściowych VPP (vppctl show runtime)"
             return [None for _ in threads]
@@ -10617,6 +10745,13 @@ upgrade_vpp_sync() {   # po upgrade_script: stary układ izolacji/VPP → nowy (
   ((DRY_RUN)) && return 0
   [[ -f $g && -x /opt/router/install-router.sh ]] || return 0
   upgrade_remove_hsflowd
+  # full-coredump: zrzut całej pamięci VPP z hugepages (bufory, statseg) — na lodz2-vpp (16.11) zapis trwał ~5 min
+  # i tyle trwała przerwa w ruchu po awarii. Zwykły zrzut (bez hugepages) — VPP wstaje od razu. Bez restartu VPP:
+  # zadziała przy następnym starcie.
+  if grep -qE '^[[:space:]]*full-coredump[[:space:]]*$' /etc/vpp/startup.conf 2>/dev/null; then
+    sed -i -E '/^[[:space:]]*full-coredump[[:space:]]*$/d' /etc/vpp/startup.conf \
+      && say "startup.conf: bez full-coredump (po awarii VPP wstaje od razu, nie po kilku minutach zapisu zrzutu) — od następnego startu VPP"
+  fi
   thp=$(grep -o '\[[a-z]*\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]')
   # num-rx-desc/num-tx-desc i flowprobe nie są w vpp_conf_diff bez pełnego wykrywania sprzętu (które w trybie
   # upgrade jeszcze nie jest zrobione) — porównanie wprost z żywym startup.conf/bootstrap.vpp, $VPP_RX_DESC/
@@ -11654,7 +11789,6 @@ st_vpp_config() {
 unix {
   nodaemon
   log /var/log/vpp/vpp.log
-  full-coredump
   cli-listen /run/vpp/cli.sock
   gid vpp
   exec /etc/vpp/bootstrap.vpp
@@ -15589,7 +15723,7 @@ Co robi `apply`:
 
 - **Nowa linia** → tworzy VLAN (`create sub-interfaces … exact-match`) albo loopback, podnosi go i nadaje adresy. Odpowiednik w Linuksie (netns `dataplane`, ta sama nazwa, np. `hu0.100`) powstaje automatycznie, więc BIRD od razu widzi interfejs.
 - **Usunięty adres** → znika z VPP i z Linuksa (sesje BGP z tego adresu się zerwą — `diff` to pokazuje).
-- **Usunięta linia** → VLAN lub loopback jest kasowany. Dotyczy tylko obiektów, które utworzył `router-ifaces`; utworzone ręcznie przez `vppctl` są oznaczone `?` i pozostają nietknięte.
+- **Usunięta linia** → VLAN lub loopback jest kasowany. Dotyczy tylko obiektów, które utworzył `router-ifaces`; utworzone ręcznie przez `vppctl` są oznaczone `?` i pozostają nietknięte. Kolejność: najpierw adresy, potem `apply` czeka (do 120 s), aż BIRD przeniesie trasy prowadzące przez ten interfejs, a linux-nl wyczyści je w VPP — dopiero wtedy kasuje parę linux-cp i sam interfejs. Interfejs usunięty, gdy FIB VPP miał jeszcze przez niego ścieżki, położył VPP (lodz2-vpp, 16.11). Jeśli trasy nie znikną (np. trasa statyczna w BIRD przez ten VLAN), `apply` kończy się błędem, pokazuje te trasy i zostawia VLAN bez adresów — wyłącz w BIRD to, co z niego korzysta, i ponów `apply`.
 - **Zmieniony opis** → nowy ifAlias w SNMP (krótki restart `vpp-snmp-agent`, ruch bez zmian) i alias w Linuksie.
 - Plik jest jedynym źródłem prawdy: adres dodany ręcznie (`vppctl`, `ip addr`) na interfejsie z pliku zostanie przy `apply` usunięty.
 - Przed zmianami cały plik jest sprawdzany: numery VLAN, poprawność adresów, adresy sieci/rozgłoszeniowe, nakładające się podsieci, istnienie portu, duplikaty. **Jeden błąd = nic nie jest zmieniane.**

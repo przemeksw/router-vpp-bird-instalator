@@ -164,10 +164,31 @@ class TestWorkerPreempt(unittest.TestCase):
         self.assertEqual(nb.sample(st, [1, 2], 2.0), [0.0, 75.0])        # statseg jeszcze nie odświeżył: ostatni wynik
         st["/sys/node/clocks"] = [[0, 0, 0], [10, 0, 0], [10, 0, 0]]     # restart VPP: liczniki od zera
         self.assertEqual(nb.sample(st, [1, 2], 3.0), [0.0, 75.0])
-        self.assertEqual(calls["n"], 1)                                  # show runtime raz na instancję VPP
+        self.assertEqual(calls["n"], 1)                                  # show runtime nie przy każdej próbce
         nb.reset()
         self.assertEqual(nb.sample(St({}), [1], 4.0), [None])            # per-node-counters off
         self.assertIn("per-node-counters on", nb.note)
+
+    def test_node_busy_rereads_inputs_after_vpp_start(self):
+        """lodz2-vpp po samoczynnym restarcie VPP: show runtime odczytany, zanim porty wstały — bez dpdk-input,
+        tylko unix-epoll-input. dpdk-input liczony jako graf → 100% na każdym workerze przy wektorze 1,0."""
+        names = ["unix-epoll-input", "dpdk-input", "ethernet-input"]
+        rts = {"rt": "unix-epoll-input   polling  1 0 0 0 0\n"}           # porty jeszcze nie podniesione
+        nb = mon.NodeBusy(lambda: rts["rt"])
+
+        def st(k):    # k-ta sekunda: 1000 obiegów, odbiór 900 cykli, graf w 10 obiegach (10 cykli)
+            return {"/sys/node/names": names,
+                    "/sys/node/clocks": [[0, 0, 0], [10 * k, 900 * k, 10 * k]],
+                    "/sys/node/calls": [[0, 0, 0], [1000 * k, 1000 * k, 10 * k]]}
+        nb.sample(st(1), [1], 0.0)
+        self.assertEqual(nb.sample(st(2), [1], 1.0), [100.0])            # stary błąd: dpdk-input jako graf
+        rts["rt"] += "dpdk-input   polling  1 0 0 0 0\nethernet-input  active 1 1 0 0 1\n"   # porty wstały
+        self.assertEqual(nb.sample(st(3), [1], 20.0), [100.0])           # przed upływem 30 s bez ponownego odczytu
+        self.assertEqual(nb.sample(st(4), [1], 31.0), [2.1])             # ponowny odczyt: dpdk-input to odbiór
+        self.assertEqual(nb.inputs, {"unix-epoll-input", "dpdk-input"})
+        rts["rt"] = ""                                                   # chwilowo pusto (vppctl zawiódł)
+        self.assertEqual(nb.sample(st(5), [1], 62.0), [2.1])
+        self.assertEqual(nb.inputs, {"unix-epoll-input", "dpdk-input"})  # zbiór nie maleje
 
     def test_read_smi_from_msr(self):
         dev = os.path.join(self.tmp, "dev")

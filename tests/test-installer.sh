@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.54"                     '^SCRIPT_VERSION="1\.5\.54"' 1
+chk "wersja skryptu 1.5.55"                     '^SCRIPT_VERSION="1\.5\.55"' 1
 chk "karta: dopełnianie do linii, kompresja CQE włączona" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"' 1
 chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
 chk "startup.conf: ethernet default-mtu z PORT_MTU"  '^  default-mtu \$VPP_DEFAULT_MTU$' 1
@@ -49,6 +49,9 @@ chk "zmniejszony pierścień nie jest rozjazdem przy upgrade" 'INST_RX_DESC_CAP'
 chk "BIRD: priorytet na rdzeniach systemowych" '15-priority.conf' 2
 chk "router-monitor: zajętość workerów z liczników węzłów VPP" '^class NodeBusy:|^def busy_from_nodes\(dclocks, dcalls, is_input\):' 2
 chk "startup.conf: liczniki węzłów VPP (zajętość workerów)" '^  per-node-counters on$' 1
+chk "startup.conf: bez full-coredump (zrzut hugepages = minuty przerwy)" '^  full-coredump$' 0
+chk "upgrade usuwa full-coredump z działającego startup.conf" "sed -i -E '/\^\[\[:space:\]\]\*full-coredump" 1
+chk "router-ifaces: usunięcie VLAN-u czeka na wycofanie tras" '^def wait_routes_gone\(c\):|cmds.append\(Cmd\("~", "wait", ' 2
 chk "router-top: zajętość z router-monitora"  '^def monitor_busy\(\):' 1
 chk "router-snmp: rvWorkerBusyPct i rvVppWorkerBusyMax" '\(4, "rvWorkerBusyPct", "gauge"|\(24, "rvVppWorkerBusyMax", "gauge"' 2
 chk "instalacja pyta o adres loop0"            'read -rp "  Adres loop0 \[\$\{LOOP0_ADDR:--\}\]: " ans' 1
