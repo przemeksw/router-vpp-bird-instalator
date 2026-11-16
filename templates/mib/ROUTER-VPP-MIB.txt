@@ -480,7 +480,7 @@ rvWorkerBusyPct OBJECT-TYPE
     UNITS       "%"
     MAX-ACCESS  read-only
     STATUS      current
-    DESCRIPTION "Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana"
+    DESCRIPTION "Zajetosc workera w % (czas poza pustymi obiegami petli, z licznikow wezlow VPP); -1 = nieznana"
     ::= { rvWorkerEntry 4 }
 
 rvPortTable OBJECT-TYPE

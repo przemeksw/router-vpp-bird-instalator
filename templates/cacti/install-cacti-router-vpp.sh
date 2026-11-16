@@ -80,7 +80,7 @@ put router_vpp_workers.xml <<'ROUTER_VPP_XML'
 			<oid>.1.3.6.1.4.1.8072.9999.9999.630.3.1.3</oid>
 		</rvWorkerVector>
 		<rvWorkerBusyPct>
-			<name>Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana</name>
+			<name>Zajetosc workera w % (czas poza pustymi obiegami petli, z licznikow wezlow VPP); -1 = nieznana</name>
 			<method>walk</method>
 			<source>value</source>
 			<direction>output</direction>

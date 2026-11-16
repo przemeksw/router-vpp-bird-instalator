@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.52"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.53"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -2540,7 +2540,6 @@ prog_router_monitor() {
 # E-mail: zgłoszenia, eskalacje i zakończenia zdarzeń trafiają do kolejki router-notify
 #         (/var/spool/router-notify); przypomnienia "trwa Ns" nie. Co faktycznie idzie mailem,
 #         decyduje MAIL_SEND w /etc/router/notify.conf (router-notify categories).
-import hashlib
 import itertools
 import json
 import logging
@@ -2940,87 +2939,104 @@ def tasks_on_cpu(cpu, skip_pid=None, n=4):
 
 
 # ------------------------------------------------------------------ zajętość workerów w %
-# Wektor rośnie dopiero przy ~80% zajętości (paczki robią się duże, gdy brakuje pustych obiegów), więc do pytania
-# "ile zapasu" lepsza jest liczba pętli: pusty obieg pętli workera kosztuje stały czas, zależny od CPU, taktowania
-# i liczby kolejek, które worker sprawdza. Zajętość ≈ 1 − pętle/s ÷ pętle/s na luzie. "Na luzie" nie jest wpisane
-# na sztywno: każdy worker uczy się go sam (najwyższa wartość pętli/s zmierzona przy wektorze < IDLE_VEC, czyli
-# gdy prawie wszystkie obiegi są puste), więc działa na każdym serwerze. Wynik zapisywany w IDLE_FILE (czyta go
-# też router-top); unieważniany, gdy zmieni się liczba wątków VPP. Worker bez pomiaru dostaje medianę pozostałych
-# (te same rdzenie, ta sama konfiguracja), a bez żadnego pomiaru zajętość jest nieznana (None), nie zgadywana.
-IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", "/var/lib/router/vpp-idle-loops.json")
-IDLE_VEC = 1.1
-# Luz uczony TYLKO, gdy porty naprawdę odbierają (≥ IDLE_MIN_RX_PPS pkt/s łącznie). Bez ruchu (start VPP, porty
-# bez linku, kolejki RX, które się nie uzupełniają — num-rx-desc 32768 na lodz2-vpp) pusty obieg jest tańszy niż
-# w normalnej pracy: wyuczony wtedy "luz" (~7,7 M zamiast ~4,3 M pętli/s) dawał stałe ~45% zajętości bez ruchu.
-IDLE_MIN_RX_PPS = 1000.0
-IDLE_FMT = 3                                       # wersja pliku; 2: bez podpisu konfiguracji VPP, 1: bez warunku ruchu — odrzucane
+# Zajętość = część czasu workera, która NIE jest pustym obiegiem pętli. Worker VPP kręci się bez przerwy: w każdym
+# obiegu węzły wejściowe (dpdk-input i inne w stanie "polling") sprawdzają kolejki; gdy coś przyszło, rusza graf
+# (węzły "active": ethernet-input, ip4-lookup, …-tx). Obieg pusty to wolny czas, obieg z pakietami — praca.
+# Z liczników węzłów (statseg per-node-counters on; przyrosty, nie "show runtime") co sekundę:
+#   w = cykle węzłów grafu ÷ cykle wszystkich węzłów workera   (obróbka pakietów)
+#   n = obiegi z pakietami ÷ wszystkie obiegi                  (wywołania grafu ÷ wywołania węzła wejściowego)
+#   zajętość = w + (1 − w) · n     (w obiegu z pakietami odbiór też jest pracą)
+# Bez ruchu 0%, przy nasyceniu (pakiety w każdym obiegu) dokładnie 100%, pomiędzy — liniowo z czasem pracy.
+# Bez uczenia się "luzu" i bez stałych zależnych od sprzętu: same proporcje liczników jednego wątku, więc ani
+# częstotliwość/turbo procesora, ani architektura (x86 TSC / ARM cntvct), ani karta nie mają znaczenia.
+# Dawna metoda (1 − pętle/s ÷ wyuczone maksimum pętli/s) na lodz2-vpp 16.11 pokazywała ~50% przy realnych 2–4%:
+# koszt pustego obiegu zmienia się z ruchem, a wyuczone maksimum było przypadkowe (4,6–7,9 M pętli/s).
+def input_nodes(runtime_text):
+    """Nazwy węzłów wejściowych (stan polling/interrupt) z "vppctl show runtime" — węzły wołane w każdym obiegu."""
+    out = set()
+    for line in runtime_text.splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[1] in ("polling", "interrupt"):
+            out.add(f[0])
+    return out
 
 
-def vpp_config_sig(path=None):
-    """Podpis konfiguracji VPP (startup.conf bez komentarzy i pustych linii). Koszt pustego obiegu workera zależy od
-    niej (odbiór skalarny/wektorowy, kolejki, porty), więc luz uczony przy innej konfiguracji jest nieważny."""
-    try:
-        with open(path or STARTUP) as f:
-            lines = [line.split("#", 1)[0].strip() for line in f]
-    except OSError:
-        return ""
-    return hashlib.sha1("\n".join(x for x in lines if x).encode()).hexdigest()[:16]
+def runtime_text():
+    return subprocess.run(["vppctl", "show", "runtime"], capture_output=True, text=True, timeout=10).stdout
 
 
-class IdleLoops:
-    def __init__(self, path, sig=""):
-        self.path, self.idle, self.dirty, self.sig = path, [], False, sig
-        try:
-            with open(path) as f:
-                d = json.load(f)
-                ok = d.get("v") == IDLE_FMT and d.get("sig", "") == sig
-                self.idle = [float(x) for x in d.get("idle", [])] if ok else []
-        except (OSError, ValueError, TypeError, AttributeError):
-            self.idle = []
+def busy_from_nodes(dclocks, dcalls, is_input):
+    """Zajętość wątku w % z przyrostów liczników jego węzłów (listy po indeksie węzła); None, gdy brak danych."""
+    k_in = k_work = 0
+    loops = graph = 0
+    for j, c in enumerate(dclocks):
+        n = dcalls[j] if j < len(dcalls) else 0
+        if is_input[j]:
+            k_in += c
+            loops = max(loops, n)               # każdy węzeł wejściowy jest wołany raz na obieg
+        else:
+            k_work += c
+            graph = max(graph, n)               # ile razy ruszył graf ≈ obiegi z pakietami
+    if loops <= 0 or k_in + k_work <= 0:
+        return None
+    w = k_work / float(k_in + k_work)
+    n = min(1.0, graph / float(loops))
+    return round(100.0 * max(0.0, min(1.0, w + (1.0 - w) * n)), 1)
 
-    def reset_if(self, sig):
-        """VPP wstał z inną konfiguracją (np. odbiór wektorowy zamiast skalarnego): luz od nowa. Maksimum tylko rośnie,
-        więc stary, wyższy luz zawyżałby zajętość na stałe (lodz2-vpp 6.11: ~34% przy wektorze 1.0)."""
-        if sig != self.sig:
-            self.sig, self.idle, self.dirty = sig, [], True
 
-    def learn(self, vrow, lrow, rx_pps):
-        if rx_pps is None or rx_pps < IDLE_MIN_RX_PPS:
+def _rows(v):
+    """Licznik wektorowy z segmentu statystyk → [[wartość węzła j] wątku i]."""
+    return [[int(x or 0) for x in r] for r in v]
+
+
+class NodeBusy:
+    """Zajętość workerów z liczników węzłów VPP. Bez per-node-counters (stary startup.conf) — None i powód w note."""
+
+    def __init__(self, vppctl=None):
+        self.vppctl = vppctl or (lambda: runtime_text())
+        self.reset()
+
+    def reset(self):
+        """Nowa instancja VPP: inne indeksy węzłów i liczniki od zera."""
+        self.prev, self.inputs, self.inputs_t, self.last, self.note = None, None, -1e9, {}, ""
+
+    def _load_inputs(self, t0):
+        if self.inputs or t0 - self.inputs_t < 30:          # raz na start VPP (show runtime robi barierę)
             return
-        n = len(lrow)
-        if len(self.idle) != n:                      # inna liczba wątków VPP (set_workers) — uczymy się od nowa
-            self.idle, self.dirty = [0.0] * n, True
-        for i in range(n):
-            v = vrow[i] if i < len(vrow) else 99.0
-            lp = float(lrow[i] or 0)
-            if v < IDLE_VEC and lp > self.idle[i]:
-                self.idle[i], self.dirty = lp, True
-
-    def base(self, i):
-        if i < len(self.idle) and self.idle[i] > 0:
-            return self.idle[i]
-        known = sorted(x for x in self.idle[1:] if x > 0)
-        return known[len(known) // 2] if known else 0.0
-
-    def busy(self, i, loops):
-        """Zajętość workera w % (0–100) albo None, gdy pętle na luzie jeszcze nieznane."""
-        b = self.base(i)
-        if b <= 0:
-            return None
-        return round(100.0 * max(0.0, min(1.0, 1.0 - float(loops or 0) / b)), 1)
-
-    def save(self):
-        if not self.dirty:
-            return
+        self.inputs_t = t0
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"v": IDLE_FMT, "sig": self.sig, "idle": self.idle, "time": int(time.time())}, f)
-            os.replace(tmp, self.path)
-            self.dirty = False
-        except OSError:
-            pass
+            self.inputs = input_nodes(self.vppctl() or "") or None
+        except (OSError, subprocess.SubprocessError):
+            self.inputs = None
+
+    def sample(self, stats, threads, t0):
+        """Zajętość w % dla wątków z listy threads (indeksy VPP); None = nieznana."""
+        try:
+            names = [x.decode() if isinstance(x, bytes) else (x or "") for x in stats["/sys/node/names"]]
+            clocks, calls = _rows(stats["/sys/node/clocks"]), _rows(stats["/sys/node/calls"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            self.note = "brak liczników węzłów VPP (startup.conf: statseg { per-node-counters on }, restart VPP)"
+            return [None for _ in threads]
+        self._load_inputs(t0)
+        if not self.inputs:
+            self.note = "nie znam węzłów wejściowych VPP (vppctl show runtime)"
+            return [None for _ in threads]
+        self.note = ""
+        cur = (names, clocks, calls)
+        prev, self.prev = self.prev, cur
+        if prev is not None and prev[0] == names:
+            is_input = [n in self.inputs for n in names]
+            for i in threads:
+                if i >= len(clocks) or i >= len(prev[1]):
+                    continue
+                dk = [a - b for a, b in zip(clocks[i], prev[1][i])]
+                dc = [a - b for a, b in zip(calls[i], prev[2][i])]
+                if min(dk + dc + [0]) < 0:                 # liczniki od zera (restart VPP) — próbka pominięta
+                    continue
+                b = busy_from_nodes(dk, dc, is_input)
+                if b is not None:                          # statseg odświeża liczniki co update-interval: bez
+                    self.last[i] = b                       # przyrostu zostaje ostatni wynik
+        return [self.last.get(i) for i in threads]
 
 
 # ------------------------------------------------------------------ SMI (przerwania BIOS-u)
@@ -3161,7 +3177,7 @@ def main():
     vpp_pid, wk_prev, wk_who, wk_who_t, vpp_seen_t = None, {}, "", 0.0, 0.0
     smi_prev, smi_hist, wk_hist = {}, [], []
     miss_hist, rings = [], ring_capacity()   # (czas, wektor maks., wywłaszczenia, SMI) co sekundę — dla explain_miss
-    idle_loops, idle_saved_t, last_rx_pps = IdleLoops(IDLE_FILE, vpp_config_sig()), 0.0, None   # nie 'idle': ta nazwa jest niżej liczbą (rdzenie systemowe)
+    node_busy = NodeBusy()                   # nie 'idle'/'busy': te nazwy są niżej liczbami
     md_t = 0.0
     sum_t = time.time()
     win = {"vec": 0.0, "vec_w": "", "pps": 0.0, "bps": 0.0, "miss": 0, "punt": 0.0, "hk": 0.0}
@@ -3227,15 +3243,13 @@ def main():
                     sum(1 for _, v in workers if v >= CFG["VEC_WARN"]), len(workers))
                 state["vector_max"], state["vector_worker"] = wv, wi
                 state["vector_per_worker"] = [v for _, v in workers]
-                idle_loops.learn(vrow, lrow, last_rx_pps)
-                busy = [idle_loops.busy(i, lrow[i] if i < len(lrow) else 0) for i, _ in workers]
+                busy = node_busy.sample(stats, [i for i, _ in workers], t0)
                 state["worker_busy"] = busy
+                if node_busy.note:
+                    state["worker_busy_note"] = node_busy.note
                 known = [b for b in busy if b is not None]
                 if known:
                     state["worker_busy_max"] = max(known)
-                if t0 - idle_saved_t >= 60:
-                    idle_loops.save()
-                    idle_saved_t = t0
                 crit = wv >= CFG["VEC_CRIT"]
                 a_load.update(t0, wv >= CFG["VEC_WARN"], wv, txt,
                               sev=2 if crit else 4, mnem="LOAD_CRITICAL" if crit else "LOAD_HIGH")
@@ -3265,7 +3279,6 @@ def main():
                     tot_punt += d[5]
                 state["interfaces"] = ifs
                 state["rx_pps"], state["rx_bps"] = tot_pps, tot_bps
-                last_rx_pps = tot_pps
                 state["rx_miss_pps"], state["punt_pps"] = tot_miss, tot_punt
                 traffic = "rx %s pps / %sb/s" % (fmt_num(tot_pps), fmt_num(tot_bps))
                 # dlaczego: przeciążenie, wywłaszczenie, SMI albo nic z tego = burst jednego przepływu — szukane
@@ -3319,8 +3332,8 @@ def main():
             try:
                 if vpp_pid is None or not os.path.isdir("%s/%d/task" % (PROC, vpp_pid)):
                     vpp_pid, wk_prev, vpp_seen_t = find_vpp_pid(), {}, t0
-                    if vpp_pid:   # nowa instancja VPP: konfiguracja z jej startu (luz workerów, pojemność pierścieni)
-                        idle_loops.reset_if(vpp_config_sig())
+                    if vpp_pid:   # nowa instancja VPP: liczniki węzłów od zera, pojemność pierścieni z jej startu
+                        node_busy.reset()
                         rings = ring_capacity()
                 wk_now = read_worker_preempt(vpp_pid) if vpp_pid else {}
             except OSError:
@@ -6911,7 +6924,7 @@ TABLES = [
         (1, "rvWorkerIndex", "int", "", "Numer workera"),
         (2, "rvWorkerName", "string", "", "Worker i rdzen CPU"),
         (3, "rvWorkerVector", "gauge", "", "Sredni rozmiar wektora (1 = luz, 256 = nasycenie)"),
-        (4, "rvWorkerBusyPct", "gauge", "%", "Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana"),
+        (4, "rvWorkerBusyPct", "gauge", "%", "Zajetosc workera w % (czas poza pustymi obiegami petli, z licznikow wezlow VPP); -1 = nieznana"),
     ]),
     (4, "rvPortTable", "rvPortEntry", "Porty fizyczne VPP: straty i bledy", [
         (1, "rvPortIndex", "int", "", "Indeks"),
@@ -8002,75 +8015,41 @@ def bar(frac, width=24):
     return "█" * n + "░" * (width - n)
 
 
-# Zajętość workera w %: 1 − pętle/s ÷ pętle/s na luzie (pusty obieg kosztuje stały czas na danym CPU). Wartość
-# "na luzie" uczy się router-monitor (IDLE_FILE, przy wektorze < IDLE_VEC) — router-top ją czyta i douczą się sam,
-# więc działa na każdym serwerze bez ustawiania czegokolwiek. Bez pomiaru zajętość jest nieznana ("?").
-IDLE_FILE = os.environ.get("ROUTER_IDLE_LOOPS", ROOT + "/var/lib/router/vpp-idle-loops.json")
-IDLE_VEC = 1.1
-IDLE_MIN_RX_PPS = 1000.0                                               # luz tylko przy realnym ruchu (jak router-monitor)
-IDLE_FMT = 3
-IDLE_LOCAL = []                                                       # pomiary router-top (indeks = wątek VPP)
-IDLE_SIG = None                                                       # podpis konfiguracji VPP z IDLE_FILE
+# Zajętość workera w % liczy router-monitor co sekundę z liczników węzłów VPP (czas poza pustymi obiegami pętli:
+# 0% bez ruchu, 100% gdy pakiety są w każdym obiegu) — router-top bierze ją ze świeżego stanu monitora.
 BUSY_WARN, BUSY_CRIT = 70.0, 90.0
 
 
-def idle_loops(n):
-    """Pętle/s na luzie dla wątków 0..n-1: maksimum z IDLE_FILE i własnych pomiarów; brak → mediana innych workerów.
-    Gdy router-monitor zapisał luz dla innej konfiguracji VPP (restart VPP z nowym startup.conf), własne pomiary
-    z pamięci są odrzucane — były zrobione przy starym koszcie pustego obiegu."""
-    global IDLE_LOCAL, IDLE_SIG
+def monitor_busy():
+    """(zajętość workerów z router-monitora [indeks 0 = worker 1], powód braku) — None, gdy stan nieświeży."""
     try:
-        with open(IDLE_FILE) as f:
-            d = json.load(f)
-        saved = [float(x) for x in d.get("idle", [])] if d.get("v") == IDLE_FMT else []
-        sig = d.get("sig") if d.get("v") == IDLE_FMT else None
-    except (OSError, ValueError, TypeError, AttributeError):
-        saved, sig = [], None
-    if sig is not None and sig != IDLE_SIG:
-        if IDLE_SIG is not None:
-            IDLE_LOCAL = []
-        IDLE_SIG = sig
-    if len(saved) != n:
-        saved = []
-    out = [max(saved[i] if saved else 0.0, IDLE_LOCAL[i] if i < len(IDLE_LOCAL) else 0.0) for i in range(n)]
-    known = sorted(x for x in out[1:] if x > 0)
-    med = known[len(known) // 2] if known else 0.0
-    return [x if x > 0 else med for x in out]
+        with open(MON_STATE) as f:
+            mon = json.load(f)
+    except (OSError, ValueError):
+        return None, "router-monitor nie działa"
+    if not isinstance(mon, dict) or time.time() - mon.get("time", 0) >= 15:
+        return None, "router-monitor nie działa"
+    return mon.get("worker_busy") or [], mon.get("worker_busy_note", "")
 
 
-def learn_idle(workers, rx_pps):
-    global IDLE_LOCAL
-    if rx_pps is None or rx_pps < IDLE_MIN_RX_PPS:
-        return
-    if len(IDLE_LOCAL) != len(workers):
-        IDLE_LOCAL = [0.0] * len(workers)
-    for i, (vecr, loops) in enumerate(workers):
-        if vecr < IDLE_VEC and loops > IDLE_LOCAL[i]:
-            IDLE_LOCAL[i] = float(loops)
-
-
-def busy_pct(loops, base):
-    return None if base <= 0 else 100.0 * max(0.0, min(1.0, 1.0 - float(loops) / base))
-
-
-def screen_load(workers, rx_pps=None):
-    """Obciążenie VPP (odpowiednik QFP): zajętość workera w % (z pętli) i średni rozmiar wektora (1 = luz, 256 = nasycenie)."""
+def screen_load(workers, busy=None, note=""):
+    """Obciążenie VPP (odpowiednik QFP): zajętość workera w % (czas pracy, z router-monitora) i średni rozmiar
+    wektora (1 = luz, 256 = nasycenie)."""
     if not workers:
         return []
     warn = float(read_kv(MONITOR_CONF, "VEC_WARN", "64") or 64)
     crit = float(read_kv(MONITOR_CONF, "VEC_CRIT", "160") or 160)
     cores = [c for c in read_kv(ENV_FILE, "INST_WORKERS").split(",") if c]
-    learn_idle(workers, rx_pps)
-    base = idle_loops(len(workers))
+    busy = busy or []
     rows = [(i, w) for i, w in enumerate(workers) if i > 0] or [(0, workers[0])]   # 0 = wątek główny
-    lines = [("  OBCIĄŻENIE VPP (zajętość: z pętli/s względem luzu; wektor: 1 = luz, %d = alarm, %d = krytyczne, 256 = nasycenie)"
+    lines = [("  OBCIĄŻENIE VPP (zajętość: czas pracy workera; wektor: 1 = luz, %d = alarm, %d = krytyczne, 256 = nasycenie)"
               % (warn, crit), "head"),
              ("  %-22s %-24s %8s %8s  %-10s %16s" % ("wątek VPP", "zajętość", "%", "wektor", "stan", "pętle/s"), "head")]
     busys = []
-    for i, (vecr, loops) in rows:
-        b = busy_pct(loops, base[i] if i < len(base) else 0.0)
-        if vecr >= crit:                       # przy nasyceniu pętle prawie stają — liczymy jak 100%
-            b = 100.0 if b is None else max(b, 100.0 * min(1.0, vecr / 256.0), 95.0)
+    for k, (i, (vecr, loops)) in enumerate(rows):
+        b = busy[k] if k < len(busy) else None
+        if vecr >= crit:                       # przy nasyceniu liczymy jak 100%, nawet bez liczników węzłów
+            b = max(b or 0.0, 100.0 * min(1.0, vecr / 256.0), 95.0)
         busys.append(b)
         state, style = ("NASYCENIE", "miss") if vecr >= crit or (b or 0) >= BUSY_CRIT else \
             ("WYSOKIE", "warn") if vecr >= warn or (b or 0) >= BUSY_WARN else \
@@ -8084,8 +8063,8 @@ def screen_load(workers, rx_pps=None):
     lines.append(("  zajętość: najwyżej %s, średnio %s   wektor: najwyżej %.1f, średnio %.1f" % (
         "%.0f%%" % max(known) if known else "?", "%.0f%%" % (sum(known) / len(known)) if known else "?",
         peak, sum(w[0] for _i, w in rows) / len(rows)), "dim"))
-    lines.append(("  zajętość rośnie z ruchem od pierwszych pakietów; wektor dopiero przy ~80%% (trwale > %d = workery nie nadążają)%s"
-                  % (warn, "; ? = router-monitor jeszcze nie zmierzył pętli na luzie" if None in busys else ""), "dim"))
+    lines.append(("  zajętość = czas poza pustymi obiegami pętli (0%% bez ruchu, 100%% = pakiety w każdym obiegu); "
+                  "wektor rośnie dopiero przy ~80%%%s" % ("; ? = " + (note or "brak pomiaru") if None in busys else ""), "dim"))
     lines.append(("", ""))
     return lines
 
@@ -8109,7 +8088,10 @@ def if_rows(cur, prev, dt):
 
 def screen_vpp(cur, prev, dt):
     rows, tot = if_rows(cur, prev, dt)
-    lines = screen_load(cur.get("__workers__"), tot[0] if prev is not cur else None)
+    busy, note = cur.get("__busy__"), cur.get("__busy_note__", "")
+    if busy is None:
+        busy, note = monitor_busy()
+    lines = screen_load(cur.get("__workers__"), busy, note)
     if not lines:
         lines = [("  Brak danych o workerach VPP.", "dim"), ("", "")]
     nphys = sum(1 for n, _r in rows if "." not in n and not n.startswith("loop"))
@@ -8248,7 +8230,7 @@ def screen_queues(cur, prev, dt):
             lines.append(("  %-6s odrzucenia sprzętowe karty: %s/s" % ("", fmt_pps(disc)), "miss"))
         lines.append(("", ""))
     if not busy:
-        lines.append(("  zajętość „?”: router-monitor jeszcze nie zmierzył wydajności workerów (potrzebny ruch na portach)", "dim"))
+        lines.append(("  zajętość „?”: router-monitor jeszcze nie zmierzył zajętości workerów (czy działa i czy VPP ma statseg { per-node-counters on })", "dim"))
     lines.append(("  Zajętość workera: ile czasu rdzeń spędza na obsłudze pakietów (cały jego ruch, z obu portów).", "dim"))
     lines.append(("    0% = bezczynny, 100% = pracuje bez przerwy. Problem dopiero, gdy trwale > 70% albo pojawi się GUBIONE PAKIETY.",
                   "dim"))
@@ -11698,10 +11680,12 @@ ethernet {
   default-mtu $VPP_DEFAULT_MTU
 }
 
+# per-node-counters on: liczniki węzłów (cykle, wywołania) w segmencie statystyk — z nich router-monitor liczy
+# zajętość workerów w % (czas poza pustymi obiegami pętli) bez "vppctl show runtime" i bez stałych sprzętowych
 statseg {
   size 1G
   page-size default-hugepage
-  per-node-counters off
+  per-node-counters on
   update-interval 1
 }
 
@@ -15919,7 +15903,7 @@ Odświeżanie co sekundę, tylko odczyt (niczego nie zmienia). Klawisze: **1** V
 
 | Karta | Co pokazuje | Źródło |
 |---|---|---|
-| **1 VPP** | **obciążenie VPP** (odpowiednik QFP w Cisco): każdy worker z paskiem i średnim rozmiarem wektora — 1 = luz, 64 = alarm (`VEC_WARN`), 160 = krytyczne, 256 = nasycenie — oraz pętle/s; ruch łącznie na portach fizycznych (RX/TX Gb/s i pkt/s) i pakiety zgubione przez kartę | statystyki VPP (`/sys/vector_rate_per_worker`, liczniki interfejsów) |
+| **1 VPP** | **obciążenie VPP** (odpowiednik QFP w Cisco): każdy worker z paskiem zajętości (czas poza pustymi obiegami pętli: 0% bez ruchu, 100% = pakiety w każdym obiegu; liczona przez router-monitor z liczników węzłów VPP, `statseg { per-node-counters on }`) i średnim rozmiarem wektora — 1 = luz, 64 = alarm (`VEC_WARN`), 160 = krytyczne, 256 = nasycenie — oraz pętle/s; ruch łącznie na portach fizycznych (RX/TX Gb/s i pkt/s) i pakiety zgubione przez kartę | statystyki VPP (`/sys/vector_rate_per_worker`, liczniki interfejsów) |
 | **2 Interfejsy** | każdy port i jego VLAN-y (`└ hu0.100`) z opisem z `ifaces.conf`: RX/TX w Gb/s i pkt/s, pakiety zgubione przez kartę (czerwony wiersz); suma portów fizycznych — jak iptraf-ng | liczniki interfejsów VPP (segment statystyk), dokładne |
 | **3 Firewall** | każda reguła z opisem: pakiety razem, pkt/s, przepustowość; zielone = reguła łapie ruch, czerwone = `deny` w akcji | liczniki ACL (jak `router-fw counters`), dokładne |
 | **4 Guard** | stan ochrony, liczniki z szybkością (sprawdzone, przepuszczone, naruszenia, **odrzucone**, **RST wysłane**), najczęstsze źródła i atakowane adresy, **ostatnie 30 naruszeń**: źródło:port → cel:port, typ (syn-ack / rst / udp), powód, decyzja (ODRZUCONY / ODRZUCONY + RST / PRZESZEDŁ w monitorze) | liczniki węzłów VPP (dokładne) + dziennik wtyczki `show synack-guard events` |

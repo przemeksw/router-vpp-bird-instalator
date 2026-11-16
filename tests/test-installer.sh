@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.52"                     '^SCRIPT_VERSION="1\.5\.52"' 1
+chk "wersja skryptu 1.5.53"                     '^SCRIPT_VERSION="1\.5\.53"' 1
 chk "karta: dopełnianie do linii, kompresja CQE włączona" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"' 1
 chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
 chk "startup.conf: ethernet default-mtu z PORT_MTU"  '^  default-mtu \$VPP_DEFAULT_MTU$' 1
@@ -29,9 +29,7 @@ chk "loop0: zmiana adresu wymaga potwierdzenia"   'read -rp "  Na pewno zmienić
 chk "loop0: podmiana adresu w ifaces.conf"       'cur_l0=\$\(awk' 1
 l0q=$(grep -n 'read -rp "  Adres loop0' install-router.sh | cut -d: -f1); aud=$(grep -n '^# AUDYT SPRZĘTU' install-router.sh | cut -d: -f1)
 if [[ -n $l0q && -n $aud ]] && ((l0q < aud)); then pass=$((pass+1)); else fail=$((fail+1)); echo "BŁĄD  pytanie o loop0 nie jest przed audytem (linia $l0q, audyt $aud)"; fi
-chk "luz workerów uczony tylko przy realnym ruchu (monitor i top)" '^IDLE_MIN_RX_PPS = 1000\.0' 2
-chk "stary plik luzu (bez wersji/podpisu VPP) odrzucany" '^IDLE_FMT = 3' 2
-chk "router-monitor: pomiar luzu nie nadpisywany przez zmienną rdzeni systemowych" '^    idle_loops, idle_saved_t, last_rx_pps = IdleLoops|        for c, \(tot, idle\) in hk_now' 2
+chk "router-monitor: zajętość nie nadpisywana przez zmienną rdzeni systemowych" '^    node_busy = NodeBusy\(\)|        for c, \(tot, idle\) in hk_now' 2
 chk "router-monitor: nikt nie woła metod na 'idle'" '\bidle\.(learn|busy|save)\(' 0
 chk "lspci: LnkSta z tabulatorem (wcześniej nic nie łapało)" "LnkSta:\\[\\[:space:\\]\\]\\*Speed" 3
 chk "vpp_conf_diff porównuje pierścienie RX/TX" 'zmiana: pierścień RX' 1
@@ -49,9 +47,9 @@ chk "rdzeń główny i workery po rdzeniach systemowych" 'MAIN_CORE=\$\{PHYS\[HK
 chk "pierścień RX dopasowany do buforów" 'while \(\( BUFFERS > 0 && \$\(rings_need\) > BUFFERS' 1
 chk "zmniejszony pierścień nie jest rozjazdem przy upgrade" 'INST_RX_DESC_CAP' 3
 chk "BIRD: priorytet na rdzeniach systemowych" '15-priority.conf' 2
-chk "router-monitor: zajętość workerów z pętli (IdleLoops)" '^class IdleLoops:' 1
-chk "router-top: kolumna zajętości i pasek %"  '^def busy_pct\(loops, base\):' 1
-chk "luz uczony, nie wpisany na sztywno (router-monitor i router-top)" '^IDLE_VEC = 1\.1$' 2
+chk "router-monitor: zajętość workerów z liczników węzłów VPP" '^class NodeBusy:|^def busy_from_nodes\(dclocks, dcalls, is_input\):' 2
+chk "startup.conf: liczniki węzłów VPP (zajętość workerów)" '^  per-node-counters on$' 1
+chk "router-top: zajętość z router-monitora"  '^def monitor_busy\(\):' 1
 chk "router-snmp: rvWorkerBusyPct i rvVppWorkerBusyMax" '\(4, "rvWorkerBusyPct", "gauge"|\(24, "rvVppWorkerBusyMax", "gauge"' 2
 chk "instalacja pyta o adres loop0"            'read -rp "  Adres loop0 \[\$\{LOOP0_ADDR:--\}\]: " ans' 1
 chk "loop0 z router.env przy kolejnych uruchomieniach" 'INST_LOOP0_ADDR="\$\{LOOP0_ADDR:--\}"|^INST_LOOP0_ADDR=' 1

@@ -153,8 +153,7 @@ class TestIfacesScreen(unittest.TestCase):
             f.write('INST_WORKERS=5,6,7\n')
         top.ENV_FILE = self.root + "/etc/router/router.env"
         top.MONITOR_CONF = self.root + "/nie-ma"
-        top.IDLE_FILE = self.root + "/nie-ma-idle.json"
-        top.IDLE_LOCAL = []
+        top.MON_STATE = self.root + "/nie-ma-state.json"
         cur = {"hu0": (0, 0, 0, 0, 0), "__workers__": [[0.0, 0], [2.0, 9000000], [80.0, 40000], [200.0, 5000]]}
         lines = top.screen_vpp(cur, cur, 1.0)
         text = "\n".join(t for t, _s in lines)
@@ -167,46 +166,32 @@ class TestIfacesScreen(unittest.TestCase):
         self.assertIn("NASYCENIE", text)
         self.assertIn("wektor: najwyżej 200.0", text)
         w1 = [t for t, _s in lines if t.startswith("  worker 1 ")][0]
-        self.assertIn("?%", w1)                               # bez pomiaru luzu zajętość nieznana, nie zgadywana
-        self.assertIn("router-monitor jeszcze nie zmierzył", text)
+        self.assertIn("?%", w1)                               # bez router-monitora zajętość nieznana, nie zgadywana
+        self.assertIn("? = router-monitor nie działa", text)
         self.assertIn("RUCH ŁĄCZNIE", text)
         self.assertNotIn("OBCIĄŻENIE", "\n".join(t for t, _s in top.screen_ifaces(cur, cur, 1.0)))
 
-    def test_worker_busy_percent_from_loops(self):
+    def test_worker_busy_percent_from_monitor(self):
         top.ENV_FILE = self.root + "/nie-ma"
         top.MONITOR_CONF = self.root + "/nie-ma"
-        top.IDLE_LOCAL = []
-        top.IDLE_FILE = self.root + "/idle.json"
-        with open(top.IDLE_FILE, "w") as f:                    # router-monitor zmierzył luz: 4 M pętli/s
-            json.dump({"v": 3, "sig": "a", "idle": [100000, 4000000, 4000000, 0]}, f)
+        top.MON_STATE = self.root + "/state.json"
+        with open(top.MON_STATE, "w") as f:                    # router-monitor: zajętość z liczników węzłów VPP
+            json.dump({"time": time.time(), "worker_busy": [50.0, 90.0, None],
+                       "worker_busy_note": "brak liczników węzłów VPP"}, f)
         cur = {"__workers__": [[1.0, 90000], [1.0, 2000000], [1.0, 400000], [2.0, 3000000]]}
-        lines = top.screen_load(cur["__workers__"], 50000)
+        lines = top.screen_vpp(dict(cur, hu0=(0, 0, 0, 0, 0)), {}, 1.0)
         rows = {t.split("(")[0].strip(): (t, st) for t, st in lines if t.startswith("  worker ")}
-        self.assertIn(" 50%", rows["worker 1"][0])            # 2 M z 4 M pętli = połowa czasu na pakietach
+        self.assertIn(" 50%", rows["worker 1"][0])
         self.assertIn(" 90%", rows["worker 2"][0])            # wektor wciąż 1.0, a worker prawie pełny
         self.assertEqual(rows["worker 2"][1], "miss")         # stan liczy też zajętość, nie tylko wektor
-        self.assertIn(" 25%", rows["worker 3"][0])            # bez własnego pomiaru: mediana innych workerów
+        self.assertIn("?%", rows["worker 3"][0])
         self.assertIn("█" * 12, rows["worker 1"][0])          # pasek = zajętość (50% z 24 znaków)
-        self.assertIn("zajętość: najwyżej 90%", "\n".join(t for t, _s in lines))
-        # zmiana liczby workerów (set_workers): stary plik nie pasuje — uczymy się od nowa z próbki na luzie
-        top.IDLE_LOCAL = []
-        lines = top.screen_load([[1.0, 50000], [1.0, 3500000]], 0)
-        self.assertIn("?%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])   # bez ruchu: nie uczy się
-        lines = top.screen_load([[1.0, 50000], [1.0, 3500000]], 50000)
-        self.assertIn("  0%", [t for t, _s in lines if t.startswith("  worker 1 ")][0])
-
-    def test_idle_local_dropped_when_vpp_config_changes(self):
-        """router-top działający przez restart VPP z inną konfiguracją nie może trzymać starego luzu w pamięci."""
-        top.IDLE_LOCAL, top.IDLE_SIG = [], None
-        top.IDLE_FILE = self.root + "/idle-sig.json"
-        with open(top.IDLE_FILE, "w") as f:
-            json.dump({"v": 3, "sig": "skalarny", "idle": [100000, 4400000]}, f)
-        top.learn_idle([[1.0, 100000], [1.0, 4500000]], 50000)
-        self.assertEqual(top.idle_loops(2)[1], 4500000)            # własny pomiar wyższy niż z pliku
-        with open(top.IDLE_FILE, "w") as f:                          # VPP wstał z nową konfiguracją
-            json.dump({"v": 3, "sig": "wektorowy", "idle": [100000, 2950000]}, f)
-        self.assertEqual(top.idle_loops(2)[1], 2950000)            # stary pomiar z pamięci odrzucony
-        self.assertEqual(top.IDLE_LOCAL, [])
+        text = "\n".join(t for t, _s in lines)
+        self.assertIn("zajętość: najwyżej 90%", text)
+        self.assertIn("? = brak liczników węzłów VPP", text)
+        with open(top.MON_STATE, "w") as f:                    # stan sprzed minuty: monitor stoi
+            json.dump({"time": time.time() - 60, "worker_busy": [50.0, 90.0, 10.0]}, f)
+        self.assertEqual(top.monitor_busy(), (None, "router-monitor nie działa"))
 
     def test_scrolling_keeps_table_header(self):
         lines = [("naglowek", "head")] + [("wiersz %d" % i, "") for i in range(100)]

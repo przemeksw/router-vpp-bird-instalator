@@ -123,57 +123,51 @@ class TestWorkerPreempt(unittest.TestCase):
         self.assertEqual(mon.CFG["WK_WINDOW"], 60)
         self.assertEqual(mon.CFG["SMI_PER_S"], 5.0)
 
-    def test_idle_loops_learning_and_busy(self):
-        path = os.path.join(self.tmp, "idle", "vpp-idle-loops.json")
-        il = mon.IdleLoops(path)
-        self.assertIsNone(il.busy(1, 1000))                     # nic nie zmierzone: nieznane, nie 0%
-        il.learn([0.0, 1.0, 1.0], [100, 7700000, 7700000], 0)   # bez ruchu (start, kolejki RX stoją): NIE uczy się
-        self.assertIsNone(il.busy(1, 1000))
-        il.learn([0.0, 1.0, 50.0], [100, 4000000, 20000], 50000)  # worker 2 pod obciążeniem: nie uczy się
-        self.assertEqual(il.busy(1, 2000000), 50.0)
-        self.assertEqual(il.busy(2, 1000000), 75.0)              # mediana innych workerów (4 M)
-        il.learn([0.0, 1.0, 1.0], [100, 3000000, 4200000], 50000)  # mniejsza wartość nie obniża maksimum
-        self.assertEqual(il.base(1), 4000000)
-        self.assertEqual(il.busy(2, 0), 100.0)
-        il.save()
-        self.assertEqual(mon.IdleLoops(path).base(2), 4200000)  # przetrwa restart router-monitor
-        with open(path, "w") as f:                               # stary plik bez wersji (uczony bez warunku ruchu)
-            json.dump({"idle": [100, 7700000, 7700000]}, f)
-        self.assertIsNone(mon.IdleLoops(path).busy(1, 4000000))  # odrzucony — nie daje fałszywych 45%
-        il2 = mon.IdleLoops(path)
-        il2.learn([0.0, 1.0], [100, 3900000], 50000)            # inna liczba wątków: od nowa
-        self.assertEqual(il2.idle, [100.0, 3900000.0])
+    def test_input_nodes_from_show_runtime(self):
+        rt = ("Thread 1 vpp_wk_0 (lcore 5)\n"
+              "Time 10.0, 1.000000 sec internal node vector rate 1.22 loops/sec 2847774.90\n"
+              "             Name                 State         Calls          Vectors        Suspends         Clocks       Vectors/Call\n"
+              "dpdk-input                       polling         28477749          259720               0          1.23e3            .01\n"
+              "ethernet-input                   active             85000          259720               0          1.10e2           3.05\n"
+              "unix-epoll-input                 polling         28477749               0               0          2.00e1            0.00\n"
+              "rdma-input                  interrupt wait              0               0               0          0.00e0            0.00\n")
+        self.assertEqual(mon.input_nodes(rt), {"dpdk-input", "unix-epoll-input", "rdma-input"})
 
-    def test_idle_loops_relearned_after_vpp_config_change(self):
-        """Luz uczony przy innej konfiguracji VPP jest nieważny: lodz2-vpp 6.11 po zmianie odbioru ze skalarnego
-        na wektorowy (ethernet default-mtu) pusty obieg kosztował inaczej i wszystkie workery pokazywały ~34% przy
-        wektorze 1.0. Maksimum tylko rośnie, więc samo się nie poprawi — trzeba uczyć się od nowa."""
-        conf = os.path.join(self.tmp, "startup.conf")
-        with open(conf, "w") as f:
-            f.write("# komentarz\ndpdk {\n  dev 0000:82:00.0 { name hu0 }\n}\n")
-        sig = mon.vpp_config_sig(conf)
-        with open(conf, "w") as f:                                # inne komentarze i puste linie: ten sam podpis
-            f.write("dpdk {\n\n  dev 0000:82:00.0 { name hu0 }   # port\n}\n")
-        self.assertEqual(mon.vpp_config_sig(conf), sig)
-        with open(conf, "a") as f:
-            f.write("ethernet {\n  default-mtu 1500\n}\n")
-        sig2 = mon.vpp_config_sig(conf)
-        self.assertNotEqual(sig2, sig)
-        path = os.path.join(self.tmp, "idle2", "vpp-idle-loops.json")
-        il = mon.IdleLoops(path, sig)
-        il.learn([0.0, 1.0], [100, 4400000], 50000)
-        il.save()
-        self.assertEqual(mon.IdleLoops(path, sig).base(1), 4400000)   # ta sama konfiguracja: luz zostaje
-        self.assertIsNone(mon.IdleLoops(path, sig2).busy(1, 2900000))  # inna: odrzucony, nie fałszywe 34%
-        il.reset_if(sig)
-        self.assertEqual(il.base(1), 4400000)
-        il.reset_if(sig2)                                          # VPP wstał z nową konfiguracją
-        self.assertIsNone(il.busy(1, 2900000))
-        il.learn([0.0, 1.0], [100, 2950000], 50000)
-        self.assertEqual(il.busy(1, 2950000), 0.0)
-        il.save()
-        with open(path) as f:
-            self.assertEqual(json.load(f)["sig"], sig2)
+    def test_busy_from_nodes_low_mid_and_saturated(self):
+        """lodz2-vpp 16.11 (wk_0): 3,1% czasu w grafie, 82,8% w odbiorze, graf w 0,3% obiegów → ~3,9%, a nie ~50%
+        ze starej metody (1 − pętle/s ÷ wyuczone maksimum)."""
+        inp = [True, False, False, True]
+        self.assertEqual(mon.busy_from_nodes([900, 0, 0, 100], [1000, 0, 0, 1000], inp), 0.0)        # bez ruchu
+        self.assertEqual(mon.busy_from_nodes([818, 16, 15, 10], [1000, 3, 3, 1000], inp), 3.9)
+        self.assertEqual(mon.busy_from_nodes([400, 300, 300, 0], [1000, 500, 500, 1000], inp), 80.0)
+        self.assertEqual(mon.busy_from_nodes([100, 500, 400, 0], [1000, 1000, 1000, 1000], inp), 100.0)  # pakiety w każdym obiegu
+        self.assertEqual(mon.busy_from_nodes([10, 50, 40, 0], [10, 30, 30, 10], inp), 100.0)   # graf częściej niż obiegi: ucięte
+        self.assertIsNone(mon.busy_from_nodes([5, 5, 5, 5], [0, 1, 1, 0], inp))               # brak obiegów
+
+    def test_node_busy_from_stats_deltas(self):
+        class St(dict):
+            pass
+        names = ["dpdk-input", "ethernet-input", "ip4-lookup"]
+        calls = {"n": 0}
+
+        def rt():
+            calls["n"] += 1
+            return "dpdk-input   polling  1 0 0 0 0\nethernet-input  active 1 1 0 0 1\n"
+        nb = mon.NodeBusy(rt)
+        st = St({"/sys/node/names": names,
+                 "/sys/node/clocks": [[0, 0, 0], [1000, 0, 0], [5000, 100, 100]],
+                 "/sys/node/calls": [[0, 0, 0], [100, 0, 0], [500, 0, 0]]})
+        self.assertEqual(nb.sample(st, [1, 2], 0.0), [None, None])       # pierwsza próbka: brak przyrostu
+        st["/sys/node/clocks"] = [[0, 0, 0], [2000, 0, 0], [5500, 350, 350]]
+        st["/sys/node/calls"] = [[0, 0, 0], [200, 0, 0], [600, 50, 50]]
+        self.assertEqual(nb.sample(st, [1, 2], 1.0), [0.0, 75.0])        # w = 500/1000, graf w 50% obiegów
+        self.assertEqual(nb.sample(st, [1, 2], 2.0), [0.0, 75.0])        # statseg jeszcze nie odświeżył: ostatni wynik
+        st["/sys/node/clocks"] = [[0, 0, 0], [10, 0, 0], [10, 0, 0]]     # restart VPP: liczniki od zera
+        self.assertEqual(nb.sample(st, [1, 2], 3.0), [0.0, 75.0])
+        self.assertEqual(calls["n"], 1)                                  # show runtime raz na instancję VPP
+        nb.reset()
+        self.assertEqual(nb.sample(St({}), [1], 4.0), [None])            # per-node-counters off
+        self.assertIn("per-node-counters on", nb.note)
 
     def test_read_smi_from_msr(self):
         dev = os.path.join(self.tmp, "dev")
@@ -235,6 +229,9 @@ class _FakeStats:
             "/if/names": ["local0", "hu0", "hu1"],
             "/sys/vector_rate_per_worker": [[0.0, 1.0, 3.0]],
             "/sys/loops_per_worker": [[100000.0, 4000000.0, 2000000.0]],
+            "/sys/node/names": ["dpdk-input", "ethernet-input", "ip4-lookup"],
+            "/sys/node/clocks": [[0, 0, 0], [n * 1000, 0, 0], [n * 400, n * 300, n * 300]],
+            "/sys/node/calls": [[0, 0, 0], [n * 100, 0, 0], [n * 100, n * 50, n * 50]],
             "/if/rx": _Counter([0, n * 1000, n * 500]), "/if/tx": _Counter([0, n * 1000, n * 500]),
             "/if/rx-miss": _Counter([0, 0, 0]), "/if/rx-no-buf": _Counter([0, 0, 0]),
             "/if/punt": _Counter([0, 0, 0]),
@@ -348,7 +345,7 @@ class TestMainLoop(unittest.TestCase):
 
         try:
             with mock.patch.dict(sys.modules, {"vpp_papi": papi, "vpp_papi.vpp_stats": stats_mod}), \
-                    mock.patch.object(mon, "IDLE_FILE", tmp + "/idle.json"), \
+                    mock.patch.object(mon, "runtime_text", lambda: "dpdk-input  polling 1 0 0 0 0\n"), \
                     mock.patch.object(mon, "PROC", tmp), mock.patch.object(mon, "SPOOL", tmp + "/spool"), \
                     mock.patch.object(mon, "STARTUP", tmp + "/startup.conf"), \
                     mock.patch.object(mon, "read_proc_stat", lambda: {}), \
@@ -374,8 +371,8 @@ class TestMainLoop(unittest.TestCase):
         self.assertEqual([e for e in emitted if e[0] in ("DOWN", "UP")], [])
         with open(tmp + "/state.json") as f:
             st = json.load(f)
-        self.assertEqual(st["worker_busy"], [0.0, 50.0])             # worker 2: 2 M z 4 M pętli (mediana luzu)
-        self.assertEqual(st["worker_busy_max"], 50.0)
+        self.assertEqual(st["worker_busy"], [0.0, 80.0])             # worker 2: 60% cykli w grafie, graf w 50% obiegów
+        self.assertEqual(st["worker_busy_max"], 80.0)
         self.assertEqual(st["alarms"], [])                         # bez zdarzeń: pusta lista aktywnych alarmów
 
 

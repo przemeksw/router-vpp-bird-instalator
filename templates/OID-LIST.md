@@ -38,7 +38,7 @@ Typy: int = Integer32, gauge = Gauge32, counter = Counter32, counter64 = Counter
 | `1.3.6.1.4.1.8072.9999.9999.630.3.1.1` | rvWorkerIndex | int |  | Numer workera |
 | `1.3.6.1.4.1.8072.9999.9999.630.3.1.2` | rvWorkerName | string |  | Worker i rdzen CPU |
 | `1.3.6.1.4.1.8072.9999.9999.630.3.1.3` | rvWorkerVector | gauge |  | Sredni rozmiar wektora (1 = luz, 256 = nasycenie) |
-| `1.3.6.1.4.1.8072.9999.9999.630.3.1.4` | rvWorkerBusyPct | gauge | % | Zajetosc workera w % (1 - petle/s / petle/s na luzie); -1 = jeszcze nieznana |
+| `1.3.6.1.4.1.8072.9999.9999.630.3.1.4` | rvWorkerBusyPct | gauge | % | Zajetosc workera w % (czas poza pustymi obiegami petli, z licznikow wezlow VPP); -1 = nieznana |
 | `1.3.6.1.4.1.8072.9999.9999.630.4.1.1` | rvPortIndex | int |  | Indeks |
 | `1.3.6.1.4.1.8072.9999.9999.630.4.1.2` | rvPortName | string |  | Nazwa portu w VPP |
 | `1.3.6.1.4.1.8072.9999.9999.630.4.1.3` | rvPortRxMiss | counter64 |  | rx-miss: karta zgubila pakiety, bo VPP nie nadazal |
