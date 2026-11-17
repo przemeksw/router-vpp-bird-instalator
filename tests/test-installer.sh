@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.56"                     '^SCRIPT_VERSION="1\.5\.56"' 1
+chk "wersja skryptu 1.5.57"                     '^SCRIPT_VERSION="1\.5\.57"' 1
 chk "karta: dopełnianie do linii, kompresja CQE włączona" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"' 1
 chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
 chk "startup.conf: ethernet default-mtu z PORT_MTU"  '^  default-mtu \$VPP_DEFAULT_MTU$' 1
@@ -117,7 +117,15 @@ chk "netns: arp_accept=2 (odpowiedzi ARP na zapytania VPP)" '^net\.ipv4\.conf\.(
 chk "netns: accept_untracked_na=2 (IPv6)"     '^net\.ipv6\.conf\.(all|default)\.accept_untracked_na = 2$' 2
 chk "netns: accept_untracked_na na istniejących interfejsach" 'for f in /proc/sys/net/ipv6/conf/\*/accept_untracked_na' 1
 chk "dataplane_sysctl: instalacja i upgrade_script" '^ +(\(\(DRY_RUN\)\) \|\| )?dataplane_sysctl$' 3
-chk "netns: sysctl przy każdym starcie"       'ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/router/dataplane-sysctl\.conf' 1
+# upgrade_script kończy się (exit) w połowie pliku — funkcje, które wywołuje, muszą być zdefiniowane wcześniej
+# (1.5.56: "dataplane_sysctl: nie znaleziono polecenia" na lodz2-vpp)
+late=$(L=$(grep -n '^if \[\[ \$MODE == upgrade \]\]' install-router.sh | cut -d: -f1)
+  body=$(awk -v L="$L" 'NR<L' install-router.sh | sed -n '/^do_upgrade() {/,/^}/p;/^upgrade_[a-z_]*() {/,/^}/p' | grep -vE '^[[:space:]]*#')
+  for f in $(sed -n "$((L + 1)),\$p" install-router.sh | grep -oE '^[a-z_][a-z0-9_]*\(\) *\{' | sed 's/().*//' | sort -u); do
+    grep -qw -- "$f" <<<"$body" && printf '%s ' "$f"; done)
+if [[ -z $late ]]; then pass=$((pass + 1)); echo "  OK    upgrade_script: wywoływane funkcje zdefiniowane przed jego exit"
+else fail=$((fail + 1)); echo "  BŁĄD  upgrade_script wywołuje funkcje zdefiniowane dopiero po exit: $late"; fi
+chk "netns: sysctl przy każdym starcie"      'ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/router/dataplane-sysctl\.conf' 1
 chk "router-ifaces: ra-suppress"              'ip6 nd %s ra-suppress' 1
 chk "router-ifaces: disable ip6 interface"    'disable ip6 interface %s' 1
 chk "router-top instalowany (etap 18)"        'prog_router_top \| put_file /opt/router/bin/router-top' 1

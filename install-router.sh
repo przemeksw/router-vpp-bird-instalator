@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.56"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.57"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -10531,6 +10531,42 @@ pass_persist .1.3.6.1.2.1.15 /opt/router/bin/router-snmp pass .1.3.6.1.2.1.15
 EOF
 }
 
+dataplane_sysctl() {   # /etc/router/dataplane-sysctl.conf: IPv6 bez RA/SLAAC, arp_accept/accept_untracked_na (instalacja i upgrade_script)
+  # --- IPv6 w netns dataplane: bez RA/SLAAC/przekierowań, nowe interfejsy bez link-local (linux-cp nie włącza
+  #     wtedy IPv6 w VPP). IPv6 działa tylko tam, gdzie ifaces.conf ma adres IPv6 (router-ifaces).
+  put_file /etc/router/dataplane-sysctl.conf "netns dataplane: IPv6 bez RA/SLAAC, interfejsy bez link-local" 644 <<'EOF'
+# install-router.sh — netns dataplane (interfejsy linux-cp): wczytywane przy tworzeniu netns.
+# Router nie przyjmuje ogłoszeń RA ani przekierowań, nie konfiguruje sobie adresów (SLAAC) i nie nadaje
+# adresów link-local — IPv6 jest tylko na interfejsach z adresem IPv6 w /etc/router/ifaces.conf.
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.autoconf = 0
+net.ipv6.conf.default.autoconf = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.default.addr_gen_mode = 1
+# linux-cp: tablicę sąsiadów VPP wypełnia Linux (linux-nl kopiuje ją do VPP). Odpowiedź ARP/NA na zapytanie
+# wysłane przez VPP trafia do Linuksa, który domyślnie (0) ją odrzuca, bo sam nie pytał — VPP nie dostawał MAC
+# next-hopa i ruch do niego ginął, dopóki Linux sam nie zapytał (lodz2-vpp, route server TPIX, 17.11.2026).
+# 2 = przyjmuj tylko od adresów z podsieci interfejsu (kernel ≥ 6.0).
+net.ipv4.conf.all.arp_accept = 2
+net.ipv4.conf.default.arp_accept = 2
+net.ipv6.conf.all.accept_untracked_na = 2
+net.ipv6.conf.default.accept_untracked_na = 2
+EOF
+  printf '[Service]
+ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/router/dataplane-sysctl.conf
+' \
+    | put_file /etc/systemd/system/netns-dataplane.service.d/20-dataplane-sysctl.conf "netns dataplane: ustawienia IPv6 przy każdym starcie"
+  systemctl daemon-reload
+  ip netns exec dataplane sysctl -q -p /etc/router/dataplane-sysctl.conf 2>/dev/null || warn "nie ustawiono IPv6 w netns dataplane"
+  # accept_untracked_na działa per interfejs ("default" dostają tylko nowe) — istniejące ustawiamy wprost
+  ip netns exec dataplane sh -c 'for f in /proc/sys/net/ipv6/conf/*/accept_untracked_na; do echo 2 >"$f"; done' 2>/dev/null || true
+  ok "netns dataplane: IPv6 bez RA i SLAAC (tylko interfejsy z adresem IPv6 w ifaces.conf); odpowiedzi ARP/NA na zapytania VPP przyjmowane (arp_accept=$(ip netns exec dataplane sysctl -n net.ipv4.conf.all.arp_accept 2>/dev/null))"
+}
+
 # router-snmp: usługa kolektora, blok pass_persist w obu snmpd, IF-MIB w dataplane tylko z VPP (instalacja i upgrade_script)
 # Stały ifIndex (SNMP = NetFlow, jak "snmp ifindex persist" w Cisco): moduł /opt/router/lib/router_ifindex.py
 # i poprawka vpp-snmp-agent (ifIndex z trwałej tabeli zamiast 1000 + sw_if_index). Poprawka jest nakładana na kod
@@ -15042,42 +15078,6 @@ EOF
     warn "konfiguracja BIRD z RPKI nie przechodzi kontroli — sprawdź /etc/bird/conf.d/05-rpki.conf"
   fi
   ok "RPKI: Routinator działa, BIRD sprawdza trasy; odrzucanie WYŁĄCZONE (router-rpki enable). Pierwsze pobranie danych trwa 5–15 min."
-}
-
-dataplane_sysctl() {   # /etc/router/dataplane-sysctl.conf: IPv6 bez RA/SLAAC, arp_accept/accept_untracked_na (instalacja i upgrade_script)
-  # --- IPv6 w netns dataplane: bez RA/SLAAC/przekierowań, nowe interfejsy bez link-local (linux-cp nie włącza
-  #     wtedy IPv6 w VPP). IPv6 działa tylko tam, gdzie ifaces.conf ma adres IPv6 (router-ifaces).
-  put_file /etc/router/dataplane-sysctl.conf "netns dataplane: IPv6 bez RA/SLAAC, interfejsy bez link-local" 644 <<'EOF'
-# install-router.sh — netns dataplane (interfejsy linux-cp): wczytywane przy tworzeniu netns.
-# Router nie przyjmuje ogłoszeń RA ani przekierowań, nie konfiguruje sobie adresów (SLAAC) i nie nadaje
-# adresów link-local — IPv6 jest tylko na interfejsach z adresem IPv6 w /etc/router/ifaces.conf.
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
-net.ipv6.conf.all.autoconf = 0
-net.ipv6.conf.default.autoconf = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.default.addr_gen_mode = 1
-# linux-cp: tablicę sąsiadów VPP wypełnia Linux (linux-nl kopiuje ją do VPP). Odpowiedź ARP/NA na zapytanie
-# wysłane przez VPP trafia do Linuksa, który domyślnie (0) ją odrzuca, bo sam nie pytał — VPP nie dostawał MAC
-# next-hopa i ruch do niego ginął, dopóki Linux sam nie zapytał (lodz2-vpp, route server TPIX, 17.11.2026).
-# 2 = przyjmuj tylko od adresów z podsieci interfejsu (kernel ≥ 6.0).
-net.ipv4.conf.all.arp_accept = 2
-net.ipv4.conf.default.arp_accept = 2
-net.ipv6.conf.all.accept_untracked_na = 2
-net.ipv6.conf.default.accept_untracked_na = 2
-EOF
-  printf '[Service]
-ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/router/dataplane-sysctl.conf
-' \
-    | put_file /etc/systemd/system/netns-dataplane.service.d/20-dataplane-sysctl.conf "netns dataplane: ustawienia IPv6 przy każdym starcie"
-  systemctl daemon-reload
-  ip netns exec dataplane sysctl -q -p /etc/router/dataplane-sysctl.conf 2>/dev/null || warn "nie ustawiono IPv6 w netns dataplane"
-  # accept_untracked_na działa per interfejs ("default" dostają tylko nowe) — istniejące ustawiamy wprost
-  ip netns exec dataplane sh -c 'for f in /proc/sys/net/ipv6/conf/*/accept_untracked_na; do echo 2 >"$f"; done' 2>/dev/null || true
-  ok "netns dataplane: IPv6 bez RA i SLAAC (tylko interfejsy z adresem IPv6 w ifaces.conf); odpowiedzi ARP/NA na zapytania VPP przyjmowane (arp_accept=$(ip netns exec dataplane sysctl -n net.ipv4.conf.all.arp_accept 2>/dev/null))"
 }
 
 st_system() {
