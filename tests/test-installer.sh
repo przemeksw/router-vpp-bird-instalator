@@ -11,7 +11,7 @@ chk() {   # chk <opis> <wyrażenie regularne> [oczekiwana liczba trafień]
   else fail=$((fail + 1)); printf '  BŁĄD  %s (trafień: %s)\n' "$1" "$n"; fi
 }
 echo "8. instalator: router-fw"
-chk "wersja skryptu 1.5.55"                     '^SCRIPT_VERSION="1\.5\.55"' 1
+chk "wersja skryptu 1.5.56"                     '^SCRIPT_VERSION="1\.5\.56"' 1
 chk "karta: dopełnianie do linii, kompresja CQE włączona" '^VPP_NIC_DEVARGS="rxq_pkt_pad_en=1"' 1
 chk "vpp_conf_diff i upgrade wykrywają brak devargs" "grep -oE 'devargs \[\^ \}\]\+'" 2
 chk "startup.conf: ethernet default-mtu z PORT_MTU"  '^  default-mtu \$VPP_DEFAULT_MTU$' 1
@@ -113,6 +113,10 @@ chk "VPP: limit i wygasanie ARP/ND"           'set ip neighbor-config ip4 limit 
 chk "bootstrap.vpp z neigh_vpp_cmds"          '^    neigh_vpp_cmds$' 1
 chk "netns: bez RA"                           '^net\.ipv6\.conf\.default\.accept_ra = 0$' 1
 chk "netns: nowe interfejsy bez link-local"   '^net\.ipv6\.conf\.default\.addr_gen_mode = 1$' 1
+chk "netns: arp_accept=2 (odpowiedzi ARP na zapytania VPP)" '^net\.ipv4\.conf\.(all|default)\.arp_accept = 2$' 2
+chk "netns: accept_untracked_na=2 (IPv6)"     '^net\.ipv6\.conf\.(all|default)\.accept_untracked_na = 2$' 2
+chk "netns: accept_untracked_na na istniejących interfejsach" 'for f in /proc/sys/net/ipv6/conf/\*/accept_untracked_na' 1
+chk "dataplane_sysctl: instalacja i upgrade_script" '^ +(\(\(DRY_RUN\)\) \|\| )?dataplane_sysctl$' 3
 chk "netns: sysctl przy każdym starcie"       'ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/router/dataplane-sysctl\.conf' 1
 chk "router-ifaces: ra-suppress"              'ip6 nd %s ra-suppress' 1
 chk "router-ifaces: disable ip6 interface"    'disable ip6 interface %s' 1
