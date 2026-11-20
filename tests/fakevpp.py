@@ -101,6 +101,42 @@ def vppctl(cmd):
             st["routes"] = [r for r in st.get("routes", []) if not (r["via"] == t[3] and r["dst"] == t[4])]
         elif t[:2] == ["fake", "lag"]:            # fake lag <bird> <linux-nl>
             st["bird_lag"], st["nl_lag"] = int(t[2]), int(t[3])
+        elif t[:3] == ["fake", "lcp-rt", "add"]:   # fake lcp-rt add <prefiks>: trasa z Linuksa (np. BIRD direct)
+            st.setdefault("lcprt", []).append(t[3])
+        elif t[:3] == ["fake", "lcp-rt", "clear"]:
+            st["lcprt"] = []
+        elif t[:2] == ["fake", "route-del-fail"]:   # fake route-del-fail on|off: "ip route del" nic nie robi
+            st["route_del_fail"] = t[2] == "on"
+        elif t[:2] == ["ip", "route"] and t[2] in ("add", "del") and len(t) == 6 and t[4] == "via":
+            pfx, n = str(ipaddress.ip_network(t[3], strict=False)), t[5]
+            if n not in st["if"]:
+                raise ValueError("unknown input `%s'" % n)
+            vr = st.setdefault("vroutes", [])
+            st.setdefault("route_log", []).append("%s %s %s" % (t[2], pfx, n))
+            if t[2] == "add":
+                if [pfx, n] not in vr:
+                    vr.append([pfx, n])
+            elif not st.get("route_del_fail") and [pfx, n] in vr:
+                vr.remove([pfx, n])
+        elif t[:2] in (["show", "ip"], ["show", "ip6"]) and t[2:3] == ["fib"] and len(t) == 4 \
+                and (t[1] == "ip" or not any(r["dst"] == t[3] for r in st.get("routes", []))):
+            # najdłuższe dopasowanie: trasy z "ip route add", podsieci podłączone, trasa domyślna
+            want = ipaddress.ip_network(t[3], strict=False)
+            cand = [(ipaddress.ip_network(p), "cli") for p, _ in st.get("vroutes", [])]
+            for i in st["if"].values():
+                cand += [(ipaddress.ip_interface(a).network, "interface") for a in i["addrs"]]
+            cand = [(p, s) for p, s in cand if p.version == want.version and want.subnet_of(p)]
+            if cand:
+                best = max(p.prefixlen for p, _ in cand)
+                p = next(p for p, _ in cand if p.prefixlen == best)
+                srcs = sorted({s for q, s in cand if q == p} | ({"lcp-rt-dynamic"} if str(p) in st.get("lcprt", []) else set()))
+            else:
+                p, srcs = ipaddress.ip_network("::/0" if want.version == 6 else "0.0.0.0/0"), ["default-route"]
+            out = "ipv%d-VRF:0, fib_index:0, flow hash:[src dst sport dport proto flowlabel ] epoch:0 flags:none\n" \
+                  % want.version
+            out += "%s fib:0 index:%d locks:2\n" % (p, 10 + p.prefixlen)
+            for s in srcs:
+                out += "  %s refs:1 entry-flags:attached, src-flags:added,\n" % s
         elif t[:3] == ["show", "ip6", "fib"] and len(t) == 4:
             for r in st.get("routes", []):
                 if r["vpp"] and r["dst"] == t[3]:

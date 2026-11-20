@@ -54,7 +54,7 @@
 # =============================================================================
 set -Euo pipefail
 
-SCRIPT_VERSION="1.5.57"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
+SCRIPT_VERSION="1.5.58"        # wersja skryptu; podbij przy każdej zmianie programów (upgrade_script porównuje treść plików)
 # ============================ USTAWIENIA =====================================
 NIC_PCI_DEFAULT="0000:82:00.0 0000:82:00.1" # porty Mellanox, które przejmie VPP
 VPP_VERSION="v26.06"           # tag wydania VPP
@@ -891,6 +891,9 @@ prog_router_ifaces() {
   router-ifaces optics       porty i wkładki: admin/link/prędkość z VPP, DDM z ethtool -m (moc TX/RX dBm, bias, temp.);
                              -w odświeża co 10 s (--interval SEK), --json
   router-ifaces errors       błędy portów (CRC, symbol, discards, rx-miss, drops…) z przyrostem; -w co 10 s
+  router-ifaces glean-fix    odśwież adres źródłowy zapytań ARP/ND VPP na wszystkich interfejsach (bez przerwy
+                             w ruchu; apply robi to samo dla każdego nowo dodanego adresu) — gdy VPP pyta
+                             "tell <adres sieci>" i nie rozwiązuje sąsiadów sam (patrz glean_refresh)
   router-ifaces netflow-on   włącz eksport NetFlow/IPFIX (flowprobe) na portach/VLAN-ach i zastosuj od razu
   router-ifaces netflow-off  wyłącz eksport NetFlow/IPFIX na portach/VLAN-ach i zastosuj od razu — bez
                              restartu VPP (loop0 zostaje jako kotwica, znikomy koszt — patrz NETFLOW_ENABLE)
@@ -1658,6 +1661,161 @@ def run_cmd(c):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+# --------------------------------------------------------------------------- źródło zapytań ARP/ND (glean)
+# VPP (fib_table_route_path_fixup, adj_glean_add_or_lock): glean podsieci podłączonej powstaje z adresem SIECI
+# (prefiks znormalizowany), a adres interfejsu wpisuje do niego dopiero aktywacja lokalnego /32 (/128)
+# (fib_entry_src_interface_update_glean). ip4/ip6_add_interface_routes dodaje /32 PRZED podsiecią: normalnie
+# podsieć pojawia się chwilę później jako nowy wpis, /32 dostaje powiadomienie o zmianie "cover" i poprawia gleana.
+# Gdy podsieć JUŻ jest w FIB z innego źródła — lcp-rt, bo BIRD eksportuje do kernela trasy "protocol direct",
+# a linux-cp przepisuje je do VPP — /32 nie widzi źródła "interface", a potem nikt go nie powiadamia: glean zostaje
+# z adresem sieci. VPP pyta "who-has X tell 195.149.232.0", nikt nie odpowiada, a sąsiedzi rozwiązują się tylko,
+# gdy sami zapytają o nas albo zapyta Linux (ping z routera) — lodz2-vpp, TPIX, 20.11.2026: ruch do członków IX
+# z tras route servera ginął. "show adj" w VPP 26.06 drukuje [src:] zamaskowane do adresu sieci zawsze, więc stan
+# widać tylko na kablu (pcap: pole "tell"). Naprawa bez przerwy w ruchu: tymczasowa trasa /31 (/127) obejmująca
+# adres — /32 dostaje nowy cover, a po jej usunięciu wraca do podsieci i wpisuje adres do gleana. Trasa jest
+# "via <interfejs>" (attached), więc wpisy sąsiadów, które obejmuje (drugi adres z /31), zostają aktywne
+# (fib_entry_src_adj_activate: cover attached na tym samym interfejsie). Sprawdzone na lodz2-vpp 20.11.2026.
+GLEAN_HOST_LEN = {4: 31, 6: 127}
+FIB_PFX_RE = re.compile(r"^(\S+/\d+)\s+fib:\d+", re.M)
+
+
+def glean_cover(a):
+    """Tymczasowy prefiks obejmujący adres interfejsu, węższy od jego podsieci; None, gdy podsieć jest za wąska
+    (IPv4 /31–/32, IPv6 /127–/128 — tam nie ma miejsca na trasę pośrednią)."""
+    n = GLEAN_HOST_LEN[a.version]
+    if a.network.prefixlen >= n:
+        return None
+    return ipaddress.ip_network("%s/%d" % (a.ip, n), strict=False)
+
+
+def fib_exact(pfx):
+    """Czy FIB VPP ma wpis dokładnie dla tego prefiksu (show ip fib <prefiks> zwraca najdłuższe dopasowanie)."""
+    m = FIB_PFX_RE.search(cli("show %s fib %s" % ("ip" if pfx.version == 4 else "ip6", pfx)))
+    try:
+        return bool(m) and ipaddress.ip_network(m.group(1), strict=False) == pfx
+    except ValueError:
+        return False
+
+
+def glean_refresh(pairs):
+    """pairs: [(interfejs VPP, ip_interface)] → [(ok, opis)]. Adresy bez miejsca na trasę pośrednią są pomijane."""
+    res = []
+    for name, a in pairs:
+        pfx = glean_cover(a)
+        if pfx is None:
+            continue
+        what = "%s %s" % (name, a)
+        add, dele = "ip route add %s via %s" % (pfx, name), "ip route del %s via %s" % (pfx, name)
+        try:
+            if fib_exact(pfx):
+                res.append((False, "%s: pominięto — FIB ma już trasę %s (nie ruszam cudzej trasy)" % (what, pfx)))
+                continue
+            out = cli(add).strip()
+        except VppError as ex:
+            res.append((False, "%s: %s" % (what, ex)))
+            continue
+        if out and ERR_RE.search(out):
+            res.append((False, "%s: %s -> %s" % (what, add, out)))
+            continue
+        gone = False
+        for _ in range(3):              # trasa tymczasowa musi zniknąć — ponawiamy, zanim zgłosimy błąd
+            try:
+                cli(dele)
+                gone = not fib_exact(pfx)
+            except VppError:
+                gone = False
+            if gone:
+                break
+            time.sleep(0.5)
+        if gone:
+            res.append((True, "%s: źródło ARP/ND odświeżone (trasa tymczasowa %s dodana i usunięta)" % (what, pfx)))
+        else:
+            res.append((False, "%s: NIE usunięto trasy tymczasowej %s — usuń ręcznie: vppctl %s" % (what, pfx, dele)))
+    return res
+
+
+def report_glean(results, verbose, boot=False):
+    """Log + ekran; błąd → %IFACE-4-GLEAN_FAIL. Zwraca liczbę błędów."""
+    bad = 0
+    for ok, msg in results:
+        log("%s glean: %s" % ("OK " if ok else "BŁĄD", msg))
+        if verbose:
+            print("  %s %s" % (color("OK " if ok else "BŁĄD", "32" if ok else "31"), msg))
+        if not ok:
+            bad += 1
+            event(4, "GLEAN_FAIL", "%s%s" % ("po starcie VPP: " if boot else "", msg))
+    return bad
+
+
+LCP_SRC_RE = re.compile(r"^\s+lcp-rt[\w-]*\s+refs:", re.M)
+
+
+def kernel_dups(act):
+    """Podsieci podłączone, których wpis w FIB VPP ma też źródło lcp-rt (trasa z Linuksa do tej samej podsieci —
+    zwykle BIRD eksportujący do kernela "protocol direct") → [(interfejs VPP, prefiks)]. To warunek błędu gleana
+    (patrz wyżej). Pytamy FIB VPP po jednym prefiksie, nie Linuksa: "ip route show proto bird" przy pełnej
+    tablicy BGP przerzucałoby co 5 minut ~1 mln tras."""
+    found = []
+    for n in sorted(act.addrs, key=natkey):
+        if n.startswith(("loop", "local")):
+            continue
+        for net in sorted({a.network for a in act.addrs[n] if a.network.prefixlen < a.max_prefixlen},
+                          key=lambda x: (x.version, str(x))):
+            try:
+                out = cli("show %s fib %s" % ("ip" if net.version == 4 else "ip6", net))
+            except VppError:
+                continue
+            m = FIB_PFX_RE.search(out)
+            try:
+                same = bool(m) and ipaddress.ip_network(m.group(1), strict=False) == net
+            except ValueError:
+                same = False
+            if same and LCP_SRC_RE.search(out):
+                found.append((n, net))
+    return found
+
+
+KDUP_HINT = ("zwykle BIRD eksportuje do kernela trasy \"protocol direct\"; przy ponownym nadaniu adresu VPP może wtedy "
+             "pytać ARP/ND z adresu sieci i nie rozwiązywać sąsiadów (apply odświeża to samo). Napraw w BIRD: w filtrze "
+             "eksportu protokołu kernel 'if source = RTS_DEVICE && ifname ~ \"hu*\" then reject;' (gotowy fragment: "
+             "/etc/bird/DOPISZ-do-konfiguracji-BIRD.txt; zastosuj 'birdc configure soft'). Gdy Linux "
+             "już tej trasy nie ma (ip -n dataplane route show <prefiks>), to pozostałość w VPP — linux-cp nie zawsze "
+             "przetwarza jej usunięcie (lodz2-vpp, 20.11.2026); znika przy restarcie VPP, do tego czasu jest nieszkodliwa")
+
+
+def do_glean_fix(args):
+    fd = lock()
+    try:
+        act = read_vpp()
+    except VppError as ex:
+        print(color("VPP nie odpowiada: %s" % ex, "31"))
+        return 3
+    pairs = [(n, a) for n in sorted(act.addrs, key=natkey) if not n.startswith(("loop", "local"))
+             for a in sorted(act.addrs[n], key=addr_key) if glean_cover(a)]
+    if not pairs:
+        print("Brak adresów do odświeżenia (loopbacki, /31, /32, /127 i /128 nie mają czego poprawiać).")
+        return 0
+    print("Odświeżenie źródła zapytań ARP/ND w VPP (trasa tymczasowa dodana i od razu usunięta, ruch bez przerwy):")
+    for n, a in pairs:
+        print("  %-14s %-28s przez %s" % (n, a, glean_cover(a)))
+    if sys.stdin.isatty() and not args.yes:
+        try:
+            ans = input("Wykonać? [t/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("t", "tak", "y", "yes"):
+            print("Przerwano — nic nie zmieniono.")
+            return 1
+    log("=== glean-fix: %d adresów ===" % len(pairs))
+    bad = report_glean(glean_refresh(pairs), verbose=True)
+    del fd
+    if bad:
+        print(color("Nie wszystko się udało (%d) — szczegóły: %s" % (bad, LOG), "31"))
+        return 4
+    print(color("Gotowe. Sprawdzenie na kablu: vppctl pcap trace tx … i pole \"tell\" w zapytaniach ARP.", "32"))
+    return 0
+
+
 # --------------------------------------------------------------------------- stan, SNMP
 def load_state():
     try:
@@ -1889,6 +2047,12 @@ def do_apply(args, boot=False):
         done, _failed, left = converge(desired, managed, verbose=not boot)
     else:
         done, left = [], []
+    # każdy nowo dodany adres: adres źródłowy ARP/ND w gleanie (patrz glean_refresh) — bez przerwy w ruchu
+    added = [(c.args.split()[4], ipaddress.ip_interface(c.args.split()[5])) for c, _ in done
+             if c.kind == "vpp" and c.op == "+" and c.args.startswith("set interface ip address ")
+             and len(c.args.split()) == 6]
+    if added:
+        report_glean(glean_refresh(added), verbose=not boot, boot=boot)
     # stan: co jest zarządzane przez skrypt (do późniejszego kasowania)
     new_managed = {e.name: e.kind for e in desired.values() if not e.implicit}
     if left:
@@ -2019,7 +2183,15 @@ def do_check(args):
             pending = sha(f.read()) != state.get("conf_sha")
     except OSError:
         pass
+    dups = kernel_dups(act)
     if args.log:
+        kkey = sha(" ".join("%s:%s" % d for d in dups)) if dups else ""
+        if dups and kkey != state.get("kdup"):
+            event(4, "KERNEL_DUP", "podsieci podłączone mają w FIB VPP także trasę z Linuksa (lcp-rt): %s — %s"
+                  % (", ".join("%s (%s)" % (p, n) for n, p in dups), KDUP_HINT))
+        elif not dups and state.get("kdup"):
+            event(5, "KERNEL_DUP_END", "podsieci podłączone bez dublujących tras z Linuksa (lcp-rt)")
+        state["kdup"] = kkey
         key = sha("\n".join(c.text() for c in cmds)) if cmds else ""
         if cmds and key != state.get("drift"):
             event(4, "DRIFT", "VPP różni się od ifaces.conf (%s do naprawy): %s — napraw: router-ifaces apply"
@@ -2040,6 +2212,11 @@ def do_check(args):
         print(color("OK: VPP zgodny z ostatnio zastosowaną konfiguracją.", "32"))
     if pending:
         print(color("Plik %s zmieniono po ostatnim apply — zobacz: router-ifaces diff" % CONF, "33"))
+    if dups:
+        print(color("UWAGA: podsieci podłączone mają w FIB VPP także trasę z Linuksa (lcp-rt):", "33"))
+        for n, p in dups:
+            print("  %-14s %s" % (n, p))
+        print("  " + KDUP_HINT)
     return 1 if cmds else 0
 
 
@@ -2566,6 +2743,7 @@ def main():
     ap.epilog = "Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>"
     ap.add_argument("--version", action="version", version="router-ifaces — Autor: PHU VIPHOST Przemysław Świderski <biuro@viphost.it>")
     ap.add_argument("cmd", nargs="?", default="show", choices=["show", "diff", "apply", "check", "render", "boot", "snmp",
+                                                          "glean-fix",
                                                           "optics", "errors", "netflow-on", "netflow-off"])
     ap.add_argument("-y", "--yes", action="store_true", help="apply bez pytania o potwierdzenie")
     ap.add_argument("--log", action="store_true", help="check: tryb cichy, wynik do logu (timer systemd)")
@@ -2578,7 +2756,8 @@ def main():
         sys.exit("Uruchom jako root.")
     fn = {"show": do_show, "diff": do_diff, "check": do_check, "render": do_render, "snmp": do_snmp,
           "optics": do_optics, "errors": do_errors, "apply": lambda a: do_apply(a), "boot": lambda a: do_apply(a, boot=True),
-          "netflow-on": lambda a: do_netflow(a, True), "netflow-off": lambda a: do_netflow(a, False)}[args.cmd]
+          "netflow-on": lambda a: do_netflow(a, True), "netflow-off": lambda a: do_netflow(a, False),
+          "glean-fix": do_glean_fix}[args.cmd]
     rc = fn(args)
     signature()
     sys.exit(rc)
@@ -9877,6 +10056,7 @@ Na co patrzeć w `alarmy.log`:
 | `%SYS-4-CPU_HIGH` | przeciążony rdzeń systemowy (BIRD, SNMP) | `top`; duża zmiana tras BGP? |
 | `%MD-…`, `%SMART-…` | dysk / RAID | wymiana dysku |
 | `%IFACE-4-DRIFT`, `%FW-4-DRIFT`, `%GUARD-4-DRIFT` | VPP różni się od pliku (ktoś zmienił ręcznie) | `router-ifaces diff` / `router-fw diff`, potem `apply` |
+| `%IFACE-4-KERNEL_DUP` | BIRD eksportuje do kernela podsieci podłączone — VPP może pytać ARP z adresu sieci (ruch rusza dopiero po pingu z routera) | filtr eksportu `kernel` w BIRD (`source = RTS_DEVICE` → reject), `router-ifaces glean-fix` |
 | `%…-2-CONFIG_ERROR` | plik ma błąd; działa ostatnia poprawna wersja | `… check`, popraw plik |
 | `%SYS-5-BOOT_OK` / `%SYS-2-BOOT_PROBLEM` | wynik kontroli po starcie serwera | przy PROBLEM: `router-check` |
 
@@ -10547,10 +10727,10 @@ net.ipv6.conf.default.accept_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.default.addr_gen_mode = 1
-# linux-cp: tablicę sąsiadów VPP wypełnia Linux (linux-nl kopiuje ją do VPP). Odpowiedź ARP/NA na zapytanie
-# wysłane przez VPP trafia do Linuksa, który domyślnie (0) ją odrzuca, bo sam nie pytał — VPP nie dostawał MAC
-# next-hopa i ruch do niego ginął, dopóki Linux sam nie zapytał (lodz2-vpp, route server TPIX, 17.11.2026).
-# 2 = przyjmuj tylko od adresów z podsieci interfejsu (kernel ≥ 6.0).
+# linux-cp: kopię odpowiedzi ARP/NA na zapytanie wysłane przez VPP dostaje też Linux, który domyślnie (0) ją
+# odrzuca, bo sam nie pytał. 2 = przyjmuj od adresów z podsieci interfejsu (kernel ≥ 6.0): Linux i VPP mają wtedy
+# te same wpisy. To NIE była przyczyna awarii z 17.11.2026 (ruch do członków IX ruszał dopiero po pingu z routera) —
+# VPP pytał z adresu sieci zamiast z adresu interfejsu, patrz router-ifaces glean-fix (20.11.2026).
 net.ipv4.conf.all.arp_accept = 2
 net.ipv4.conf.default.arp_accept = 2
 net.ipv6.conf.all.accept_untracked_na = 2
@@ -10565,6 +10745,77 @@ ExecStartPost=-/usr/sbin/ip netns exec dataplane /usr/sbin/sysctl -q -p /etc/rou
   # accept_untracked_na działa per interfejs ("default" dostają tylko nowe) — istniejące ustawiamy wprost
   ip netns exec dataplane sh -c 'for f in /proc/sys/net/ipv6/conf/*/accept_untracked_na; do echo 2 >"$f"; done' 2>/dev/null || true
   ok "netns dataplane: IPv6 bez RA i SLAAC (tylko interfejsy z adresem IPv6 w ifaces.conf); odpowiedzi ARP/NA na zapytania VPP przyjmowane (arp_accept=$(ip netns exec dataplane sysctl -n net.ipv4.conf.all.arp_accept 2>/dev/null))"
+}
+
+BIRD_KERNEL_HINT=/etc/bird/DOPISZ-do-konfiguracji-BIRD.txt
+bird_kernel_hint() {   # /etc/bird/DOPISZ-do-konfiguracji-BIRD.txt: filtr eksportu do kernela (instalacja i upgrade_script)
+  # Konfigurację BGP (i protokół kernel) pisze drugi skrypt, nie ten — tu tylko gotowy fragment do dopisania i stan.
+  # Bez filtra BIRD eksportuje do kernela podsieci podłączone ("protocol direct"), linux-cp wpisuje je do FIB VPP
+  # (lcp-rt), a przy ponownym nadaniu adresu glean VPP zostaje z adresem SIECI: VPP pyta "tell 195.149.232.0"
+  # i nie rozwiązuje sąsiadów (lodz2-vpp, TPIX, 17–20.11.2026). Szczegóły: README, "Źródło zapytań ARP/ND w VPP".
+  [[ -d /etc/bird ]] || return 0
+  local src=${LOOP0_ADDR%%/*} where state
+  [[ -n $src ]] || src="<adres loop0>"
+  # dokładnie nasz warunek (RTS_DEVICE + ifname "hu…") — samo RTS_DEVICE bywa też w filtrach sesji BGP (ogłaszanie
+  # podsieci podłączonych klientom), więc nie świadczy o filtrze eksportu do kernela (lodz2-vpp: peers_cbgp/*)
+  where=$(grep -rlE --include='*.conf' 'source[[:space:]]*=[[:space:]]*RTS_DEVICE[^;]*ifname[[:space:]]*~[[:space:]]*"hu' \
+    /etc/bird 2>/dev/null | head -3 | tr '\n' ' ')
+  if [[ -n $where ]]; then state="filtr JEST (warunek RTS_DEVICE + ifname \"hu*\" w: ${where% })"
+  else state="filtra NIE znaleziono w /etc/bird/**/*.conf — jeśli BIRD eksportuje trasy do kernela, dopisz go"; fi
+  put_file "$BIRD_KERNEL_HINT" "fragment do dopisania w konfiguracji BIRD (filtr eksportu do kernela)" 644 <<EOF
+# install-router.sh — DOPISZ DO KONFIGURACJI BIRD. Ten plik NIE jest wczytywany przez BIRD (to tylko ściąga).
+# Stan przy ostatniej instalacji/aktualizacji: $state
+#
+# PO CO: BIRD nie może eksportować do kernela podsieci podłączonych ("protocol direct") na portach VPP (hu*).
+# Inaczej linux-cp wpisuje je do FIB VPP jako drugą trasę do tej samej podsieci, a przy ponownym nadaniu adresu
+# (zmiana w ifaces.conf, aktualizacja, ręczne vppctl) VPP pyta o sąsiadów z adresu SIECI, np.
+# "who-has 195.149.233.28 tell 195.149.232.0". Nikt nie odpowiada: ruch do next-hopów (np. członków IX z tras
+# route servera) ginie na routerze i rusza dopiero po pingu z routera (lodz2-vpp, TPIX, 17–20.11.2026).
+# Linux ma te podsieci sam (proto kernel), a BIRD dalej używa tras direct wewnętrznie (iBGP, next-hopy) —
+# filtr niczego nie zabiera.
+#
+# CO DOPISAĆ: w protokole kernel dla IPv4, na POCZĄTKU filtra eksportu:
+#
+#     if source = RTS_DEVICE && ifname ~ "hu*" then reject;
+#
+# Przykład (protokół kernel z eksportem tras BGP do Linuksa):
+#
+#   protocol kernel KernelRIB {
+#       learn;
+#       persist;
+#       scan time 300;
+#       ipv4 {
+#           import all;
+#           export filter { if source = RTS_DEVICE && ifname ~ "hu*" then reject; krt_prefsrc = $src; accept; };
+#       };
+#   }
+#
+# loop0, rpki1 i inne interfejsy spoza VPP warunek "hu*" pomija — ich trasy zostają jak były.
+# IPv6: jeśli "protocol direct" ma też kanał ipv6, dopisz ten sam warunek w protokole kernel dla ipv6.
+# Bez eksportu do kernela (export none — konfiguracja bazowa instalatora) nic nie trzeba dopisywać.
+#
+# JAK WPROWADZIĆ NA DZIAŁAJĄCYM ROUTERZE (bez przeliczania pełnej tablicy BGP, ruch bez przerwy):
+#   cp -a /etc/bird/bird.conf /etc/bird/bird.conf.bak-\$(date +%F)
+#   (dopisz warunek w pliku z protokołem kernel)
+#   bird -p -c /etc/bird/bird.conf && birdc configure soft
+# BIRD sam usunie kopie z kernela przy najbliższym skanie (scan time; domyślnie 60 s).
+#
+# SPRAWDZENIE:
+#   ip netns exec dataplane ip -4 route show proto bird scope link     # bez wpisów "dev hu…"
+#   router-ifaces check                                                # bez ostrzeżenia KERNEL_DUP *
+#   router-ifaces glean-fix                                            # poprawia źródło ARP już teraz
+# * źródło lcp-rt może zostać w FIB VPP mimo braku trasy w Linuksie (linux-cp nie zawsze przetwarza usunięcie);
+#   jest nieszkodliwe i znika przy restarcie VPP.
+#
+# TEST NA KABLU po dodaniu sieci wymiany (każda linia ma kończyć się OK):
+#   vppctl show int addr | awk '/L3 [0-9.]+\\//{split(\$2,a,"/"); print a[1]}' > /tmp/our-ips.txt
+#   vppctl classify filter pcap mask hex 00000000000000000000000000000000ffff match hex 000000000000000000000000000000000806
+#   vppctl pcap trace tx max 5000 intfc any filter file arp-check.pcap; sleep 20; vppctl pcap trace off
+#   tcpdump -nner /tmp/arp-check.pcap 2>/dev/null | grep -o 'vlan [0-9]*.*who-has [0-9.]* tell [0-9.]*' | awk '{gsub(",","",\$2); print \$2, \$NF}' | sort -u | while read v ip; do grep -qxF "\$ip" /tmp/our-ips.txt && s=OK || s="BŁĄD: to nie nasz adres"; echo "VLAN \$v  tell \$ip  \$s"; done
+EOF
+  chown root:bird "$BIRD_KERNEL_HINT" 2>/dev/null || true
+  if [[ -n $where ]]; then ok "BIRD: filtr eksportu do kernela bez podsieci hu* — $state"
+  else say "BIRD: $state — fragment do dopisania: $BIRD_KERNEL_HINT"; fi
 }
 
 # router-snmp: usługa kolektora, blok pass_persist w obu snmpd, IF-MIB w dataplane tylko z VPP (instalacja i upgrade_script)
@@ -10704,6 +10955,7 @@ do_upgrade() {
     ok "programy routera są aktualne — nic do podmiany"
     if ((!DRY_RUN)) && [[ $old_ver != "$SCRIPT_VERSION" ]]; then write_version upgrade; say "zapisano wersję $SCRIPT_VERSION w $VERSION_FILE"; fi
     ((DRY_RUN)) || dataplane_sysctl
+    ((DRY_RUN)) || bird_kernel_hint
     return 0
   fi
   if ((DRY_RUN)); then ok "dry-run: do podmiany ${#todo[@]} plik(ów); nic nie zapisano"; return 0; fi
@@ -10737,6 +10989,7 @@ do_upgrade() {
   [[ -e /opt/router/bin/router-rpki ]] && ln -sfn /opt/router/bin/router-rpki /usr/local/sbin/router-rpki
   snmp_router_ext
   dataplane_sysctl
+  bird_kernel_hint
   # stały ifIndex: moduł + poprawka agenta; restart agenta i router-netflow, gdy coś się zmieniło
   local ifx_before
   ifx_before=$(md5sum /opt/router/lib/router_ifindex.py 2>/dev/null)
@@ -13722,6 +13975,7 @@ EOF
   chmod 750 /etc/bird /etc/bird/conf.d
   say "bird -p (kontrola składni)"
   bird -p -c /etc/bird/bird.conf
+  bird_kernel_hint
   put_file "/etc/systemd/system/$unit.service.d/10-dataplane.conf" "BIRD uruchamiany w netns dataplane" <<'EOF'
 [Unit]
 Requires=netns-dataplane.service
@@ -15652,7 +15906,7 @@ Zmiany działają w ciągu 5 sekund (bez restartu). Test: `router-notify test`. 
 | `VPP_PUNT` | `%VPP-4-PUNT_HIGH` |
 | `SYS_CPU` | `%SYS-4-CPU_HIGH` |
 | `FIREWALL` | `%FW-5-APPLIED`, `%FW-4-DRIFT`, `%FW-2-CONFIG_ERROR`, `%FW-5-BLOCK` (rozdział 10a) |
-| `IFACES` | `%IFACE-5-CONFIG_APPLIED`, `%IFACE-4-DRIFT`, `%IFACE-2-CONFIG_ERROR`, `%IFACE-3-APPLY_FAIL`, `%IFACE-3/4-OPTICS` (wkładki poza progami DDM) (rozdział 10) |
+| `IFACES` | `%IFACE-5-CONFIG_APPLIED`, `%IFACE-4-DRIFT`, `%IFACE-2-CONFIG_ERROR`, `%IFACE-3-APPLY_FAIL`, `%IFACE-3/4-OPTICS` (wkładki poza progami DDM), `%IFACE-4-KERNEL_DUP`, `%IFACE-4-GLEAN_FAIL` (rozdział 10) |
 | `STATS` | `%VPP-6-STATS` (po włączeniu `SUMMARY_EVERY`) — zwykle nie chcesz tego mailem |
 | `OTHER` | wszystko, co nie pasuje do powyższych |
 | `ALL` | wszystkie kategorie |
@@ -15733,6 +15987,7 @@ router-ifaces render     # cała konfiguracja jako polecenia vppctl
 router-ifaces optics     # porty: link up/down, prędkość; wkładki: moc TX/RX (dBm), bias, temperatura (DDM)
 router-ifaces optics -w  # to samo na żywo, odświeżanie co 10 s (--interval SEK); Ctrl+C kończy
 router-ifaces errors -w  # błędy portów (CRC, discards, rx-miss, drops…) i ich przyrost co 10 s
+router-ifaces glean-fix  # VPP nie rozwiązuje sąsiadów sam (ruch rusza dopiero po pingu z routera) — patrz niżej
 ```
 
 Co robi `apply`:
@@ -15763,12 +16018,19 @@ Ten sam timer może pilnować **wkładek** — domyślnie WYŁĄCZONE (`OPTICS_C
 | `%IFACE-6-PENDING` | plik zmieniony, jeszcze nie zastosowany |
 | `%IFACE-2-CONFIG_ERROR` | przy starcie plik miał błąd — użyto ostatniej poprawnej wersji |
 | `%IFACE-3-APPLY_FAIL`, `%IFACE-2-APPLY_FAIL` | części zmian nie dało się zastosować / VPP nie odpowiadał |
+| `%IFACE-4-KERNEL_DUP` / `%IFACE-5-KERNEL_DUP_END` | podsieć podłączona ma w FIB VPP także trasę z Linuksa (BIRD eksportuje `protocol direct` do kernela) — grozi pytaniem ARP/ND z adresu sieci / już nie |
+| `%IFACE-4-GLEAN_FAIL` | nie udało się odświeżyć źródła zapytań ARP/ND (np. trasa tymczasowa nie zniknęła — w komunikacie polecenie do usunięcia) |
 
 **IPv6 tylko tam, gdzie wpiszesz adres IPv6.** Interfejs (VLAN, port, loopback) z `-` w kolumnie ipv6 ma IPv6 całkowicie wyłączone: w VPP (`disable ip6 interface`) i w Linuksie (bez adresu link-local). Nie odpowiada na ND, nie bierze udziału w IPv6. Interfejs z adresem IPv6 ma IPv6 włączone i link-local w Linuksie (potrzebny do ND i sesji BGP po IPv6).
 
 **Router nie wysyła ogłoszeń RA** — nie adresuje innych routerów ani hostów w sieci. VPP domyślnie RA nie wysyła, a `router-ifaces` dodatkowo ustawia `ip6 nd <interfejs> ra-suppress` na każdym interfejsie z IPv6. W netns dataplane (`/etc/router/dataplane-sysctl.conf`) Linux nie przyjmuje RA, przekierowań ani nie konfiguruje sobie adresów (SLAAC) — cudzy RA w sieci nie zmieni adresów ani tras routera.
 
-**Sąsiedzi next-hopów (ARP/ND) przy linux-cp.** VPP zna MAC sąsiada z tablicy Linuksa (linux-nl ją kopiuje). Gdy VPP sam pyta o next-hop (np. członka IX z trasy od route servera, z którym Linux nigdy nie rozmawiał), odpowiedź trafia do Linuksa — a ten domyślnie odrzuca odpowiedź, o którą sam nie pytał. Skutek: ruch do takiego next-hopa ginie na routerze, dopóki ktoś nie wyśle pakietu z Linuksa (np. `ping` z routera) — lodz2-vpp, TPIX, 17.11.2026. Dlatego `dataplane-sysctl.conf` ustawia `arp_accept = 2` i `accept_untracked_na = 2` (IPv4/IPv6): Linux przyjmuje takie odpowiedzi tylko od adresów z podsieci interfejsu. Sprawdzenie: `ip netns exec dataplane sysctl net.ipv4.conf.all.arp_accept` (ma być 2).
+**Źródło zapytań ARP/ND w VPP (glean).** VPP pyta o sąsiada w podsieci podłączonej z adresu zapisanego w tzw. gleanie tej podsieci. Glean powstaje z adresem *sieci*, a adres interfejsu wpisuje do niego dopiero lokalny wpis `/32` (`/128`) — i to tylko wtedy, gdy podsieć pojawia się w FIB VPP jako nowy wpis. Jeśli podsieć już tam jest z innego źródła (`lcp-rt`: Linux ma do niej trasę, bo BIRD eksportuje do kernela trasy `protocol direct`), a adres zostanie nadany ponownie (zmiana w `ifaces.conf`, aktualizacja, ręczne `set interface ip address`), glean zostaje z adresem sieci. VPP pyta wtedy `who-has X tell 195.149.232.0`, nikt nie odpowiada, a sąsiedzi rozwiązują się tylko wtedy, gdy sami zapytają o router albo zapyta Linux. Objaw: ruch do next-hopa (np. członka IX z trasy od route servera) ginie na routerze i rusza dopiero po `ping` z routera — lodz2-vpp, TPIX, 17–20.11.2026 (VPP wysyłał ~70 zapytań ARP na sekundę, bez odpowiedzi). `show adj` w VPP 26.06 zawsze drukuje `[src:…]` zamaskowane do adresu sieci, więc prawdę widać tylko na kablu: `vppctl pcap trace tx max 50 intfc any file arp.pcap`, `vppctl ping <sąsiad>`, `vppctl pcap trace off`, `tcpdump -nner /tmp/arp.pcap arp` — w polu `tell` ma być adres interfejsu.
+
+- `router-ifaces apply` (i odtwarzanie po starcie VPP) po każdym nowo nadanym adresie odświeża glean: dodaje i od razu usuwa trasę `/31` (`/127`) obejmującą adres, `via <interfejs>`. Lokalny `/32` przelicza wtedy swój wpis nadrzędny i wpisuje adres interfejsu do gleana. Ruch nie jest przerywany — wpisy sąsiadów z tej `/31` zostają aktywne (trasa jest podłączona na tym samym interfejsie). Na `/31`, `/32`, `/127`, `/128` nie ma miejsca na trasę pośrednią — tam ten mechanizm nie działa.
+- `router-ifaces glean-fix` robi to samo dla wszystkich adresów na żywym routerze (pyta; `-y` bez pytania). Bezpieczne w dowolnej chwili.
+- `router-ifaces check` (i timer co 5 min) ostrzega `%IFACE-4-KERNEL_DUP`, gdy podsieć podłączona ma w FIB VPP także trasę z Linuksa (`lcp-rt`). Właściwa naprawa jest w BIRD: w filtrze eksportu protokołu `kernel` odrzuć trasy podłączone na portach VPP — `if source = RTS_DEVICE && ifname ~ "hu*" then reject;` (gotowy fragment z przykładem, procedurą i testem: `/etc/bird/DOPISZ-do-konfiguracji-BIRD.txt`, odświeżany przy każdej instalacji i `upgrade_script`, z informacją, czy filtr już jest) — i zastosuj przez `birdc configure soft`: BIRD 3 sam usunie te trasy z kernela przy najbliższym skanie (`scan time`), bez przeliczania całej tablicy eksportu, co robi zwykłe `configure` po zmianie filtra. Linux ma te podsieci sam (`proto kernel`), więc nic nie traci. Uwaga: linux-cp nie zawsze przetwarza usunięcie takiej trasy — na lodz2-vpp 20.11.2026 z 6 podsieci w FIB VPP zniknęła tylko jedna, w pozostałych zostało źródło `lcp-rt-dynamic`, choć Linux już tych tras nie miał. To nieszkodliwe (źródło nieaktywne) i znika przy najbliższym restarcie VPP; do tego czasu `check` zgłasza `KERNEL_DUP`, a `apply` i tak odświeża glean po każdym nowym adresie.
+- `dataplane-sysctl.conf` ustawia dodatkowo `arp_accept = 2` i `accept_untracked_na = 2`: kopia odpowiedzi ARP/NA na zapytanie VPP trafia też do Linuksa i Linux ją przyjmuje (od adresów z podsieci interfejsu), więc obie tablice sąsiadów są zgodne. To nie była przyczyna awarii z 17.11 — wcześniejszy opis w tym miejscu był błędny.
 
 Gdy IPv6 pojawi się tam, gdzie go nie ma w pliku (np. ręczne `enable ip6 interface`), `router-ifaces check` zgłasza rozjazd, a `apply` wyłącza je z powrotem.
 

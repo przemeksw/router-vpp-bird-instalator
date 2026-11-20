@@ -331,6 +331,52 @@ t "errors: bez przyrostu = kod 0"           0 $RI errors
 t "errors -w: odświeża i kończy po Ctrl+C"  0 watch2 python3 $PWD/build/router-ifaces errors -w --interval 1
 
 echo
+echo "15. źródło zapytań ARP/ND (glean) i trasy z Linuksa dublujące podsieci podłączone"
+mkdir -p "$W/root2/etc/router"
+cp "$W/root/etc/router/router.env" "$W/root2/etc/router/router.env"
+cat >"$W/root2/etc/router/ifaces.conf" <<'C'
+hu0     -    -                    -                    Trunk 100G
+hu0     376  195.149.232.204/22   -                    IX: TPIX
+hu0     381  213.172.174.115/31   -                    Transit /31
+hu0     100  192.0.2.2/30         2001:db8:100::2/64   Transit v6
+loop0   -    203.0.113.1/32       -                    Loopback
+C
+ri2() { ROUTER_IFACES_ROOT=$W/root2 FAKEVPP_STATE=$W/vpp2.json $RI "$@"; }
+vpp2() { FAKEVPP_STATE=$W/vpp2.json $W/bin/fakevppctl "$@"; }
+rlog() { python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1])).get("route_log", [])))' "$W/vpp2.json"; }
+left() { python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get("vroutes", []); print(v); sys.exit(1 if v else 0)' "$W/vpp2.json"; }
+t "apply"                                   0 ri2 apply -y
+t "apply: /22 odświeżony przez /31"         0 bash -c "$(declare -f rlog); W=$W; rlog | grep -qx 'add 195.149.232.204/31 hu0.376' && rlog | grep -qx 'del 195.149.232.204/31 hu0.376'"
+t "apply: /30 odświeżony przez /31"         0 bash -c "$(declare -f rlog); W=$W; rlog | grep -qx 'add 192.0.2.2/31 hu0.100'"
+t "apply: IPv6 /64 odświeżony przez /127"   0 bash -c "$(declare -f rlog); W=$W; rlog | grep -qx 'add 2001:db8:100::2/127 hu0.100'"
+t "apply: /31 i loopback pominięte"         1 bash -c "$(declare -f rlog); W=$W; rlog | grep -qE '213\.172\.174|203\.0\.113'"
+t "apply: trasy tymczasowe usunięte"        0 left
+t "apply: wpis w logu"                      0 grep -q "źródło ARP/ND odświeżone" "$W/root2/var/log/router/ifaces.log"
+t "apply: 3 adresy odświeżone"              0 bash -c "$(declare -f rlog); W=$W; [ \$(rlog | grep -c '^add ') -eq 3 ]"
+t "apply ponownie (bez zmian)"              0 ri2 apply -y
+t "...nie rusza gleanów"                    0 bash -c "$(declare -f rlog); W=$W; [ \$(rlog | grep -c '^add ') -eq 3 ]"
+t "glean-fix -y"                            0 ri2 glean-fix -y
+t "glean-fix: wszystkie 3 adresy"           0 bash -c "$(declare -f rlog); W=$W; [ \$(rlog | grep -c '^add ') -eq 6 ]"
+vpp2 ip route add 195.149.232.204/31 via hu0.376 >/dev/null
+t "glean-fix: cudza trasa /31 nieruszana"   4 ri2 glean-fix -y
+t "cudza trasa została"                     1 left
+vpp2 ip route del 195.149.232.204/31 via hu0.376 >/dev/null
+vpp2 fake route-del-fail on >/dev/null
+t "glean-fix: trasa nie zniknęła = kod 4"   4 ri2 glean-fix -y
+t "...z poleceniem do usunięcia"            0 grep -q "usuń ręcznie: vppctl ip route del" "$W/root2/var/log/router/ifaces.log"
+t "...i alarmem GLEAN_FAIL"                 0 grep -q "%IFACE-4-GLEAN_FAIL" "$W/root2/var/log/router/alarmy.log"
+vpp2 fake route-del-fail off >/dev/null
+for p in 195.149.232.204/31 192.0.2.2/31 2001:db8:100::2/127; do vpp2 ip route del $p via $( [[ $p == 195* ]] && echo hu0.376 || echo hu0.100 ) >/dev/null; done
+t "sprzątnięte"                             0 left
+t "check: bez dubli — brak uwagi"           1 has "UWAGA: podsieci podłączone" ri2 check
+vpp2 fake lcp-rt add 195.149.232.0/22 >/dev/null
+t "check: dubel lcp-rt wykryty"             0 has "195.149.232.0/22" ri2 check
+t "check --log: KERNEL_DUP"                 0 bash -c "ROUTER_IFACES_ROOT=$W/root2 FAKEVPP_STATE=$W/vpp2.json $RI check --log; grep -q '%IFACE-4-KERNEL_DUP' $W/root2/var/log/router/alarmy.log"
+t "check --log: bez powtórki"               0 bash -c "ROUTER_IFACES_ROOT=$W/root2 FAKEVPP_STATE=$W/vpp2.json $RI check --log; [ \$(grep -c 'IFACE-4-KERNEL_DUP' $W/root2/var/log/router/alarmy.log) -eq 1 ]"
+vpp2 fake lcp-rt clear >/dev/null
+t "check --log: KERNEL_DUP_END"             0 bash -c "ROUTER_IFACES_ROOT=$W/root2 FAKEVPP_STATE=$W/vpp2.json $RI check --log; grep -q '%IFACE-5-KERNEL_DUP_END' $W/root2/var/log/router/alarmy.log"
+
+echo
 echo "14. router-history"
 python3 tests/test_router_history.py || fail=$((fail + 1))
 
